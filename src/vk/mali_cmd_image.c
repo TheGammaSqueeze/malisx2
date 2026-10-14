@@ -134,6 +134,42 @@ dispatch_copy(struct mali_cmd_buffer *cmd, const struct copy_surface *src, int s
       vk_logw(VK_LOG_OBJS(cmd), "malisx2: copies of %u-byte blocks are not supported", bytes);
       return;
    }
+   /* Linear -> u-interleaved at an aligned spot: the 4x4 groups go through
+    * the quad copy, the ragged right and bottom edges through this one. */
+   if (bytes <= 4 && src->tile_shift == 0 && dst->tile_shift == 4 && !(dx & 3) && !(dy & 3) &&
+       w_blocks >= 4 && h_blocks >= 4) {
+      const struct mali_shader *q = MALI_PER_ARCH(meta_copy_quad_get)(cmd, util_logbase2(bytes));
+      if (!q)
+         return;
+      const uint32_t qw = w_blocks / 4, qh = h_blocks / 4;
+      struct mali_meta_copy_push qp = {
+         .src = src->base,
+         .dst = dst->base,
+         .src_layer_stride = src->layer_stride,
+         .dst_layer_stride = dst->layer_stride,
+         .src_row_stride = src->row_stride,
+         .dst_row_stride = dst->row_stride,
+         .src_x = sx,
+         .src_y = sy,
+         .dst_x = dx,
+         .dst_y = dy,
+         .width = qw,
+         .height = qh,
+         .src_tile_shift = src->tile_shift,
+         .dst_tile_shift = dst->tile_shift,
+      };
+      const uint32_t qbase[3] = {0, 0, 0};
+      const uint32_t qgroups[3] = {DIV_ROUND_UP(qw, MALI_META_COPY_WG),
+                                   DIV_ROUND_UP(qh, MALI_META_COPY_WG), layers};
+      MALI_PER_ARCH(cmd_dispatch_shader)(cmd, q, NULL, &qp, sizeof(qp), qbase, qgroups);
+      const uint32_t cw = qw * 4, ch = qh * 4;
+      if (cw < w_blocks)
+         dispatch_copy(cmd, src, sx + cw, sy, dst, dx + cw, dy, w_blocks - cw, h_blocks, layers);
+      if (ch < h_blocks)
+         dispatch_copy(cmd, src, sx, sy + ch, dst, dx, dy + ch, cw, h_blocks - ch, layers);
+      return;
+   }
+
    const struct mali_shader *s = MALI_PER_ARCH(meta_copy_get)(cmd, util_logbase2(bytes));
    if (!s)
       return;

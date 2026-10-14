@@ -56,6 +56,7 @@
 
 struct mali_meta_gfx {
    struct mali_shader *copy[2][5];   /* [source is a texture][log2 block bytes] */
+   struct mali_shader *copy_quad[3]; /* [log2 block bytes] */
    unsigned count;
    struct {
       struct mali_meta_fs_key key;
@@ -335,6 +336,8 @@ MALI_PER_ARCH(meta_gfx_finish)(struct mali_device *dev)
       for (unsigned i = 0; i < ARRAY_SIZE(mg->copy[t]); i++)
          MALI_PER_ARCH(shader_unref)(dev, mg->copy[t][i]);
    }
+   for (unsigned i = 0; i < ARRAY_SIZE(mg->copy_quad); i++)
+      MALI_PER_ARCH(shader_unref)(dev, mg->copy_quad[i]);
    for (unsigned i = 0; i < mg->count; i++)
       MALI_PER_ARCH(shader_unref)(dev, mg->e[i].shader);
    free(mg);
@@ -590,6 +593,73 @@ build_copy(struct mali_device *dev, unsigned elem_log2, bool src_tex)
    return b->shader;
 }
 
+/*
+ * Linear -> u-interleaved, a 4x4 group of blocks per invocation. Within a
+ * tile, index bit 2i is x_i ^ y_i and bit 2i+1 is y_i, so the group at an
+ * aligned (x, y) fills indices 0..15 of its run: block k of the run is at
+ * y0 = k1, x0 = k0 ^ y0, y1 = k3, x1 = k2 ^ y1.
+ */
+static nir_shader *
+build_copy_quad(struct mali_device *dev, unsigned elem_log2)
+{
+   const unsigned elem = 1u << elem_log2;
+   nir_builder bld = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
+      "mali_meta_copy_quad%u", elem);
+   nir_builder *b = &bld;
+   b->shader->info.workgroup_size[0] = MALI_META_COPY_WG;
+   b->shader->info.workgroup_size[1] = MALI_META_COPY_WG;
+   b->shader->info.workgroup_size[2] = 1;
+
+   nir_def *id = nir_load_global_invocation_id(b, 32);
+   nir_def *gx = nir_channel(b, id, 0), *gy = nir_channel(b, id, 1), *gz = nir_channel(b, id, 2);
+   nir_def *w = copy_push(b, 32, COPY_PUSH(width));
+   nir_def *h = copy_push(b, 32, COPY_PUSH(height));
+
+   nir_push_if(b, nir_iand(b, nir_ult(b, gx, w), nir_ult(b, gy, h)));
+   {
+      nir_def *qx = nir_ishl_imm(b, gx, 2), *qy = nir_ishl_imm(b, gy, 2);
+      nir_def *sx = nir_iadd(b, qx, copy_push(b, 32, COPY_PUSH(src_x)));
+      nir_def *sy = nir_iadd(b, qy, copy_push(b, 32, COPY_PUSH(src_y)));
+      nir_def *src_row = copy_push(b, 32, COPY_PUSH(src_row_stride));
+      /* Row (sy + r) of the source starts at row0 + r * src_row. */
+      nir_def *row0 = surface_addr(
+         b, copy_push(b, 64, COPY_PUSH(src)), copy_push(b, 64, COPY_PUSH(src_layer_stride)),
+         src_row, sx, sy, gz, nir_imm_int(b, 0), elem);
+      nir_def *src_row64 = nir_u2u64(b, src_row);
+
+      nir_def *words[16] = {0};
+      const unsigned per_word = 4 / elem;
+      for (unsigned k = 0; k < 16; k++) {
+         const unsigned y0 = (k >> 1) & 1, x0 = (k & 1) ^ y0;
+         const unsigned y1 = (k >> 3) & 1, x1 = ((k >> 2) & 1) ^ y1;
+         const unsigned lx = x0 | (x1 << 1), ly = y0 | (y1 << 1);
+         nir_def *a = nir_iadd(b, row0, nir_iadd_imm(b, nir_imul_imm(b, src_row64, ly), lx * elem));
+         nir_def *v = nir_load_global(b, 1, elem * 8, a, .align_mul = elem);
+         if (elem < 4)
+            v = nir_u2u32(b, v);
+         const unsigned wi = k / per_word, sh = (k % per_word) * elem * 8;
+         if (sh)
+            v = nir_ishl_imm(b, v, sh);
+         words[wi] = words[wi] ? nir_ior(b, words[wi], v) : v;
+      }
+
+      nir_def *da = surface_addr(
+         b, copy_push(b, 64, COPY_PUSH(dst)), copy_push(b, 64, COPY_PUSH(dst_layer_stride)),
+         copy_push(b, 32, COPY_PUSH(dst_row_stride)),
+         nir_iadd(b, qx, copy_push(b, 32, COPY_PUSH(dst_x))),
+         nir_iadd(b, qy, copy_push(b, 32, COPY_PUSH(dst_y))), gz,
+         copy_push(b, 32, COPY_PUSH(dst_tile_shift)), elem);
+      const unsigned nwords = 4 * elem;
+      for (unsigned i = 0; i < nwords; i += 4) {
+         nir_def *v = nir_vec4(b, words[i], words[i + 1], words[i + 2], words[i + 3]);
+         nir_store_global(b, v, nir_iadd_imm(b, da, i * 4), .write_mask = 0xf, .align_mul = 16);
+      }
+   }
+   nir_pop_if(b, NULL);
+   return b->shader;
+}
+
 static const struct mali_shader *
 copy_get(struct mali_cmd_buffer *cmd, unsigned elem_log2, bool src_tex)
 {
@@ -636,6 +706,47 @@ const struct mali_shader *
 MALI_PER_ARCH(meta_copy_get)(struct mali_cmd_buffer *cmd, unsigned elem_log2)
 {
    return copy_get(cmd, elem_log2, false);
+}
+
+const struct mali_shader *
+MALI_PER_ARCH(meta_copy_quad_get)(struct mali_cmd_buffer *cmd, unsigned elem_log2)
+{
+   struct mali_device *dev = cmd->dev;
+   struct mali_shader *s = NULL;
+
+   assert(elem_log2 < 3);
+   simple_mtx_lock(&dev->meta_lock);
+   if (!dev->meta_gfx)
+      dev->meta_gfx = calloc(1, sizeof(struct mali_meta_gfx));
+   struct mali_meta_gfx *mg = dev->meta_gfx;
+   if (mg) {
+      s = mg->copy_quad[elem_log2];
+      if (!s) {
+         nir_shader *nir = build_copy_quad(dev, elem_log2);
+         MALI_PER_ARCH(shader_preprocess)(dev, nir);
+         const struct vk_pipeline_robustness_state rs = {
+            .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .vertex_inputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+         };
+         const struct mali_shader_compile_info info = {.nir = nir, .rs = &rs};
+         blake3_hash hash;
+         struct mesa_blake3 h;
+         _mesa_blake3_init(&h);
+         _mesa_blake3_update(&h, "mali-meta-copy-quad", 19);
+         _mesa_blake3_update(&h, &elem_log2, sizeof(elem_log2));
+         _mesa_blake3_final(&h, hash);
+         if (MALI_PER_ARCH(shader_compile)(dev, &info, hash, &s) != VK_SUCCESS)
+            s = NULL;
+         mg->copy_quad[elem_log2] = s;
+      }
+   }
+   simple_mtx_unlock(&dev->meta_lock);
+
+   if (!s)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   return s;
 }
 
 const struct mali_shader *

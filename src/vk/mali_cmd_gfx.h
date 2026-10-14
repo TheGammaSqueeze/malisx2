@@ -545,6 +545,17 @@ struct mali_meta_copy_push {
 MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_get,
                    (struct mali_cmd_buffer *cmd, unsigned elem_log2));
 
+/*
+ * The raw copy from a linear surface into a u-interleaved one (tile shift
+ * 4), one invocation per 4x4 group of blocks, for blocks of 1, 2 or 4
+ * bytes. The 16 blocks of an aligned 4x4 group are contiguous in a
+ * u-interleaved tile, so each invocation stores them with one to four
+ * 16-byte stores. width and height in the push are in groups; dst_x and
+ * dst_y must be multiples of 4.
+ */
+MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_quad_get,
+                   (struct mali_cmd_buffer *cmd, unsigned elem_log2));
+
 /* The same copy with the source read through texture 0 (a 2D array of the
  * copied layers, in the uint format of the block size) at (src_x + x,
  * src_y + y, z): for AFBC sources, which have no raw addressing. */
