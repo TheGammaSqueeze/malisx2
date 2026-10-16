@@ -707,9 +707,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * which is panvk's for v11: 7 sets, 2^20 descriptors per type, 16
        * dynamic uniform and 8 dynamic storage buffers, 16 vertex buffers,
        * 1 MiB uniform buffers (12-bit entry count of 16-byte entries),
-       * 256 bytes of push constants.
+       * 256 bytes of push constants. v7's Uniform Buffer descriptor has
+       * a 12-bit count of 16-byte entries: 64 KiB (panvk_v7).
        */
-      .maxUniformBufferRange = 1u << 20,
+      .maxUniformBufferRange = v7 ? 1u << 16 : 1u << 20,
       .maxPushConstantsSize = 256,
       .maxBoundDescriptorSets = 7,
 

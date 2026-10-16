@@ -24,6 +24,16 @@
  * high bits above it, and the plane's width and height; v9's have a 64-bit
  * pointer, 32-bit sizes and strides and no extent (the T820 blob writes
  * the same v9 fields).
+ *
+ * v7 (Bifrost) has no plane descriptors: the Texture descriptor carries
+ * the texel ordering itself and points at an array of 16-byte Surface
+ * With Stride entries (pointer, row stride, surface stride), one per
+ * (layer, sample, level) in that nesting, cube faces counted as layers,
+ * a 3D view one entry per level at its first slice (Mesa pan_texture.c
+ * pan_emit_iview_texture_payload / get_linear_or_u_tiled_surface_props /
+ * pan_sampled_texture_emit at PAN_ARCH 7). An ASTC surface pointer carries
+ * the block size in its low bits. Storage views (an attribute descriptor
+ * pair on v7) are not built yet.
  */
 
 #ifndef PAN_ARCH
@@ -45,7 +55,11 @@
 #include "vk_format.h"
 #include "vk_log.h"
 
-#define PLANE_DESC_SIZE 32
+#if PAN_ARCH < 9
+#define PLANE_DESC_SIZE 16   /* Surface With Stride */
+#else
+#define PLANE_DESC_SIZE 32   /* the plane descriptors */
+#endif
 
 #if PAN_ARCH >= 9
 
@@ -201,30 +215,143 @@ struct view_src {
 
 #if PAN_ARCH < 9
 
-/*
- * TODO v7: a Bifrost texture's payload is an array of surface pointers
- * (Surface With Stride: pointer, row stride, surface stride; 16 bytes
- * each), levels inner, layers and samples outer, and the Texture
- * descriptor carries the texel ordering, format and swizzle itself (Mesa
- * pan_texture.c pan_emit_iview_texture_payload / pan_emit_texture at
- * PAN_ARCH 7, panvk_v7 panvk_vX_image_view.c
- * panvk_per_arch(CreateImageView)). Until that is ported no texture or
- * storage descriptor exists on v7: vkCreateImageView fails for sampled and
- * storage usage, attachment-only views work.
- */
+/* Surface entries a view's texture has: layers (one for 3D) x samples x
+ * levels. */
+static unsigned
+view_plane_count(const struct view_src *src)
+{
+   const unsigned layers = src->dim == MALI_TEXTURE_DIMENSION_3D ? 1 : src->layers;
+   return layers * MAX2(src->image->vk.samples, 1) * src->levels;
+}
+
+/* The ASTC block size tag of a surface pointer (pan_texture.c
+ * astc_compression_tag). */
+static unsigned
+astc_tag(const struct util_format_description *desc)
+{
+   if (desc->block.depth > 1) {
+      static const unsigned dims3d[7] = {
+         [3] = MALI_ASTC_3D_DIMENSION_3, [4] = MALI_ASTC_3D_DIMENSION_4,
+         [5] = MALI_ASTC_3D_DIMENSION_5, [6] = MALI_ASTC_3D_DIMENSION_6,
+      };
+      return (dims3d[desc->block.depth] << 4) | (dims3d[desc->block.height] << 2) |
+             dims3d[desc->block.width];
+   }
+   static const unsigned dims2d[13] = {
+      [4] = MALI_ASTC_2D_DIMENSION_4,   [5] = MALI_ASTC_2D_DIMENSION_5,
+      [6] = MALI_ASTC_2D_DIMENSION_6,   [8] = MALI_ASTC_2D_DIMENSION_8,
+      [10] = MALI_ASTC_2D_DIMENSION_10, [12] = MALI_ASTC_2D_DIMENSION_12,
+   };
+   return (dims2d[desc->block.height] << 3) | dims2d[desc->block.width];
+}
+
+/* One Surface With Stride: level `level`, layer or Z slice `layer`,
+ * sample `sample` (get_linear_or_u_tiled_surface_props). The surface
+ * stride is the hardware's bound check on 2D surfaces, so it is never 0. */
+static void
+emit_surface(const struct view_src *src, unsigned level, unsigned layer, unsigned sample,
+             void *out)
+{
+   const struct mali_image *image = src->image;
+   const struct mali_image_plane_layout *pl = &image->planes[src->plane].layout;
+   const struct mali_image_slice *s = &pl->slices[level];
+   const struct util_format_description *desc = util_format_description(src->format);
+
+   assert(!mali_image_is_afbc(image));
+   uint64_t addr = image->base + s->offset;
+   if (image->vk.image_type == VK_IMAGE_TYPE_3D)
+      addr += (uint64_t)layer * s->surface_stride;
+   else
+      addr += (uint64_t)layer * pl->array_stride + (uint64_t)sample * s->surface_stride;
+   if (desc->layout == UTIL_FORMAT_LAYOUT_ASTC)
+      addr |= astc_tag(desc);
+
+   assert(s->surface_stride <= UINT32_MAX);
+   pan_cast_and_pack(out, SURFACE_WITH_STRIDE, cfg) {
+      cfg.pointer = addr;
+      cfg.row_stride = s->row_stride;
+      cfg.surface_stride = (uint32_t)s->surface_stride;
+   }
+}
+
+/* The surfaces of a view: layers outer, then samples, levels inner
+ * (pan_emit_iview_texture_payload at PAN_ARCH 7). Returns the bytes
+ * written. */
 static unsigned
 emit_planes(const struct view_src *src, uint8_t *out)
 {
-   MALI_TODO_V7("texture plane descriptors");
-   return 0;
+   const unsigned layers = src->dim == MALI_TEXTURE_DIMENSION_3D ? 1 : src->layers;
+   const unsigned samples = MAX2(src->image->vk.samples, 1);
+   unsigned n = 0;
+   for (unsigned l = 0; l < layers; l++) {
+      for (unsigned smp = 0; smp < samples; smp++) {
+         for (unsigned lvl = 0; lvl < src->levels; lvl++) {
+            emit_surface(src, src->first_level + lvl, src->first_layer + l, smp,
+                         out + n * PLANE_DESC_SIZE);
+            n++;
+         }
+      }
+   }
+   return n * PLANE_DESC_SIZE;
 }
 
+/* Extent at the view's base level; an uncompressed view of a compressed
+ * image counts blocks (pan_texture_get_extent). */
+static VkExtent3D
+view_extent(const struct view_src *src)
+{
+   const struct mali_image *image = src->image;
+   VkExtent3D e = {
+      .width = u_minify(image->vk.extent.width, src->first_level),
+      .height = u_minify(image->vk.extent.height, src->first_level),
+      .depth = u_minify(image->vk.extent.depth, src->first_level),
+   };
+   const enum pipe_format ifmt = image->planes[src->plane].format;
+   if (util_format_is_compressed(ifmt) && !util_format_is_compressed(src->format)) {
+      e.width = DIV_ROUND_UP(e.width, util_format_get_blockwidth(ifmt));
+      e.height = DIV_ROUND_UP(e.height, util_format_get_blockheight(ifmt));
+      e.depth = DIV_ROUND_UP(e.depth, util_format_get_blockdepth(ifmt));
+   }
+   return e;
+}
+
+/* The Bifrost Texture descriptor (pan_sampled_texture_emit at PAN_ARCH 7):
+ * the texel ordering comes from the image's layout alone. `storage` is
+ * never set on v7 (storage views are attribute pairs, not built yet). */
 static void
 pack_texture(const struct view_src *src, const unsigned char swizzle[4],
              uint64_t planes, float min_lod, bool storage, uint32_t out[8])
 {
-   MALI_TODO_V7("texture descriptors");
-   memset(out, 0, 8 * sizeof(uint32_t));
+   const struct mali_image *image = src->image;
+   const VkExtent3D e = view_extent(src);
+   unsigned array_size = src->dim == MALI_TEXTURE_DIMENSION_3D ? 1 : src->layers;
+   if (src->dim == MALI_TEXTURE_DIMENSION_CUBE)
+      array_size /= 6;
+   assert(!storage);
+
+   unsigned sw = 0;
+   for (unsigned i = 0; i < 4; i++)
+      sw |= swizzle[i] << (3 * i);
+
+   pan_cast_and_pack(out, TEXTURE, cfg) {
+      cfg.dimension = src->dim;
+      cfg.format = GENX(pan_format_from_pipe_format)(src->format)->hw;
+      cfg.width = e.width;
+      cfg.height = e.height;
+      if (src->dim == MALI_TEXTURE_DIMENSION_3D)
+         cfg.depth = e.depth;
+      else
+         cfg.sample_count = MAX2(image->vk.samples, 1);
+      cfg.swizzle = sw;
+      cfg.texel_ordering = image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ?
+                              MALI_TEXTURE_LAYOUT_LINEAR : MALI_TEXTURE_LAYOUT_TILED;
+      cfg.levels = src->levels;
+      cfg.array_size = array_size;
+      cfg.surfaces = planes;
+      /* The base level is in the surface pointers; LODs count from it. */
+      cfg.minimum_lod = MAX2(0.0f, min_lod - src->first_level);
+      cfg.maximum_lod = src->levels - 1;
+   }
 }
 
 #else
@@ -328,6 +455,15 @@ emit_plane(const struct view_src *src, unsigned level, unsigned layer, void *out
    }
 }
 
+/* Plane descriptors a view's texture has: layers (one for 3D) x levels;
+ * samples share one. */
+static unsigned
+view_plane_count(const struct view_src *src)
+{
+   const unsigned layers = src->dim == MALI_TEXTURE_DIMENSION_3D ? 1 : src->layers;
+   return layers * src->levels;
+}
+
 /* The plane descriptors of a view: layers outer, levels inner
  * (pan_emit_iview_texture_payload). Returns the bytes written. */
 static unsigned
@@ -415,16 +551,22 @@ MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_
    const VkImageUsageFlags usage = view->vk.usage;
    const bool want_tex = usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
                                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+#if PAN_ARCH < 9
+   /* TODO v7: a storage view is an Attribute Buffer pair (panvk_v7
+    * panvk_vX_image_view.c prepare_attr_buf_descs), read through the image
+    * Attribute table of a draw or dispatch; neither exists yet. The view
+    * is created without it (a storage descriptor written from it is zero,
+    * mali_descriptor_set.c), so images with STORAGE usage still get their
+    * sampled descriptor. */
+   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !vk_format_is_compressed(view->vk.view_format))
+      MALI_TODO_V7("storage image views");
+   const bool want_storage = false;
+#else
    const bool want_storage = (usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
                              !vk_format_is_compressed(view->vk.view_format);
+#endif
    if (!want_tex && !want_storage)
       return VK_SUCCESS;
-#if PAN_ARCH < 9
-   /* TODO v7: see emit_planes above. */
-   MALI_TODO_V7("sampled and storage image views");
-   return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                    "sampled and storage image views are not ported to Bifrost yet");
-#endif
 
    struct view_src src = {
       .image = image,
@@ -474,8 +616,7 @@ MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_
       ssrc.layers = view->vk.storage.z_slice_count;
    }
 
-   const unsigned per_view =
-      (src.dim == MALI_TEXTURE_DIMENSION_3D ? 1 : src.layers) * src.levels * PLANE_DESC_SIZE;
+   const unsigned per_view = view_plane_count(&src) * PLANE_DESC_SIZE;
    const uint64_t size = (want_tex ? per_view : 0) + (want_storage ? per_view : 0);
 
    enum mali_kbase_result r =

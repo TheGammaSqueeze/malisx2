@@ -350,19 +350,19 @@ MALI_PER_ARCH(cmd_pack_plane_texture)(struct mali_cmd_buffer *cmd, const struct 
                                       unsigned first_layer, unsigned layer_count, uint32_t out[8])
 {
 #if PAN_ARCH < 9
-   /* TODO v7: see mali_image_view.c (surface pointers, not plane
-    * descriptors). Preloads and blits fail until it is ported. */
-   MALI_TODO_V7("attachment texture descriptors");
-   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-   return false;
+   /* v7: one 16-byte Surface With Stride per layer and sample
+    * (mali_image_view.c). The frame shader draws that read these are not
+    * ported yet (meta_fs_dcd below). */
+   const unsigned surfaces = layer_count * MAX2(image->vk.samples, 1);
+   struct mali_ptr p = mali_cmd_alloc(cmd, surfaces * pan_size(SURFACE_WITH_STRIDE), 64);
 #else
    struct mali_ptr p = mali_cmd_alloc(cmd, mali_image_plane_texture_desc_size(layer_count), 64);
+#endif
    if (!p.cpu)
       return false;
    MALI_PER_ARCH(image_pack_plane_texture)(image, plane, format, level, first_layer, layer_count,
                                            p.cpu, p.gpu, out);
    return true;
-#endif
 }
 
 bool

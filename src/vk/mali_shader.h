@@ -103,11 +103,37 @@ struct mali_graphics_sysvals {
        * value as the Draw descriptor's offset_start. */
       int32_t raw_vertex_offset;
    } vs;
-   struct {
-      mali_aligned_u64 blend_descs[MALI_MAX_RTS];
-   } fs;
+   union {
+      struct {
+         mali_aligned_u64 blend_descs[MALI_MAX_RTS];
+      } fs;
+      /* v7 only, in the words v9+ use for the Blend descriptors (Bifrost
+       * reads those from the hardware's blend FAU slots, so a v7 shader
+       * never marks them used): the GPU addresses of the bound descriptor
+       * sets, for storage buffers read straight from their set and for
+       * texture size queries (mali_nir_lower_descriptors_v7.c), and at
+       * MALI_V7_DESC_TABLE_DYN_SSBOS the stage's dynamic storage buffer
+       * table (mali_cmd_state.h). One block per stage, so the last entry
+       * is the stage's own. */
+      struct {
+         mali_aligned_u64 sets[MALI_MAX_SETS + 1];
+      } v7_desc;
+   };
    struct mali_input_attachment_info iam[MALI_INPUT_ATTACHMENT_MAP_SIZE];
 } __attribute__((aligned(8)));
+
+static_assert(sizeof(((struct mali_graphics_sysvals *)NULL)->v7_desc) ==
+                 sizeof(((struct mali_graphics_sysvals *)NULL)->fs),
+              "the v7 set addresses take exactly the blend descriptor words");
+
+/* The sysval's table index of a v7 stage's dynamic storage buffer table
+ * (panvk_v7 PANVK_DESC_TABLE_*_DYN_SSBOS: user sets first). */
+#define MALI_V7_DESC_TABLE_DYN_SSBOS MALI_MAX_SETS
+
+/* The push-constant base that marks system values until the FAU packing
+ * gives everything its final offset (mali_shader.c, the v7 descriptor
+ * lowering). */
+#define MALI_SYSVALS_PUSH_CONST_BASE MALI_MAX_PUSH_CONSTANTS_SIZE
 
 struct mali_compute_sysvals {
    struct {
@@ -229,6 +255,9 @@ mali_shader_fau_consts(const struct mali_shader_fau *fau, uint64_t *out)
 struct mali_shader_desc_info {
    uint32_t used_set_mask;
    uint32_t driver_table_prefix;
+   /* v7: the dynamic uniform buffers the shader reads first
+    * (mali_v7_shader_desc::dyn_ubo_count of them), then its dynamic storage
+    * buffers, each MALI_COPY_DESC_HANDLE(set, dynamic buffer index). */
    struct {
       uint32_t map[MALI_MAX_DYNAMIC_BUFFERS];
       uint32_t count;
@@ -236,6 +265,50 @@ struct mali_shader_desc_info {
    /* Fragment shaders: the shader loads some varyings with LD_VAR, which
     * reads the attribute descriptors at the start of table 0. */
    bool needs_varying_descs;
+};
+
+/*
+ * Bifrost (v7) has no resource tables: a draw or dispatch hands each stage
+ * per-type tables (Uniform Buffer descriptors of 8 bytes, Texture and
+ * Sampler descriptors of 32, image Attribute descriptors), and the shader's
+ * indices are positions in those tables (panvk_v7
+ * panvk_vX_nir_lower_descriptors.c, PANVK_BIFROST_DESC_TABLE_*). The
+ * lowering decides the positions and records where each entry comes from;
+ * the command buffer copies the descriptors out of the bound sets at draw
+ * time (mali_cmd_state.h mali_gfx_v7_stage_tables). Storage buffers are
+ * not copied: the shader reads their address pair from the set itself,
+ * through the set addresses in the sysvals.
+ */
+enum mali_v7_desc_table {
+   MALI_V7_DESC_TABLE_UBO = 0,     /* 8-byte entries, dynamic ones after the others */
+   MALI_V7_DESC_TABLE_IMG,         /* storage images and texel buffers (attributes) */
+   MALI_V7_DESC_TABLE_TEXTURE,
+   MALI_V7_DESC_TABLE_SAMPLER,
+   MALI_V7_DESC_TABLE_COUNT,
+};
+
+struct mali_v7_shader_desc {
+   /* Entries of each table copied from sets (dynamic uniform buffers are
+    * added behind count[UBO] from desc.dyn_bufs). */
+   uint32_t count[MALI_V7_DESC_TABLE_COUNT];
+   /* The first dyn_ubo_count entries of desc.dyn_bufs.map are uniform
+    * buffers, the rest storage buffers. */
+   uint32_t dyn_ubo_count;
+   /* The tables' sources, one MALI_COPY_DESC_HANDLE(set, slot) per entry,
+    * table after table in enum order (map_count entries, malloc'd). */
+   uint32_t *map;
+   uint32_t map_count;
+   /* The shader reads the set addresses (v7_desc.sets): storage buffers,
+    * texture or image size queries. */
+   bool needs_set_addrs;
+   /* The lowering could not allocate its map (mali_shader.c lower_nir). */
+   bool failed;
+   /* The shader's constant data (nir constant_data_size bytes, host copy
+    * for serialization) and its GPU copy, whose address the stage's FAU
+    * block carries in common.constant_data. */
+   void *data;
+   uint32_t data_size;
+   struct mali_bo_ref data_mem;
 };
 
 /* SPD slots. A vertex shader has three (panvk v11): position for points,
@@ -284,11 +357,16 @@ struct mali_shader {
     * address in MALI_UBO_COPY_SRC and the FAU block's in MALI_UBO_COPY_DST
     * first; valid while the binding covers bytes [0, end). count 0: no
     * such words, or the draw copies them another way. */
-   struct {
-      uint32_t count;
-      uint32_t end;
-      uint64_t ins[MALI_UBO_COPY_MAX_INS];
-   } ubo_copy;
+   union {
+      struct {
+         uint32_t count;
+         uint32_t end;
+         uint64_t ins[MALI_UBO_COPY_MAX_INS];
+      } ubo_copy;
+      /* v7 only (a shader belongs to one arch): the per-type descriptor
+       * tables and constant data of a Bifrost shader. */
+      struct mali_v7_shader_desc v7;
+   };
 
    /* GPU copies: code in the executable pool (128-byte aligned), SPDs in
     * the pipeline descriptor pool (32-byte aligned). */
@@ -374,6 +452,15 @@ void mali_nir_lower_descriptors(nir_shader *nir,
                                 const struct vk_pipeline_robustness_state *rs,
                                 const struct vk_pipeline_layout *layout,
                                 struct mali_shader_desc_info *desc_info);
+/* The Bifrost (v7) variant: per-type tables instead of resource tables
+ * (mali_nir_lower_descriptors_v7.c). rs picks the storage buffer address
+ * format, the one shader_spirv_options parsed the SPIR-V with. False when
+ * the table map could not be allocated (v7->map is then NULL). */
+bool mali_nir_lower_descriptors_v7(nir_shader *nir,
+                                   const struct vk_pipeline_robustness_state *rs,
+                                   const struct vk_pipeline_layout *layout,
+                                   struct mali_shader_desc_info *desc_info,
+                                   struct mali_v7_shader_desc *v7);
 bool mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
                                            const struct vk_graphics_pipeline_state *state,
                                            uint32_t *input_attachment_read);

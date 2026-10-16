@@ -61,3 +61,16 @@ executable(
   dependencies : [dep_dl, dep_m],
   install : false,
 )
+# tex_g52: a 4x4 RGBA8 texture uploaded through a staging buffer, bound in
+# a descriptor set with a nearest sampler and a uniform buffer, sampled by a
+# full-screen triangle onto the 64x64 target, read back and checked texel
+# block by texel block (the Bifrost Texture, Sampler and Uniform Buffer
+# descriptors and the per-stage tables). The SPIR-V is embedded.
+executable(
+  'tex_g52',
+  files('tex_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DTEX_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)
