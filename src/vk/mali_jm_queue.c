@@ -1168,6 +1168,9 @@ MALI_PER_ARCH(device_finish)(struct mali_device *dev)
    pthread_mutex_unlock(&dev->lock);
    mali_jm_sync_file_finish(jd);
    mali_jm_heap_finish(jd);
+#if PAN_ARCH < 9
+   mali_v7_desc_finish(dev);
+#endif
 
    dev->vk.check_status = NULL;
    dev->jm = NULL;

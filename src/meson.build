@@ -132,7 +132,8 @@ _vk_c_args = [
 ]
 
 # The files built once per GPU architecture:
-# descriptor, sampler, view, format-table, shader, blend-shader and
+# descriptor, sampler, view, format-table, shader (and its descriptor
+# lowering), blend-shader and
 # pipeline packing, the command-buffer builders both back halves share
 # (mali_cmd_state.c, mali_fb.c, mali_cmd_meta_gfx.c), the buffer copies
 # (mali_cmd_copy.c, on each back half's dispatch) and the image copies,
@@ -143,8 +144,8 @@ _vk_per_arch_files = files(
   'vk/mali_blend.c', 'vk/mali_cmd_copy.c', 'vk/mali_cmd_image.c', 'vk/mali_cmd_meta_gfx.c',
   'vk/mali_cmd_state.c',
   'vk/mali_descriptor_set.c', 'vk/mali_fb.c', 'vk/mali_format_table.c',
-  'vk/mali_image_view.c', 'vk/mali_pipeline.c', 'vk/mali_pipeline_state.c',
-  'vk/mali_sampler.c', 'vk/mali_shader.c',
+  'vk/mali_image_view.c', 'vk/mali_nir_lower_descriptors.c', 'vk/mali_pipeline.c',
+  'vk/mali_pipeline_state.c', 'vk/mali_sampler.c', 'vk/mali_shader.c',
 )
 _vk_inc = [inc_include, inc_src, inc_malisx2, include_directories('vk'),
            include_directories('measurement')]
@@ -161,9 +162,10 @@ malisx2_vk = static_library(
   # Memory, buffers, images, formats.
   files('vk/mali_buffer.c', 'vk/mali_device_memory.c', 'vk/mali_formats.c',
         'vk/mali_image.c', 'vk/mali_image_layout.c'),
-  # Shader lowering and memory pools, descriptor set layouts.
+  # Shader lowering and memory pools, descriptor set layouts (the
+  # descriptor lowering is a per-arch file: Valhall and Bifrost differ).
   files('vk/mali_bo_pool.c', 'vk/mali_descriptor_set_layout.c',
-        'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_input_attachments.c'),
+        'vk/mali_nir_lower_input_attachments.c'),
   # Command buffers, the CSF queue, submit and sync.
   files('vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_queue.c',
         'vk/mali_sync.c'),
@@ -205,6 +207,8 @@ _vk_jm_files = files(
   'vk/mali_jm_cmd_buffer.c', 'vk/mali_jm_cmd_dispatch.c', 'vk/mali_jm_cmd_draw.c',
   'vk/mali_jm_cmd_render.c', 'vk/mali_jm_heap.c', 'vk/mali_jm_query.c',
   'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_sync.c', 'vk/mali_wsi.c',
+  # The Bifrost descriptor tables and copy job (empty at PAN_ARCH 9).
+  'vk/mali_jm_desc_v7.c',
   # Timing and command-stream capture on the job manager (MALISX2_MEASURE):
   # their own implementation of what touches struct mali_cmd_buffer
   # directly, because that struct (mali_jm.h) differs from the CSF one

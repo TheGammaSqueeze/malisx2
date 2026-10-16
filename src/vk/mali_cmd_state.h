@@ -233,11 +233,9 @@ mali_compute_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *cs
                        unsigned texture_count)
 {
 #if PAN_ARCH < 9
-   /* TODO v7: no resource tables on Bifrost; a dispatch gets separate
-    * uniform-buffer, texture, sampler and attribute (image) tables in its
-    * Draw section (panvk_v7 panvk_vX_cmd_desc_state.c
-    * panvk_per_arch(cmd_prepare_dyn_ssbos/ubos/textures/samplers) and
-    * jm/panvk_vX_cmd_dispatch.c). */
+   /* No resource tables on Bifrost: a dispatch gets separate uniform
+    * buffer, texture, sampler and image tables in its Draw section
+    * (mali_jm_desc_v7.c); the v7 dispatch never calls this. */
    MALI_TODO_V7("the compute resource table");
    return 0;
 #else

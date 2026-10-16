@@ -408,6 +408,74 @@ pack_texture(const struct view_src *src, const unsigned char swizzle[4],
 
 #endif /* PAN_ARCH >= 9 */
 
+#if PAN_ARCH < 9
+/*
+ * Bifrost storage images (panvk_v7 panvk_vX_image_view.c
+ * prepare_attr_buf_descs): a shader reads and writes a storage image
+ * through the attribute unit, so the view's storage descriptor is an
+ * Attribute Buffer of type 3D Linear or 3D Interleaved at the first level
+ * and layer (or Z slice) of the view, with its 3D continuation (the
+ * extents and strides), 32 bytes in all. The hardware format goes into
+ * the Attribute descriptor the dispatch's copy job writes from this pair
+ * (mali_jm_desc_v7.c), so it is folded into the Attribute Buffer's stride
+ * word: the texel size in bits 0..6, log2(samples) in bits 7..9, the
+ * 22-bit format from bit 10. The copy job masks the stride back out.
+ */
+static void
+v7_pack_storage_attr_bufs(const struct mali_image_view *view, uint32_t out[8])
+{
+   const struct mali_image *image = container_of(view->vk.image, struct mali_image, vk);
+   const bool is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D;
+   const unsigned plane = 0;
+   const struct mali_image_plane_layout *pl = &image->planes[plane].layout;
+   const unsigned level = view->vk.base_mip_level;
+   const struct mali_image_slice *sl = &pl->slices[level];
+   const enum pipe_format format = vk_format_to_pipe_format(view->vk.view_format);
+   const unsigned first = is_3d ? view->vk.storage.z_slice_offset : view->vk.base_array_layer;
+   const unsigned count = is_3d ? view->vk.storage.z_slice_count : view->vk.layer_count;
+   const unsigned samples = MAX2(image->vk.samples, 1);
+   const uint64_t layer_stride = is_3d ? sl->surface_stride : pl->array_stride;
+   const uint32_t blksize = util_format_get_blocksize(format);
+   const uint32_t hw_fmt = GENX(pan_format_from_pipe_format)(format)->hw;
+
+   assert(blksize <= BITFIELD_MASK(7));
+   assert(util_logbase2(samples) <= BITFIELD_MASK(3));
+   assert(hw_fmt <= BITFIELD_MASK(22));
+
+   struct {
+      struct mali_attribute_buffer_packed buf;
+      struct mali_attribute_buffer_continuation_3d_packed cont;
+   } desc;
+   static_assert(sizeof(desc) == 8 * sizeof(uint32_t), "one slot");
+
+   pan_pack(&desc.buf, ATTRIBUTE_BUFFER, cfg) {
+      cfg.type = image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR
+                    ? MALI_ATTRIBUTE_TYPE_3D_LINEAR
+                    : MALI_ATTRIBUTE_TYPE_3D_INTERLEAVED;
+      cfg.pointer = image->base + sl->offset + (uint64_t)first * layer_stride;
+      cfg.stride = blksize | (util_logbase2(samples) << 7) | (hw_fmt << 10);
+      /* The bytes from the first layer's level to the end of the last
+       * layer's. */
+      const uint64_t size = is_3d ? (uint64_t)count * sl->surface_stride
+                                  : (uint64_t)(count - 1) * layer_stride + sl->size;
+      cfg.size = (uint32_t)MIN2(size, UINT32_MAX);
+   }
+   pan_pack(&desc.cont, ATTRIBUTE_BUFFER_CONTINUATION_3D, cfg) {
+      cfg.s_dimension = u_minify(image->vk.extent.width, level);
+      cfg.t_dimension = u_minify(image->vk.extent.height, level);
+      cfg.r_dimension = count;
+      cfg.row_stride = sl->row_stride;
+      if (count > 1 || samples > 1)
+         cfg.slice_stride = (uint32_t)layer_stride;
+      if (samples > 1) {
+         cfg.r_dimension *= samples;
+         cfg.slice_stride /= samples;
+      }
+   }
+   memcpy(out, &desc, sizeof(desc));
+}
+#endif /* PAN_ARCH < 9 */
+
 VkResult
 MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_view *view)
 {
@@ -420,10 +488,21 @@ MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_
    if (!want_tex && !want_storage)
       return VK_SUCCESS;
 #if PAN_ARCH < 9
+   /* Storage views: the Attribute Buffer pair above (no plane descriptors
+    * to allocate). */
+   if (want_storage) {
+      if (!GENX(pan_format_from_pipe_format)(vk_format_to_pipe_format(view->vk.view_format))->hw)
+         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "no storage image format for view format %d", view->vk.view_format);
+      v7_pack_storage_attr_bufs(view, view->storage_tex);
+      view->has_storage_tex = true;
+   }
+   if (!want_tex)
+      return VK_SUCCESS;
    /* TODO v7: see emit_planes above. */
-   MALI_TODO_V7("sampled and storage image views");
+   MALI_TODO_V7("sampled image views");
    return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                    "sampled and storage image views are not ported to Bifrost yet");
+                    "sampled image views are not ported to Bifrost yet");
 #endif
 
    struct view_src src = {

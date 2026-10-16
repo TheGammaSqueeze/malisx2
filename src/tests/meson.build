@@ -36,3 +36,28 @@ executable(
   dependencies : [dep_dl],
   install : false,
 )
+
+# compute_g52: one compute dispatch with a descriptor set (two storage
+# buffers read from the set, a storage image through the attribute unit),
+# push constants and the compute system values; the buffer and the image
+# are read back and checked. The SPIR-V is embedded (see the file comment).
+executable(
+  'compute_g52',
+  files('compute_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DCOMPUTE_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)
+
+# copy_g52: the transfer commands (buffer copy, fill, update, buffer to a
+# tiled image with a ragged patch, image to image, a 1:1 blit, image to
+# buffer), every result checked against its pattern on the CPU.
+executable(
+  'copy_g52',
+  files('copy_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DCOPY_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)

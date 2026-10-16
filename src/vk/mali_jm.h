@@ -522,6 +522,70 @@ void mali_jm_heap_finish(struct mali_jm_device *jd);
  * b->heap_desc). False on failure, with the command buffer's error set. */
 bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
 
+#if PAN_ARCH < 9
+/* ---------------------------------------------------------------------- */
+/* Bifrost descriptor tables (mali_jm_desc_v7.c)                            */
+
+/*
+ * What a Bifrost dispatch or draw points its Draw descriptor at for one
+ * shader's descriptor sets (mali_shader.h, "Bifrost (v7) descriptor
+ * model"): the four tables, the image Attribute descriptors, the dynamic
+ * storage buffer table, and the desc.sets system values. Built from the
+ * bound sets by mali_v7_desc_prepare; the regular entries of the tables
+ * are filled on the GPU by the copy job (mali_v7_desc_copy_job), which
+ * runs before the job that uses them, so a set updated between recording
+ * and submission is read as the application left it.
+ */
+struct mali_v7_desc_tables {
+   uint64_t tables[MALI_V7_TABLE_COUNT];   /* 0 when the shader has none */
+   uint64_t img_attribs;                    /* Attribute descriptors of the images */
+   uint64_t dyn_ssbos;                      /* address/size pairs */
+   uint64_t sets[MALI_V7_SETS];             /* the bound sets' memory */
+   uint32_t set_desc_counts[MALI_V7_SETS];  /* slots of each */
+   bool any;                                /* a copy job is needed */
+};
+
+/* Allocates and fills what the CPU can (dynamic buffers, the dummy
+ * sampler, the set bases); desc may be NULL for a shader without sets.
+ * False with the command buffer's error set. */
+bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                          const struct mali_desc_state *desc, struct mali_v7_desc_tables *out);
+
+/*
+ * The copy job: a Compute job on chain c that copies the shader's regular
+ * descriptors from the sets into the tables (one invocation per entry).
+ * attrib_buf_idx_offset: what the image Attribute descriptors' buffer
+ * indices start at (0 for compute and fragment, twice the vertex binding
+ * count for a vertex shader). *index: the job's index, for the dependency
+ * of the job that follows; 0 when no job was needed. False on failure.
+ */
+bool mali_v7_desc_copy_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                           const struct mali_shader *s, const struct mali_v7_desc_tables *t,
+                           uint32_t attrib_buf_idx_offset, uint16_t *index);
+
+/* The desc.sets system values of the compute stage, from the tables. */
+void mali_v7_desc_compute_sysvals(const struct mali_v7_desc_tables *t,
+                                  struct mali_compute_sysvals *sv);
+
+/* The FAU block of a dispatch on Bifrost (mali_cmd_state.h mali_compute_fau
+ * with the desc.sets and constant data system values): the block's
+ * address, 0 when the shader has no FAU or on failure. */
+uint64_t mali_v7_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                             const struct mali_v7_desc_tables *t, const void *push,
+                             uint32_t push_size, const uint32_t base[3],
+                             const uint32_t groups[3]);
+
+/* Compute job sizing: the Invocation section for a dispatch
+ * (pan_pack_work_groups_compute without the graphics quirks) and the
+ * Parameters' job task split. */
+void mali_v7_compute_invocation(struct mali_invocation_packed *out, const uint32_t local[3],
+                                const uint32_t groups[3]);
+unsigned mali_v7_compute_task_split(const uint32_t local[3]);
+
+/* Frees the device's copy shader. */
+void mali_v7_desc_finish(struct mali_device *dev);
+#endif /* PAN_ARCH < 9 */
+
 /* ---------------------------------------------------------------------- */
 /* The device and queue                                                    */
 
@@ -646,6 +710,12 @@ struct mali_jm_device {
 
    /* Atoms of the JOB_SUBMIT being built (only while building). */
    struct mali_jm_build *build;
+
+#if PAN_ARCH < 9
+   /* The descriptor copy shader (mali_jm_desc_v7.c), compiled on first
+    * use under mali_device::meta_lock, unreferenced at device_finish. */
+   struct mali_shader *v7_desc_copy;
+#endif
 
    /* Set for the duration of one vkQueueSubmit when MALISX2_MEASURE's
     * "csf" mode is on (recorder_jm.c calls it "csf" too: one capture

@@ -49,7 +49,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(mali_sampler, vk.base, VkSampler,
 
 struct mali_buffer_view {
    struct vk_buffer_view vk;
-   struct mali_hw_desc desc;    /* Buffer, type Structure */
+   /* v9+: a Buffer of type Structure. v7: a 1D Attribute Buffer, then an
+    * Attribute descriptor (the texel buffer is an image for Bifrost). */
+   struct mali_hw_desc desc;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_buffer_view, vk.base, VkBufferView,

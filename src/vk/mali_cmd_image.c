@@ -440,7 +440,12 @@ copy_on_fragment(struct mali_cmd_buffer *cmd, const struct mali_image *src,
                  const struct mali_image *dst, VkImageAspectFlags aspect,
                  const struct copy_surface *s)
 {
-#if PAN_ARCH < 10
+#if PAN_ARCH < 9
+   /* The fragment-side copy pass needs the frame shaders (mali_cmd_meta_gfx.c
+    * meta_fs_dcd, not ported to Bifrost yet): the compute copy closes the
+    * batch instead. */
+   return false;
+#elif PAN_ARCH < 10
    return aspect == VK_IMAGE_ASPECT_COLOR_BIT && src->vk.image_type == VK_IMAGE_TYPE_2D &&
           dst->vk.image_type == VK_IMAGE_TYPE_2D && s->block_w == 1 && s->block_h == 1 &&
           util_is_power_of_two_nonzero(s->block_bytes) && s->block_bytes <= 16 &&
@@ -727,6 +732,48 @@ MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInf
       const int32_t dy1 = MAX2(r->dstOffsets[0].y, r->dstOffsets[1].y);
       if (dx1 <= dx0 || dy1 <= dy0)
          continue;
+
+#if PAN_ARCH < 9
+      /*
+       * Bifrost: the blit pass needs the frame shaders (mali_cmd_meta_gfx.c
+       * meta_fs_dcd and the attachment textures, not ported yet). A blit
+       * that neither scales, flips, converts nor reads a compressed or
+       * AFBC image is a copy: same extent in both images, both offsets
+       * increasing, size-compatible single-block formats, one Z slice.
+       * Those go through the compute copy (dispatch_copy); the rest is
+       * refused with the TODO line until the texture family lands.
+       */
+      {
+         const int32_t sx0 = r->srcOffsets[0].x, sx1 = r->srcOffsets[1].x;
+         const int32_t sy0 = r->srcOffsets[0].y, sy1 = r->srcOffsets[1].y;
+         const bool one_to_one =
+            sx1 > sx0 && sy1 > sy0 && r->dstOffsets[1].x > r->dstOffsets[0].x &&
+            r->dstOffsets[1].y > r->dstOffsets[0].y && sx1 - sx0 == dx1 - dx0 &&
+            sy1 - sy0 == dy1 - dy0 && r->srcOffsets[1].z - r->srcOffsets[0].z == 1 &&
+            r->dstOffsets[1].z - r->dstOffsets[0].z == 1 &&
+            util_format_get_blocksize(sfmt) == util_format_get_blocksize(dfmt) &&
+            util_format_get_blockwidth(sfmt) == 1 && util_format_get_blockheight(sfmt) == 1 &&
+            util_format_get_blockwidth(dfmt) == 1 && util_format_get_blockheight(dfmt) == 1 &&
+            !mali_image_is_afbc(src) && !mali_image_is_afbc(dst) &&
+            (r->srcSubresource.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) &&
+            vk_image_subresource_layer_count(&src->vk, &r->srcSubresource) == layers;
+         if (!one_to_one) {
+            MALI_TODO_V7("scaled, flipped or converting blits");
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         const bool src3d = src->vk.image_type == VK_IMAGE_TYPE_3D;
+         const bool dst3d = dst->vk.image_type == VK_IMAGE_TYPE_3D;
+         struct copy_surface s, d;
+         image_surface(src, VK_IMAGE_ASPECT_COLOR_BIT, slevel,
+                       src3d ? r->srcOffsets[0].z : r->srcSubresource.baseArrayLayer, &s);
+         image_surface(dst, VK_IMAGE_ASPECT_COLOR_BIT, dlevel,
+                       dst3d ? r->dstOffsets[0].z : r->dstSubresource.baseArrayLayer, &d);
+         dispatch_copy(cmd, &s, sx0, sy0, &d, dx0, dy0, (uint32_t)(dx1 - dx0),
+                       (uint32_t)(dy1 - dy0), layers);
+         continue;
+      }
+#endif
 
       struct mali_meta_fs_key key = {
          .layered = layers > 1,
