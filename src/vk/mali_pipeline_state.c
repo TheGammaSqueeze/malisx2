@@ -910,6 +910,10 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
        * primitive index written back for a fragment shader that reads it. */
       cfg.job_task_split = 6;
       cfg.primitive_index_writeback = fs_reads_prim_id;
+      /* Per draw, in words 1 to 5 (the draw packs them with the real
+       * values, mali_jm_cmd_draw.c); only word 0 is kept from here. The
+       * packer encodes the count minus one and asserts it is at least 1. */
+      cfg.index_count = 1;
 #endif
       cfg.draw_mode = draw_mode(prim);
       cfg.primitive_index_enable = fs_reads_prim_id;

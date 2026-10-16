@@ -994,6 +994,9 @@ mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count)
    pan_pack(&off, BLEND, cfg) {
       cfg.enable = false;
       cfg.internal.mode = MALI_BLEND_MODE_OFF;
+      /* Not read in this mode; the v7 packer encodes it minus one and
+       * asserts it is at least 1. */
+      cfg.internal.fixed_function.num_comps = 4;
    }
    for (unsigned loc = 0; loc < MALI_MAX_RTS; loc++)
       d->blend_descs[loc] = off.opaque[2] | (uint64_t)off.opaque[3] << 32;
