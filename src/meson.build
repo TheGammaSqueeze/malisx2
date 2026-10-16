@@ -237,8 +237,9 @@ malisx2_vk_v7 = static_library(
   'mali_vk_v7',
   _vk_jm_files,
   # The Bifrost descriptor tables, their copy job and the compute job
-  # sizing, shared by the v7 draws and dispatches.
-  files('vk/mali_jm_desc_v7.c'),
+  # sizing, shared by the v7 draws and dispatches; the census mode of the
+  # unported paths (MALI_TODO_V7, vk/mali_arch.h).
+  files('vk/mali_jm_desc_v7.c', 'vk/mali_v7_census.c'),
   _vk_per_arch_files,
   mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
   include_directories : _vk_inc,

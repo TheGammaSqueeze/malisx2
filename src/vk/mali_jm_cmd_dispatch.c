@@ -62,8 +62,10 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
     * built from `textures`.
     */
    if (texture_count) {
+      /* Census mode skips the dispatch. */
       MALI_TODO_V7("internal dispatches with texture descriptors");
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      if (!mali_v7_census())
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
 

@@ -1018,7 +1018,12 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       uint32_t min, max;
       bool empty;
       if (!index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         /* TODO v7: the GPU min/max index helper (panvk_v7 libpan
+          * draw_helper.cl, patched into the jobs) for index buffers
+          * without a CPU view. Census mode skips the draw. */
+         MALI_TODO_V7("indexed draws whose index buffer has no CPU view");
+         if (!mali_v7_census())
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
       if (empty)

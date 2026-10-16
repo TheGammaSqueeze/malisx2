@@ -90,14 +90,27 @@
  * zero result its callers treat as failure), never pretends it worked.
  * Each site names the panvk_v7 function it should be ported from in a
  * TODO v7 comment next to it.
+ *
+ * Census mode (bring-up only): with MALISX2_V7_CENSUS=1 in the
+ * environment, or the Android property debug.malisx2.v7_census=1, each
+ * site logs "malisx2 v7 census: <function>: <what>" once instead, and the
+ * caller asks mali_v7_census() whether to degrade to a no-op or the
+ * closest safe behaviour rather than fail, so that one application run
+ * names every unported path it reaches. Off by default: the sites then
+ * log and fail exactly as before. Every site and what it does in census
+ * mode is listed in MALISX2_G52.md (milestone 5). The two functions are in
+ * mali_v7_census.c, which only the v7 library builds: only v7 code
+ * expands the macro.
  */
+void mali_v7_todo_log(const char *what, const char *func);
+bool mali_v7_census(void);
+
 #define MALI_TODO_V7(what)                                                     \
    do {                                                                        \
       static bool mali_todo_v7_said_;                                          \
       if (!mali_todo_v7_said_) {                                               \
          mali_todo_v7_said_ = true;                                            \
-         mesa_loge("malisx2: TODO v7: %s is not ported to Bifrost yet (%s)",    \
-                   what, __func__);                                            \
+         mali_v7_todo_log(what, __func__);                                     \
       }                                                                        \
    } while (0)
 
