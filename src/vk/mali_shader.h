@@ -333,6 +333,23 @@ enum mali_v7_desc_table {
    MALI_V7_DESC_TABLE_COUNT,
 };
 
+/*
+ * The image table's size limit. An Attribute names its Attribute Buffer
+ * with a 9-bit index (genxml v7.xml), so a stage sees 512 Attribute
+ * Buffer records, and each image takes a pair of them: from record 0 in a
+ * fragment or compute shader, behind the pairs of up to 16 vertex buffers
+ * in a vertex shader (mali_jm_cmd_draw.c). That leaves room for
+ * 512 / 2 - 16 = 240 images. An index past 511 would spill into the
+ * Attribute's Offset enable and Format bits, and nothing would catch it,
+ * so the per-stage limits keep the table within this size
+ * (mali_physical_device.c): storage images and storage texel buffers
+ * (maxPerStageDescriptorStorageImages) plus uniform texel buffers, which
+ * Vulkan counts as sampled images (maxPerStageDescriptorSampledImages).
+ * panvk_v7's limits allow 32 + 256 and overflow the field.
+ */
+#define MALI_V7_ATTRIB_BUF_RECORDS 512
+#define MALI_V7_MAX_STAGE_IMG_ENTRIES (MALI_V7_ATTRIB_BUF_RECORDS / 2 - 16)
+
 struct mali_v7_shader_desc {
    /* Entries of each table copied from sets (dynamic uniform buffers are
     * added behind count[UBO] from desc.dyn_bufs). */

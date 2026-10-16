@@ -673,6 +673,8 @@ cpu_img_copy(const uint8_t *slot, uint32_t idx, uint32_t attrib_buf_idx_offset,
    if (slot) {
       memcpy(src, slot, sizeof(src));
       const uint32_t buf_idx = idx * 2 + attrib_buf_idx_offset;
+      /* Both records of the pair within the 9-bit index (mali_shader.h). */
+      assert(buf_idx + 1 < MALI_V7_ATTRIB_BUF_RECORDS);
       if ((src[0] & BITFIELD_MASK(5)) == MALI_ATTRIBUTE_TYPE_1D) {
          /* Texel buffer: its own Attribute (format, offset enable, offset),
           * the Attribute Buffer alone. */
@@ -732,6 +734,10 @@ mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++)
       assert(!s->v7.count[tab] || (t->tables[tab] && t->tables_cpu[tab]));
    assert(!s->v7.count[MALI_V7_DESC_TABLE_IMG] || (t->img_attribs && t->img_attribs_cpu));
+   /* The last image pair's records within the 9-bit Attribute buffer
+    * index (mali_shader.h; v7_fixup_info refuses a bigger table). */
+   assert(attrib_buf_idx_offset + 2 * s->v7.count[MALI_V7_DESC_TABLE_IMG] <=
+          MALI_V7_ATTRIB_BUF_RECORDS);
 
    if (cpu_copy_mode()) {
       cpu_fill(s, desc, t, attrib_buf_idx_offset);

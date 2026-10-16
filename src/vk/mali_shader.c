@@ -1356,6 +1356,17 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
 static VkResult
 v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader *s)
 {
+   /* An image table the 9-bit Attribute buffer index cannot address
+    * (mali_shader.h). The per-stage limits keep every valid pipeline
+    * layout below this, so only a layout over the limits gets here; refuse
+    * it rather than pack indices that spill into the Attribute's format. */
+   if (s->v7.count[MALI_V7_DESC_TABLE_IMG] > MALI_V7_MAX_STAGE_IMG_ENTRIES)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "%s shader: %u storage images and texel buffers, more than the %u a "
+                       "Bifrost stage can address",
+                       mesa_shader_stage_name(s->stage), s->v7.count[MALI_V7_DESC_TABLE_IMG],
+                       MALI_V7_MAX_STAGE_IMG_ENTRIES);
+
    s->info.ubo_count = s->v7.count[MALI_V7_DESC_TABLE_UBO] + s->v7.dyn_ubo_count;
    s->info.texture_count = s->v7.count[MALI_V7_DESC_TABLE_TEXTURE];
    s->info.sampler_count = s->v7.count[MALI_V7_DESC_TABLE_SAMPLER];

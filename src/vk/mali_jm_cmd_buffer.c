@@ -549,19 +549,35 @@ mali_jm_cmd_add_batch(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b
 /* ---------------------------------------------------------------------- */
 /* Barriers                                                                */
 
+/* Blits done by compute. On Bifrost (v7) every blit accepted today is a
+ * 1:1 copy and runs as the compute copy on the vtc slot
+ * (mali_cmd_image.c), so a barrier that names the blit stage must order
+ * the vtc slot too. A legacy TRANSFER mask names the copy stage with it
+ * and was covered already; a synchronization2 mask can name the blit
+ * stage alone. The blit stays a fragment-slot transfer as well
+ * (FRAG_XFER_STAGES): scaled blits will be fragment passes once the
+ * frame shaders are ported, and ordering both slots is only more than
+ * needed. On v9 a blit is always a fragment pass. */
+#if PAN_ARCH < 9
+#define VTC_BLIT_STAGES VK_PIPELINE_STAGE_2_BLIT_BIT
+#else
+#define VTC_BLIT_STAGES 0
+#endif
+
 /* Stages whose work runs on the vtc slot: vertex and compute shading,
  * indirect and vertex input, and transfers done by compute (buffer copies,
- * fills, updates, buffer<->image copies). */
+ * fills, updates, buffer<->image copies, the v7 blits). */
 #define VTC_STAGES                                                             \
    (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | \
     VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | \
     VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |                      \
     VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |                   \
     VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | \
-    VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT)
+    VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT | VTC_BLIT_STAGES)
 
 /* The vtc-slot stages that are transfers. */
-#define VTC_XFER_STAGES (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT)
+#define VTC_XFER_STAGES                                                        \
+   (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT | VTC_BLIT_STAGES)
 
 /* Stages of rendering on the fragment slot. */
 #define FRAG_RENDER_STAGES                                                     \

@@ -508,8 +508,13 @@ emit_attrib_buf(const struct vk_vertex_binding_state *b, uint32_t stride, uint64
  * (MALI_V7_DESC_TABLE_IMG of its struct mali_v7_desc_tables, pointed here)
  * and are written by its descriptor copy (mali_v7_desc_copy), which runs
  * in front of the Vertex job; the image Attributes name buffer 2 x
- * (binding count + image index).
+ * (binding count + image index), which the image table's size limit keeps
+ * within the 9-bit Attribute buffer index (mali_shader.h).
  */
+static_assert(2 * (MALI_MAX_VBS + MALI_V7_MAX_STAGE_IMG_ENTRIES) <= MALI_V7_ATTRIB_BUF_RECORDS,
+              "a vertex shader's image pairs fit behind the vertex buffers' within the "
+              "Attribute's buffer index");
+
 static bool
 emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p,
                 const struct mali_draw_info *di, struct draw_data *dd)
@@ -524,6 +529,7 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
       num_imgs ? MALI_MAX_VS_ATTRIBS
                : MAX2(util_last_bit(vi->attributes_valid), p->vs->info.attribute_count);
    const unsigned buf_count = (num_vbs + num_imgs) * 2;
+   assert(buf_count <= MALI_V7_ATTRIB_BUF_RECORDS);
 
    struct mali_ptr bufs = mali_cmd_alloc(cmd, (buf_count + 1) * pan_size(ATTRIBUTE_BUFFER),
                                          pan_alignment(ATTRIBUTE_BUFFER));

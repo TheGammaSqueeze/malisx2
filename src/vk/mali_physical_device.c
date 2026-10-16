@@ -600,7 +600,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * (32 kept for internal UBOs), SSBOs addressed through one UBO of
     * 16-byte entries (12-bit count) and storage images through the 9-bit
     * attribute buffer index at two slots each
-    * (Mesa panvk_descriptor_set_layout.h, panvk_shader.h).
+    * (Mesa panvk_descriptor_set_layout.h, panvk_shader.h). One change
+    * from panvk_v7: storage images, storage texel buffers and uniform
+    * texel buffers share a stage's image table, and its 9-bit attribute
+    * buffer index holds MALI_V7_MAX_STAGE_IMG_ENTRIES (240, mali_shader.h)
+    * of them. Uniform texel buffers count as sampled images, so the
+    * sampled image limit is what is left after the storage images: 208
+    * rather than panvk's 256 (Vulkan asks for at least 16).
     */
    const bool v7 = p->arch_major == 7;
    const uint32_t set_samplers = v7 ? UINT16_MAX : 1u << 20;
@@ -609,10 +615,11 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    const uint32_t set_ssbos = v7 ? 1u << 12 : 1u << 20;
    const uint32_t set_storage_images = v7 ? 1u << 8 : 1u << 20;
    const uint32_t stage_samplers = v7 ? 128 : 1u << 20;
-   const uint32_t stage_sampled_images = v7 ? 256 : 1u << 20;
+   const uint32_t stage_storage_images = v7 ? 32 : 1u << 20;
+   const uint32_t stage_sampled_images =
+      v7 ? MALI_V7_MAX_STAGE_IMG_ENTRIES - stage_storage_images : 1u << 20;
    const uint32_t stage_ubos = v7 ? UINT8_MAX - 32 : 1u << 20;
    const uint32_t stage_ssbos = v7 ? 64 : 1u << 20;
-   const uint32_t stage_storage_images = v7 ? 32 : 1u << 20;
    const uint32_t stage_input_attachments = 9;
    const uint32_t stage_resources = stage_samplers + stage_ubos + stage_ssbos +
                                     stage_sampled_images + stage_storage_images +

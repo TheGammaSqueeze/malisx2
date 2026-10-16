@@ -26,12 +26,14 @@
  * a uniform 64 64 64 255 means the texture read as zero.
  *
  * The upload: vkCmdCopyBufferToImage goes through the driver's compute
- * copy (a v7 dispatch since the compute merge). On a driver without it,
- * recording fails with VK_ERROR_FEATURE_NOT_PRESENT, the texels are
- * written into the linear image's memory from the host instead, and the
- * verdict says so; --upload=copy makes that a failure, --upload=host skips
- * the copy. --tiled makes the texture optimally tiled (u-interleaved on
- * v7), which needs the copy path.
+ * copy (a v7 dispatch since the compute merge). Only on a driver that
+ * refuses the copy outright (recording fails with
+ * VK_ERROR_FEATURE_NOT_PRESENT, a TODO v7 stub) are the texels written into
+ * the linear image's memory from the host instead, and the verdict says
+ * so; any other recording failure is a FAIL of the copy path.
+ * --upload=copy makes the refusal a failure too, --upload=host skips the
+ * copy. --tiled makes the texture optimally tiled (u-interleaved on v7),
+ * which needs the copy path.
  *
  * The shaders are SPIR-V embedded as arrays, generated with glslangValidator
  * 16.6.0 (`glslangValidator -V --target-env vulkan1.1`) from:
@@ -926,14 +928,24 @@ main(int argc, char **argv)
             return st;
          upload_how = "vkCmdCopyBufferToImage (the driver's compute copy)";
          copied = true;
+      } else if (r == VK_ERROR_FEATURE_NOT_PRESENT && upload == UPLOAD_AUTO && !tiled) {
+         /* A driver that refuses the copy (a TODO v7 stub): the host write
+          * below, and the verdict says so. */
+         printf("  vkCmdCopyBufferToImage: recording refused with %s (the driver has no copy "
+                "for this upload; see the log's TODO v7 line); writing from the host\n",
+                result_str(r));
       } else {
-         printf("  vkCmdCopyBufferToImage: recording failed with %s (the v7 compute copy is not "
-                "available in this build; see the log's TODO v7 line)\n", result_str(r));
-         if (upload == UPLOAD_COPY || tiled) {
-            printf("FAIL: the texture upload needs the copy path (%s)\n",
-                   tiled ? "a tiled texture" : "--upload=copy");
-            return 1;
-         }
+         /* Any other failure is the copy path's own: a copy shader that did
+          * not compile, its dispatch or command memory. */
+         printf("  vkCmdCopyBufferToImage: recording failed with %s (the compute copy path; "
+                "see the log)\n", result_str(r));
+         const char *why = "";
+         if (upload == UPLOAD_COPY)
+            why = " (--upload=copy)";
+         else if (tiled)
+            why = " (a tiled texture needs the copy)";
+         printf("FAIL: the texture upload through vkCmdCopyBufferToImage did not record%s\n", why);
+         return 1;
       }
    }
    if (!copied) {

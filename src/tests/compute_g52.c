@@ -9,11 +9,20 @@
  * proves the Compute job, the Bifrost descriptor tables (storage buffers
  * read from the set through the desc.sets system values, a storage image
  * through the attribute unit, filled by the descriptor copy job), push
- * constants in FAU and the compute system values: a compute shader runs
- * 4 workgroups of 64, reads a storage buffer of 256 u32, writes each value
- * times a push constant (3) plus the global invocation id into a second
- * storage buffer, and stores a gradient into a 16x16 RGBA8 storage image;
- * both are read back and checked.
+ * constants in FAU and the compute system values. Two dispatches of the
+ * same shader in one command buffer:
+ *
+ *  - vkCmdDispatch, 4 workgroups of 64: reads words 0..255 of a storage
+ *    buffer, writes each value times pc.mul (3) plus the global invocation
+ *    id plus pc.add (0x00c0ffee) into a second storage buffer, and stores a
+ *    gradient into a 16x16 RGBA8 storage image;
+ *  - vkCmdDispatchBase with base workgroup 4, 4 workgroups, after new push
+ *    constants (pc.add 0x0badf00d): words 256..511, no image stores.
+ *
+ * pc.add sits in the upper half of a 64-bit FAU word and the base
+ * workgroup in the system values, so a dropped high half, stale push
+ * constants or an ignored base all show up as wrong words. Both buffers and
+ * the image are read back and checked.
  *
  * The shader is SPIR-V embedded as an array, generated with glslangValidator
  * 16.6.0 (`glslangValidator -V --target-env vulkan1.1`) from:
@@ -72,13 +81,15 @@
 #define COMPUTE_G52_DEFAULT_ICD "libvulkan_malisx2.so"
 #endif
 
-#define N 256
+#define N 256             /* invocations of one dispatch */
+#define WORDS (2 * N)     /* the words both dispatches write */
 #define WG 64
 #define IMG_W 16
 #define IMG_H 16
 #define WAIT_NS (5ull * 1000 * 1000 * 1000)
 #define PC_MUL 3u
-#define PC_ADD 0u
+#define PC_ADD 0x00c0ffeeu  /* vkCmdDispatch, words 0..N-1 */
+#define PC_ADD2 0x0badf00du /* vkCmdDispatchBase, words N..WORDS-1 */
 
 static const uint32_t comp_spv[] = {
    0x07230203, 0x00010300, 0x0008000b, 0x00000056, 0x00000000, 0x00020011,
@@ -210,6 +221,15 @@ now_ns(void)
    return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
+/* What the shader writes to output word i: the first dispatch's words use
+ * pc.add PC_ADD, the vkCmdDispatchBase ones PC_ADD2 (u32 arithmetic, as on
+ * the GPU). */
+static uint32_t
+word_want(const uint32_t *in_words, uint32_t i)
+{
+   return in_words[i] * PC_MUL + i + (i < N ? PC_ADD : PC_ADD2);
+}
+
 struct fns {
    PFN_vkGetInstanceProcAddr gipa;
    PFN_vkCreateInstance CreateInstance;
@@ -263,6 +283,7 @@ struct fns {
    PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
    PFN_vkCmdPushConstants CmdPushConstants;
    PFN_vkCmdDispatch CmdDispatch;
+   PFN_vkCmdDispatchBase CmdDispatchBase;
    PFN_vkCreateFence CreateFence;
    PFN_vkDestroyFence DestroyFence;
    PFN_vkQueueSubmit QueueSubmit;
@@ -627,6 +648,7 @@ main(int argc, char **argv)
    DEV(CmdBindDescriptorSets);
    DEV(CmdPushConstants);
    DEV(CmdDispatch);
+   DEV(CmdDispatchBase);
    DEV(CreateFence);
    DEV(DestroyFence);
    DEV(QueueSubmit);
@@ -644,18 +666,18 @@ main(int argc, char **argv)
 
    /* The two storage buffers. */
    struct hbuf in, out;
-   if (!hbuf_create(&f, device, &mem_props, N * sizeof(uint32_t),
+   if (!hbuf_create(&f, device, &mem_props, WORDS * sizeof(uint32_t),
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "input", &in) ||
-       !hbuf_create(&f, device, &mem_props, N * sizeof(uint32_t),
+       !hbuf_create(&f, device, &mem_props, WORDS * sizeof(uint32_t),
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "output", &out))
       return 1;
    uint32_t *in_words = in.map;
-   for (uint32_t i = 0; i < N; i++)
+   for (uint32_t i = 0; i < WORDS; i++)
       in_words[i] = i * 7u + 11u;
-   memset(out.map, 0xa5, N * sizeof(uint32_t));
+   memset(out.map, 0xa5, WORDS * sizeof(uint32_t));
    hbuf_flush(&f, device, &in, false);
    hbuf_flush(&f, device, &out, false);
-   printf("  storage buffers: 2 x %u bytes\n", (unsigned)(N * sizeof(uint32_t)));
+   printf("  storage buffers: 2 x %u bytes\n", (unsigned)(WORDS * sizeof(uint32_t)));
 
    /* The storage image. */
    const VkImageTiling tiling = linear_storage ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
@@ -825,6 +847,8 @@ main(int argc, char **argv)
    }
    const VkComputePipelineCreateInfo cpci = {
       .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      /* The second dispatch has a nonzero base workgroup. */
+      .flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT,
       .stage = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -900,6 +924,12 @@ main(int argc, char **argv)
    const uint32_t pc[2] = {PC_MUL, PC_ADD};
    f.CmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
    f.CmdDispatch(cmd, N / WG, 1, 1);
+   /* Words N.. : the base workgroup moves gl_GlobalInvocationID past the
+    * first dispatch's (and past the image stores), with a new pc.add. The
+    * two dispatches write disjoint words: no barrier between them. */
+   const uint32_t pc2[2] = {PC_MUL, PC_ADD2};
+   f.CmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), pc2);
+   f.CmdDispatchBase(cmd, N / WG, 0, 0, N / WG, 1, 1);
 
    const VkMemoryBarrier shader_to_host = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -916,7 +946,8 @@ main(int argc, char **argv)
               "log)\n", result_str(r));
       return 1;
    }
-   printf("  command buffer recorded (one dispatch of %u x 1 x 1 workgroups of %u)\n", N / WG, WG);
+   printf("  command buffer recorded (vkCmdDispatch %u x 1 x 1, then vkCmdDispatchBase from "
+          "workgroup %u, %u x 1 x 1; workgroups of %u)\n", N / WG, N / WG, N / WG, WG);
 
    const VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
    VkFence fence = VK_NULL_HANDLE;
@@ -939,8 +970,8 @@ main(int argc, char **argv)
          print_fault(&f, device);
       return 1;
    }
-   printf("  submitted (one vtc atom: descriptor copy job + compute job); waiting up to %llu ms\n",
-          (unsigned long long)(WAIT_NS / 1000000));
+   printf("  submitted (one vtc atom: a descriptor copy job and a compute job per dispatch); "
+          "waiting up to %llu ms\n", (unsigned long long)(WAIT_NS / 1000000));
 
    r = f.WaitForFences(device, 1, &fence, VK_TRUE, WAIT_NS);
    const int64_t t1 = now_ns();
@@ -961,27 +992,60 @@ main(int argc, char **argv)
    if (!icoherent)
       f.InvalidateMappedMemoryRanges(device, 1, &iwhole);
 
-   /* The buffer. */
+   /* The buffer: words 0..N-1 from vkCmdDispatch with PC_ADD, words
+    * N..WORDS-1 from vkCmdDispatchBase with PC_ADD2. */
    const uint32_t *out_words = out.map;
-   uint32_t bad = 0, untouched = 0;
+   uint32_t bad = 0, untouched = 0, bad_half[2] = {0, 0}, untouched_half[2] = {0, 0};
+   /* The known wrong shapes: pc.add read as 0, the second dispatch with
+    * the first one's push constants, the first dispatch's words written by
+    * the second (its base lost). */
+   uint32_t no_add = 0, stale_pc = 0, first_half_add2 = 0;
    int first_bad = -1;
-   for (uint32_t i = 0; i < N; i++) {
-      const uint32_t want = in_words[i] * PC_MUL + i + PC_ADD;
+   for (uint32_t i = 0; i < WORDS; i++) {
+      const unsigned half = i >= N;
+      const uint32_t want = word_want(in_words, i);
       if (out_words[i] == want)
          continue;
-      if (out_words[i] == 0xa5a5a5a5u)
+      if (out_words[i] == 0xa5a5a5a5u) {
          untouched++;
+         untouched_half[half]++;
+      }
+      const uint32_t base_word = in_words[i] * PC_MUL + i;
+      if (out_words[i] == base_word)
+         no_add++;
+      else if (half && out_words[i] == base_word + PC_ADD)
+         stale_pc++;
+      else if (!half && out_words[i] == base_word + PC_ADD2)
+         first_half_add2++;
       if (first_bad < 0)
          first_bad = (int)i;
       bad++;
+      bad_half[half]++;
    }
-   printf("  buffer: out[0] = %u (want %u), out[%u] = %u (want %u)\n", out_words[0],
-          in_words[0] * PC_MUL + 0 + PC_ADD, N - 1, out_words[N - 1],
-          in_words[N - 1] * PC_MUL + (N - 1) + PC_ADD);
-   if (bad)
+   printf("  buffer (vkCmdDispatch): out[0] = 0x%08x (want 0x%08x), out[%u] = 0x%08x "
+          "(want 0x%08x)\n", out_words[0], word_want(in_words, 0), N - 1, out_words[N - 1],
+          word_want(in_words, N - 1));
+   printf("  buffer (vkCmdDispatchBase): out[%u] = 0x%08x (want 0x%08x), out[%u] = 0x%08x "
+          "(want 0x%08x)\n", N, out_words[N], word_want(in_words, N), WORDS - 1,
+          out_words[WORDS - 1], word_want(in_words, WORDS - 1));
+   if (bad) {
       printf("  buffer: %u of %u words wrong (%u still hold the 0xa5 sentinel); first at %d = "
-             "%u, want %u\n", bad, N, untouched, first_bad, out_words[first_bad],
-             in_words[first_bad] * PC_MUL + (uint32_t)first_bad + PC_ADD);
+             "0x%08x, want 0x%08x\n", bad, WORDS, untouched, first_bad, out_words[first_bad],
+             word_want(in_words, (uint32_t)first_bad));
+      printf("  buffer: vkCmdDispatch half %u wrong (%u untouched), vkCmdDispatchBase half %u "
+             "wrong (%u untouched)\n", bad_half[0], untouched_half[0], bad_half[1],
+             untouched_half[1]);
+      if (no_add)
+         printf("  buffer: %u words lack pc.add: it read as 0 (the upper half of the push "
+                "constant FAU word)\n", no_add);
+      if (stale_pc)
+         printf("  buffer: %u of the second dispatch's words carry the first dispatch's pc.add: "
+                "stale push constants\n", stale_pc);
+      if (first_half_add2)
+         printf("  buffer: %u of the first dispatch's words were written by the second "
+                "dispatch%s: its base workgroup (system values) was ignored\n", first_half_add2,
+                untouched_half[1] == N ? ", which left its own words untouched" : "");
+   }
 
    /* The image: R = x * 17, G = y * 17, B = 128, A = 255 (one LSB of slack:
     * float to UNORM rounding). */
@@ -1032,7 +1096,8 @@ main(int argc, char **argv)
 
    int status;
    if (!bad && !ibad) {
-      printf("PASS: %u buffer words and %u image pixels as expected\n", N, IMG_W * IMG_H);
+      printf("PASS: %u buffer words (two dispatches) and %u image pixels as expected\n", WORDS,
+             IMG_W * IMG_H);
       status = 0;
    } else {
       printf("FAIL: %u buffer words and %u image pixels wrong\n", bad, ibad);
