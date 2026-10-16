@@ -280,6 +280,10 @@ struct mali_kbase {
    enum mali_kbase_jm_atom_layout jm_atom_layout;
    int jm_probe_errno;
    uint32_t jm_probe_event;
+   /* Job manager only: MEM_JIT_INIT was refused with ENOMEM (the JIT zone
+    * did not fit the GPU's VA after the executable zone) and the context
+    * runs without a JIT zone, which the job-manager path does not use. */
+   bool jm_no_jit;
    /* SET_FLAGS succeeded: the kernel context exists. */
    bool context_created;
    /* mali_kbase_abandon was called. */
@@ -305,7 +309,9 @@ struct mali_kbase {
  *      page (BASE_MEM_MAP_TRACKING_HANDLE, required before any
  *      allocation on this kernel), GET_GPUPROPS, MEM_EXEC_INIT,
  *      MEM_JIT_INIT (trim level 0; we do not use JIT memory, see
- *      mali_kbase_alloc). Then one JOB_SUBMIT of a dependency-only atom
+ *      mali_kbase_alloc, so a kernel that refuses it with ENOMEM because
+ *      the GPU's VA is too narrow for the zone is accepted without one,
+ *      jm_no_jit). Then one JOB_SUBMIT of a dependency-only atom
  *      at stride 72 picks the atom layout: EINVAL means a stock kernel
  *      (64-byte base_jd_atom); acceptance means the MediaTek frame_nr
  *      layout, and the atom's completion event is read back before

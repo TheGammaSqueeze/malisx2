@@ -235,6 +235,11 @@ mali_kbase_jm_atom_layout_str(const struct mali_kbase *kb, char *buf, size_t siz
       snprintf(buf, size, "64-byte atoms (stock kbase): the kernel refused stride 72 (%s)",
                strerror(kb->jm_probe_errno));
    }
+   if (kb->jm_no_jit) {
+      size_t n = strlen(buf);
+      snprintf(buf + n, size > n ? size - n : 0,
+               "; no JIT zone (MEM_JIT_INIT refused, GPU MMU VA %u bits)", kb->props.va_bits);
+   }
    return buf;
 }
 

@@ -311,6 +311,25 @@ jit_init(struct mali_kbase *kb)
       .phys_pages = KB_JIT_VA_PAGES,
    };
    long ret = kb_ioctl(kb, KB_IOCTL_MEM_JIT_INIT, &ji);
+   if (ret == -ENOMEM && kb->frontend == MALI_KBASE_FRONTEND_JM) {
+      /* The JIT zone is cut from the end of the SAME_VA zone, after the
+       * 4 GiB executable zone, and the SAME_VA zone is 2^min(CPU VA bits,
+       * GPU MMU VA bits) bytes (kbase_region_tracker_init_jit_64 answers
+       * ENOMEM when the request does not fit). On a GPU with a narrow MMU
+       * (the RK3568's Mali-G52: 33 bits, 8 GiB, of which the executable
+       * zone already took 4 GiB) the blob's 128 GiB request cannot fit.
+       * The job-manager path never uses JIT memory: no JIT soft jobs, and
+       * every MEM_ALLOC lands in the SAME_VA or executable zone, neither
+       * of which needs the CUSTOM_VA zone JIT would create. So go on
+       * without it, and keep the SAME_VA space for real allocations. A
+       * CSF context keeps failing here: its tiler heap chunks come from
+       * that zone. */
+      KB_LOG(kb, "MEM_JIT_INIT of %llu pages refused with ENOMEM (GPU MMU VA %u bits); "
+                 "going on without a JIT zone, which the job-manager path does not use",
+             (unsigned long long)KB_JIT_VA_PAGES, kb->props.va_bits);
+      kb->jm_no_jit = true;
+      return MALI_KBASE_SUCCESS;
+   }
    if (ret < 0) {
       KB_LOG(kb, "MEM_JIT_INIT failed: %s", strerror((int)-ret));
       return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
