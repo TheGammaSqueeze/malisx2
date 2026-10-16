@@ -105,6 +105,11 @@
 void mali_v7_todo_log(const char *what, const char *func);
 bool mali_v7_census(void);
 
+/* A v7 triage switch: the environment variable `env`, else the Android
+ * property `prop`, else `def` (mali_v7_census.c). Not cached: callers
+ * read it once. */
+bool mali_v7_debug_switch(const char *env, const char *prop, bool def);
+
 #define MALI_TODO_V7(what)                                                     \
    do {                                                                        \
       static bool mali_todo_v7_said_;                                          \

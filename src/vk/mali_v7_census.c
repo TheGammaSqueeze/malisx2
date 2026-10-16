@@ -5,12 +5,17 @@
 
 /*
  * The census mode of the Bifrost (v7) bring-up (mali_arch.h, MALI_TODO_V7):
- * whether it is on, and the once-per-site log line of an unported path.
+ * whether it is on, and the once-per-site log line of an unported path;
+ * and the reader of the v7 triage switches it shares with the other ones
+ * (mali_v7_debug_switch).
  *
- * On: MALISX2_V7_CENSUS set to anything but "" or "0", or, when the
- * variable is not set, the Android property debug.malisx2.v7_census set to
- * "1", "true", "on" or "yes" (the way debug.malisx2.measure is read,
- * measurement/config.c). The answer is read once per process.
+ * A switch is an environment variable, or, when the variable is not set,
+ * an Android property (the way debug.malisx2.measure is read,
+ * measurement/config.c): an application started by a launcher gets no
+ * environment of ours, but setprop reaches it. "0", "false", "off" and
+ * "no" turn a switch off, any other non-empty value on; unset or empty
+ * leaves its default. Census: MALISX2_V7_CENSUS / debug.malisx2.v7_census,
+ * off by default, read once per process.
  *
  * Built into the v7 library only (src/meson.build), so the v9 and v11
  * objects do not change.
@@ -28,26 +33,26 @@
 #endif
 
 static bool
-census_value_on(const char *s)
+switch_value_on(const char *s)
 {
-   if (!s || !*s)
-      return false;
    return strcmp(s, "0") != 0 && strcmp(s, "false") != 0 && strcmp(s, "off") != 0 &&
           strcmp(s, "no") != 0;
 }
 
-static bool
-census_read(void)
+bool
+mali_v7_debug_switch(const char *env, const char *prop, bool def)
 {
-   const char *s = getenv("MALISX2_V7_CENSUS");
-   if (s)
-      return census_value_on(s);
+   const char *s = getenv(env);
+   if (s && *s)
+      return switch_value_on(s);
 #ifdef __ANDROID__
-   char prop[PROP_VALUE_MAX] = "";
-   if (__system_property_get("debug.malisx2.v7_census", prop) > 0)
-      return census_value_on(prop);
+   char value[PROP_VALUE_MAX] = "";
+   if (__system_property_get(prop, value) > 0 && value[0])
+      return switch_value_on(value);
+#else
+   (void)prop;
 #endif
-   return false;
+   return def;
 }
 
 bool
@@ -58,7 +63,7 @@ mali_v7_census(void)
    static int state;
    int s = __atomic_load_n(&state, __ATOMIC_RELAXED);
    if (!s) {
-      s = census_read() ? 2 : 1;
+      s = mali_v7_debug_switch("MALISX2_V7_CENSUS", "debug.malisx2.v7_census", false) ? 2 : 1;
       __atomic_store_n(&state, s, __ATOMIC_RELAXED);
       if (s == 2)
          mesa_logw("malisx2 v7 census: on: unported Bifrost paths log once each and degrade "

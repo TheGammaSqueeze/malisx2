@@ -248,13 +248,6 @@ mali_jm_cmd_pass_split(struct mali_cmd_buffer *cmd)
 /* ---------------------------------------------------------------------- */
 /* Full-screen jobs                                                        */
 
-/*
- * Fullscreen jobs (type 12, 128 bytes) running the Draw descriptor dcd over
- * rect in layers [base_layer, base_layer + layer_count), one per layer, on
- * the layer's tiler context. They are tiler-side jobs in the batch's vtc
- * chain (Dependency 2 = the previous tiler-side job). barrier: the header's
- * Barrier bit, which the blob sets on its in-pass clears.
- */
 #if PAN_ARCH < 9
 /* pan_pack_work_groups_compute(out, 1, 4, 1, 1, 1, 1, true, false): one
  * instance of four vertices, the graphics quirks (mali_jm_cmd_draw.c
@@ -360,6 +353,13 @@ mali_v7_cmd_meta_quads(struct mali_cmd_buffer *cmd, const void *draw, const VkRe
 }
 #endif /* PAN_ARCH < 9 */
 
+/*
+ * Fullscreen jobs (type 12, 128 bytes) running the Draw descriptor dcd over
+ * rect in layers [base_layer, base_layer + layer_count), one per layer, on
+ * the layer's tiler context. They are tiler-side jobs in the batch's vtc
+ * chain (Dependency 2 = the previous tiler-side job). barrier: the header's
+ * Barrier bit, which the blob sets on its in-pass clears.
+ */
 static void
 fullscreen_jobs(struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
                 uint32_t base_layer, uint32_t layer_count, bool barrier)
@@ -520,23 +520,23 @@ MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
 
 #if PAN_ARCH < 9
 /*
- * MALISX2_V7_FRAME_TILER=1 (a triage switch for the device runs): a pass
- * that runs frame shaders but tiled nothing (a blit, an image clear with
- * a border, a LOAD pass without draws) gets its Tiler Contexts anyway, as
- * panvk_v7 gives every fragment job one (jm/panvk_vX_cmd_buffer.c
- * cmd_close_batch, cmd_prepare_tiler_context). Off by default: the FBD's
- * tiler pointer stays 0, as on v9 and as Mesa's gallium driver leaves it
- * for a batch without draws, which runs frame shaders too (a clear with
- * a preloaded depth buffer). Read once.
+ * MALISX2_V7_FRAME_TILER=1 or the property debug.malisx2.v7_frame_tiler=1
+ * (a triage switch for the device runs): a pass that runs frame shaders
+ * but tiled nothing (a blit, an image clear with a border, a LOAD pass
+ * without draws) gets its Tiler Contexts anyway, as panvk_v7 gives every
+ * fragment job one (jm/panvk_vX_cmd_buffer.c cmd_close_batch,
+ * cmd_prepare_tiler_context). Off by default: the FBD's tiler pointer
+ * stays 0, as on v9 and as Mesa's gallium driver leaves it for a batch
+ * without draws, which runs frame shaders too (a clear with a preloaded
+ * depth buffer). Read once.
  */
 static bool
 frame_tiler_forced(void)
 {
    static int on = -1;
-   if (on < 0) {
-      const char *e = getenv("MALISX2_V7_FRAME_TILER");
-      on = e && *e && strcmp(e, "0") != 0;
-   }
+   if (on < 0)
+      on = mali_v7_debug_switch("MALISX2_V7_FRAME_TILER", "debug.malisx2.v7_frame_tiler",
+                                false);
    return on;
 }
 

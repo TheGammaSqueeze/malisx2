@@ -39,6 +39,17 @@ compressed_format_bits(const struct mali_physical_device *pdev)
                                           : pdev->props.raw_texture_features[0];
 }
 
+#if PAN_ARCH < 9
+static bool
+zs_blit_dst_offered(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = mali_v7_debug_switch("MALISX2_V7_ZS_BLIT", "debug.malisx2.v7_zs_blit", true);
+   return on;
+}
+#endif
+
 static bool
 pipe_format_supported(const struct mali_physical_device *pdev, enum pipe_format p)
 {
@@ -100,8 +111,12 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
 #if PAN_ARCH < 9
    /* v7 blits depth and stencil through a frame shader that writes them
     * (mali_cmd_image.c), so its depth/stencil formats are blit
-    * destinations too (nearest only, identical formats, as Vulkan asks). */
-   if ((f->bind & PAN_BIND_DEPTH_STENCIL) && (f->bind & PAN_BIND_SAMPLER_VIEW))
+    * destinations too (nearest only, identical formats, as Vulkan asks).
+    * Applications choose their depth copy path from this bit (azahar's
+    * blit_support); MALISX2_V7_ZS_BLIT=0 or debug.malisx2.v7_zs_blit=0
+    * withdraws it for triage (the driver still blits depth if asked). */
+   if ((f->bind & PAN_BIND_DEPTH_STENCIL) && (f->bind & PAN_BIND_SAMPLER_VIEW) &&
+       zs_blit_dst_offered())
       feat |= VK_FORMAT_FEATURE_BLIT_DST_BIT;
 #endif
 
