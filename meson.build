@@ -34,9 +34,9 @@ project(
 pan_arch = 11
 
 # Every arch we generate genxml packers and a pixel-format library for, and
-# build the per-arch vk/ files for (src/meson.build): 9 for the G57's
-# job-manager back half, 11 for the G615.
-pan_archs = [9, pan_arch]
+# build the per-arch vk/ files for (src/meson.build): 7 for the G52's
+# (Bifrost) job-manager back half, 9 for the G57's, 11 for the G615.
+pan_archs = [7, 9, pan_arch]
 
 cc = meson.get_compiler('c')
 cpp = meson.get_compiler('cpp')

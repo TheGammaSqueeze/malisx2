@@ -37,6 +37,9 @@
 #include "util/list.h"
 #include "util/u_dynarray.h"
 
+/* The per-arch names of the job-manager functions declared below. */
+#include "mali_arch.h"
+
 /* The command-stream back half's region API (mali_measure_begin) takes its
  * subqueue enum. The v9 per-arch files include this header only for the
  * shader dump directory (mali_measure_shader_dir). */
@@ -212,7 +215,7 @@ void mali_measure_extra(struct mali_cmd_buffer *cmd, uint32_t handle, uint32_t e
  * frontend-neutral), never cmd. */
 void mali_measure_harvest(struct mali_measure *m, struct mali_measure_cmd *mc);
 
-#if defined(PAN_ARCH) && PAN_ARCH == 9
+#if defined(PAN_ARCH) && PAN_ARCH < 10
 struct mali_jm_chain;
 
 /*

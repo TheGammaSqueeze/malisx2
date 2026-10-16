@@ -1238,6 +1238,7 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
 /* ---------------------------------------------------------------------- */
 /* Upload                                                                  */
 
+#if PAN_ARCH >= 9
 static enum mali_flush_to_zero_mode
 ftz_mode(const struct mali_shader *s)
 {
@@ -1267,6 +1268,7 @@ spd_stage(mesa_shader_stage stage)
       return MALI_SHADER_STAGE_COMPUTE;
    }
 }
+#endif /* PAN_ARCH >= 9 */
 
 /*
  * Copy the code into the executable pool and build the SPDs, using
@@ -1405,6 +1407,29 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
    /* The inline constant pool is addressed as PC + a 32-bit offset. */
    assert(s->code.gpu_va >> 32 == (s->code.gpu_va + padded - 1) >> 32);
 
+#if PAN_ARCH < 9
+   /*
+    * v7 has no Shader Program Descriptor: the Renderer State Descriptor of
+    * a draw and the Draw section of a Compute job point at the code
+    * itself, with the stage's properties (register allocation, flush to
+    * zero, helper threads) packed next to the pointer (panvk_v7
+    * panvk_vX_shader.c panvk_per_arch(shader_upload) /
+    * panvk_vX_cmd_draw.c emit_rsd). So on v7 spd[] holds the entry
+    * addresses the RSD builder will take: the main entry, the vertex
+    * entries with and without the point-size write, the varying shader.
+    * Without IDVS the Bifrost compiler reports no secondary entry and a
+    * zero no_psiz_offset, so a vertex shader has one entry.
+    */
+   if (s->stage != MESA_SHADER_VERTEX) {
+      s->spd[MALI_SPD_MAIN] = s->code.gpu_va;
+      return VK_SUCCESS;
+   }
+   s->spd[MALI_SPD_POS_POINTS] = s->code.gpu_va;
+   s->spd[MALI_SPD_POS_TRIANGLES] = s->code.gpu_va + s->info.vs.no_psiz_offset;
+   s->spd[MALI_SPD_VARYING] =
+      s->info.vs.secondary_enable ? s->code.gpu_va + s->info.vs.secondary_offset : 0;
+   return VK_SUCCESS;
+#else
    const unsigned spd_count = s->stage == MESA_SHADER_VERTEX ? 3 : 1;
    if (mali_bo_pool_alloc(&dev->desc_pool, spd_count * MALI_SPD_SIZE, MALI_SPD_SIZE,
                           &s->spd_mem) != MALI_KBASE_SUCCESS)
@@ -1458,6 +1483,7 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
    }
 
    return VK_SUCCESS;
+#endif /* PAN_ARCH >= 9 */
 }
 
 /* ---------------------------------------------------------------------- */

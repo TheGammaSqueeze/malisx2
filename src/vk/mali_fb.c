@@ -445,6 +445,7 @@ target_mem(const struct mali_fb_target *t, unsigned layer, uint64_t *base,
    *surf_stride = s->surface_stride;
 }
 
+#if PAN_ARCH >= 9
 /* get_afbc_att_mem_props: the layer's first header, the body offset from
  * it and the header row stride. */
 static void
@@ -469,6 +470,7 @@ afbc_reverse_issue_order(const struct mali_render_state *r)
    tile_dims(r->tile_size, &tw, &th);
    return tw < AFBC_BLOCK || th < AFBC_BLOCK;
 }
+#endif /* PAN_ARCH >= 9 */
 
 static enum mali_block_format
 target_block_format(const struct mali_fb_target *t)
@@ -648,6 +650,13 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
       pan_merge(&desc, &part, ZS_CRC_EXTENSION);
    }
 
+#if PAN_ARCH < 9
+   /* TODO v7: AFBC depth/stencil targets (absolute body pointer, no
+    * separate AFBC stencil target: Mesa pan_emit_afbc_zs_attachment at
+    * PAN_ARCH 7). mali_image.c gives v7 images no AFBC modifier yet. */
+   assert(!target_is_afbc(zt) && !target_is_afbc(st));
+   if (zt->image && zt->store) {
+#else
    if (zt->image && zt->store && target_is_afbc(zt)) {
       uint64_t header;
       uint32_t body, row;
@@ -662,6 +671,7 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
       }
       pan_merge(&desc, &part, ZS_CRC_EXTENSION);
    } else if (zt->image && zt->store) {
+#endif
       uint64_t base, surf;
       uint32_t row;
       target_mem(zt, layer, &base, &row, &surf);
@@ -679,6 +689,9 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
       }
       pan_merge(&desc, &part, ZS_CRC_EXTENSION);
    }
+#if PAN_ARCH < 9
+   if (st->image && st->store) {
+#else
    if (st->image && st->store && target_is_afbc(st)) {
       uint64_t header;
       uint32_t body, row;
@@ -693,6 +706,7 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
       }
       pan_merge(&desc, &part, ZS_CRC_EXTENSION);
    } else if (st->image && st->store) {
+#endif
       uint64_t base, surf;
       uint32_t row;
       target_mem(st, layer, &base, &row, &surf);
@@ -713,6 +727,24 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
    memcpy(out, &desc, sizeof(desc));
 }
 
+#if PAN_ARCH < 9
+/* TODO v7: AFBC colour targets take an absolute body pointer and body
+ * size and no compression mode word (Mesa pan_emit_afbc_color_attachment
+ * at PAN_ARCH 7). mali_image.c gives v7 images no AFBC modifier yet, so
+ * this is never reached; a target that writes nothing is packed in case. */
+static void
+pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, unsigned i,
+             unsigned layer, const uint32_t clear[4], void *out)
+{
+   MALI_TODO_V7("AFBC render targets");
+   pan_cast_and_pack(out, RGB_RENDER_TARGET, cfg) {
+      cfg.internal_buffer_offset = r->rt_offset[i];
+      cfg.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
+      cfg.write_enable = false;
+      cfg.writeback_block_format = MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED;
+   }
+}
+#else
 /* pan_emit_afbc_color_attachment for v9+. */
 static void
 pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, unsigned i,
@@ -748,6 +780,7 @@ pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, 
       cfg.compression_mode = MALI_PER_ARCH(image_afbc_hw_mode)(t->image, t->plane);
    }
 }
+#endif
 
 static void
 pack_rt(const struct mali_render_state *r, unsigned i, unsigned layer, void *out)
@@ -855,10 +888,12 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
          cfg.post_frame = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
          cfg.frame_shader_dcds = dcds;
          cfg.sample_locations = samples;
+#if PAN_ARCH >= 9
          /* The layer inside its tiler context selects the primitive list;
           * the frame argument reaches the fragment shader as the layer. */
          cfg.internal_layer_index = l % MALI_LAYERS_PER_TILER_CTX;
          cfg.frame_argument = l;
+#endif
          cfg.width = r->desc.width;
          cfg.height = r->desc.height;
          cfg.bound_min_x = r->minx;
@@ -869,8 +904,15 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
          cfg.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
          cfg.tie_break_rule = MALI_TIE_BREAK_RULE_MINUS_180_IN_0_OUT;
          cfg.effective_tile_size = r->tile_size;
+#if PAN_ARCH >= 9
          cfg.point_sprite_coord_origin_max_y = false;
          cfg.first_provoking_vertex = r->first_provoking_vertex;
+#else
+         /* v7: the provoking vertex is a Primitive bit of each tiler job
+          * (panvk_v7 panvk_vX_cmd_draw.c), the point sprite origin a
+          * shader-side matter; one framebuffer descriptor per layer, so
+          * no layer index here. */
+#endif
          cfg.render_target_count = r->rt_count;
          cfg.color_buffer_allocation = r->cbuf_alloc;
          if (st->image) {
@@ -923,8 +965,13 @@ MALI_PER_ARCH(fb_fill_tsd)(struct mali_cmd_buffer *cmd, struct mali_render_state
    pan_cast_and_pack(r->tsd_cpu, LOCAL_STORAGE, cfg) {
       if (tls) {
          cfg.tls_size = util_logbase2_ceil(DIV_ROUND_UP(r->tls_size, 16));
+#if PAN_ARCH >= 9
          cfg.tls_address_mode = MALI_ADDRESS_MODE_PACKED;
          cfg.tls_base_pointer = tls >> 8;
+#else
+         /* v7 has no address mode: the full pointer (Mesa pan_emit_tls). */
+         cfg.tls_base_pointer = tls;
+#endif
       }
       cfg.wls_instances = MALI_LOCAL_STORAGE_NO_WORKGROUP_MEM;
    }

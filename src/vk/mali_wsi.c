@@ -43,7 +43,7 @@
 
 #include "mali_image.h"
 #include "mali_memory.h"
-#if defined(PAN_ARCH) && PAN_ARCH == 9
+#if defined(PAN_ARCH) && PAN_ARCH < 10
 #include "mali_jm.h"
 #else
 #include "mali_queue.h"
@@ -56,7 +56,7 @@
 #define wsi_errorf(obj, result, ...)                                            \
    (mesa_loge("malisx2: WSI: " __VA_ARGS__), vk_errorf(obj, result, __VA_ARGS__))
 
-#if PAN_ARCH != 9
+#if PAN_ARCH >= 10
 
 /* ---------------------------------------------------------------------- */
 /* Gralloc usage                                                           */
@@ -333,7 +333,7 @@ mali_wsi_acquire(struct mali_device *dev, int fd, VkSemaphore semaphore, VkFence
    return result;
 }
 
-#endif /* PAN_ARCH != 9 */
+#endif /* PAN_ARCH >= 10 */
 
 /* ---------------------------------------------------------------------- */
 /* Release (per architecture: see the file comment)                        */
@@ -342,7 +342,7 @@ mali_wsi_acquire(struct mali_device *dev, int fd, VkSemaphore semaphore, VkFence
  * per CSF subqueue on v11, the submission number and tracker atom on v9
  * (mali_jm.h's MALI_SYNC_REQ_COUNT). Local to this function: the rest of
  * the file never looks inside a mali_sync. */
-#if PAN_ARCH == 9
+#if PAN_ARCH < 10
 #define MALI_WSI_SYNC_REQ_COUNT MALI_SYNC_REQ_COUNT
 #else
 #define MALI_WSI_SYNC_REQ_COUNT MALI_SUBQUEUE_COUNT
@@ -424,22 +424,27 @@ out:
 
 #undef MALI_WSI_SYNC_REQ_COUNT
 
-#if PAN_ARCH != 9
+#if PAN_ARCH >= 10
 /*
  * vkQueueSignalReleaseImageANDROID's entry point (mali_android.c) and the
- * host tests call this name; mali_v9_wsi_release is the only other
- * variant (defined when this same file is built at PAN_ARCH=9 into
- * malisx2_vk_v9, always linked next to this, non-v9, build). Compiled
- * once here, like the three functions above.
+ * host tests call this name; mali_v7_wsi_release and mali_v9_wsi_release
+ * are the other variants (defined when this same file is built at
+ * PAN_ARCH=7 and 9 into malisx2_vk_v7 and malisx2_vk_v9, always linked
+ * next to this, CSF, build). Compiled once here, like the three functions
+ * above.
  */
-extern VkResult mali_v9_wsi_release(struct mali_queue *queue, uint32_t count,
-                                    const VkSemaphore *semaphores, int *out_fd);
+MALI_PER_JM_ARCH_DECL(VkResult, wsi_release, (struct mali_queue *queue, uint32_t count,
+                                              const VkSemaphore *semaphores, int *out_fd));
 
 VkResult
 mali_wsi_release(struct mali_queue *queue, uint32_t count, const VkSemaphore *semaphores,
                  int *out_fd)
 {
-   return queue->jm ? mali_v9_wsi_release(queue, count, semaphores, out_fd)
-                     : MALI_PER_ARCH(wsi_release)(queue, count, semaphores, out_fd);
+   if (queue->jm) {
+      struct mali_device *dev = container_of(queue->vk.base.device, struct mali_device, vk);
+      const uint32_t arch = mali_device_physical(dev)->arch;
+      return mali_jm_arch_dispatch(arch, wsi_release, queue, count, semaphores, out_fd);
+   }
+   return MALI_PER_ARCH(wsi_release)(queue, count, semaphores, out_fd);
 }
 #endif

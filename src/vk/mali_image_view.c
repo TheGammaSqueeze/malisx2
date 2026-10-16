@@ -47,6 +47,8 @@
 
 #define PLANE_DESC_SIZE 32
 
+#if PAN_ARCH >= 9
+
 /* Clump formats that are not raw N-byte texels (pan_texture.c's table,
  * less the YUV formats, which are not supported). */
 static enum mali_clump_format
@@ -104,6 +106,8 @@ astc_dim(unsigned dim)
    }
 }
 
+#endif /* PAN_ARCH >= 9 */
+
 static enum mali_texture_dimension
 texture_dim(VkImageViewType type)
 {
@@ -123,6 +127,29 @@ texture_dim(VkImageViewType type)
 
 /* ---------------------------------------------------------------------- */
 /* AFBC                                                                    */
+
+#if PAN_ARCH < 9
+
+/* TODO v7: Bifrost has no AFBC compression mode word; an AFBC texture is
+ * read through its format and the surface pointers (Mesa pan_texture.c at
+ * PAN_ARCH 7, panvk_v7 panvk_vX_image_view.c). mali_image.c gives v7
+ * images no AFBC modifier yet, so neither is reached. */
+unsigned
+MALI_PER_ARCH(image_afbc_hw_mode)(const struct mali_image *image, unsigned plane)
+{
+   MALI_TODO_V7("AFBC compression modes");
+   return 0;
+}
+
+unsigned
+MALI_PER_ARCH(image_afbc_hw_read_mode)(const struct mali_image *image, unsigned plane,
+                                       enum pipe_format view)
+{
+   MALI_TODO_V7("AFBC compression modes");
+   return 0;
+}
+
+#else
 
 static enum mali_afbc_compression_mode
 afbc_hw_mode(enum mali_afbc_mode m)
@@ -160,6 +187,8 @@ MALI_PER_ARCH(image_afbc_hw_read_mode)(const struct mali_image *image, unsigned 
    return MALI_PER_ARCH(image_afbc_hw_mode)(image, plane);
 }
 
+#endif /* PAN_ARCH >= 9 */
+
 /* What a view reads: one plane of the image, in one format. */
 struct view_src {
    const struct mali_image *image;
@@ -169,6 +198,36 @@ struct view_src {
    unsigned first_level, levels;
    unsigned first_layer, layers; /* 3D: first Z slice and slice count */
 };
+
+#if PAN_ARCH < 9
+
+/*
+ * TODO v7: a Bifrost texture's payload is an array of surface pointers
+ * (Surface With Stride: pointer, row stride, surface stride; 16 bytes
+ * each), levels inner, layers and samples outer, and the Texture
+ * descriptor carries the texel ordering, format and swizzle itself (Mesa
+ * pan_texture.c pan_emit_iview_texture_payload / pan_emit_texture at
+ * PAN_ARCH 7, panvk_v7 panvk_vX_image_view.c
+ * panvk_per_arch(CreateImageView)). Until that is ported no texture or
+ * storage descriptor exists on v7: vkCreateImageView fails for sampled and
+ * storage usage, attachment-only views work.
+ */
+static unsigned
+emit_planes(const struct view_src *src, uint8_t *out)
+{
+   MALI_TODO_V7("texture plane descriptors");
+   return 0;
+}
+
+static void
+pack_texture(const struct view_src *src, const unsigned char swizzle[4],
+             uint64_t planes, float min_lod, bool storage, uint32_t out[8])
+{
+   MALI_TODO_V7("texture descriptors");
+   memset(out, 0, 8 * sizeof(uint32_t));
+}
+
+#else
 
 /* One plane descriptor: level `level`, layer or Z slice `layer`
  * (get_linear_or_u_tiled_plane_props + emit_generic_plane /
@@ -347,6 +406,8 @@ pack_texture(const struct view_src *src, const unsigned char swizzle[4],
    }
 }
 
+#endif /* PAN_ARCH >= 9 */
+
 VkResult
 MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_view *view)
 {
@@ -358,6 +419,12 @@ MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_
                              !vk_format_is_compressed(view->vk.view_format);
    if (!want_tex && !want_storage)
       return VK_SUCCESS;
+#if PAN_ARCH < 9
+   /* TODO v7: see emit_planes above. */
+   MALI_TODO_V7("sampled and storage image views");
+   return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                    "sampled and storage image views are not ported to Bifrost yet");
+#endif
 
    struct view_src src = {
       .image = image,

@@ -50,6 +50,12 @@
 static bool
 afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
 {
+   /* TODO v7: the G52 compresses too (panvk_v7 uses AFBC through
+    * pan_emit_afbc_color_attachment and the texture's own format), but
+    * the v7 back half packs no AFBC targets or plane descriptors yet
+    * (mali_fb.c, mali_image_view.c), so its images stay uncompressed. */
+   if (arch < 9)
+      return false;
    switch (mode) {
    case MALI_AFBC_NONE:
       return false;
@@ -194,9 +200,10 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod = choose_modifier(image, formats, arch);
-   /* No CRC on v9 yet: the job manager cannot update the seed from the
-    * GPU, and the CPU-side seed it needs is not written yet. */
-   const bool crc = arch != 9 && mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
+   /* No CRC on the job manager (v7, v9) yet: it cannot update the seed
+    * from the GPU, and the CPU-side seed it needs is not written yet. */
+   const bool crc = !mali_arch_is_jm(arch) &&
+                    mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
    /* Planes follow each other; each starts 4 KiB aligned (data_size is
     * rounded so). */

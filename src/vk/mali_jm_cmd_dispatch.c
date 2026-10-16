@@ -40,6 +40,17 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    if (!groups[0] || !groups[1] || !groups[2])
       return;
 
+#if PAN_ARCH < 9
+   /* TODO v7: the v7 Compute job is Invocation (workgroup sizes and counts
+    * packed as shifts, Mesa pan_pack_work_groups_compute), Parameters
+    * (job_task_split) and a Draw section pointing at the uniform-buffer,
+    * texture, sampler and image-attribute tables, the push uniforms, the
+    * Renderer State Descriptor (shader pointer and counts) and the Local
+    * Storage descriptor (panvk_v7 jm/panvk_vX_cmd_dispatch.c
+    * panvk_per_arch(CmdDispatchBase), panvk_vX_cmd_desc_state.c). */
+   MALI_TODO_V7("compute dispatch");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+#else
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
 
    const uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
@@ -96,6 +107,7 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    cmd->dispatches++;
    if (unlikely(mh))
       mali_jm_measure_end(cmd, mh, c);
+#endif /* PAN_ARCH >= 9 */
 }
 
 void

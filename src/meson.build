@@ -71,8 +71,8 @@ idep_mali_kbase = declare_dependency(
 # Mesa's generator; the stubs themselves come from waist.txt.
 # Device-level commands (vkCmd*, vkQueue*, vkCreate{Sampler,ImageView,
 # BufferView,*Pipelines}, vkUpdateDescriptorSets, ...) get a dispatch table
-# per GPU architecture, --device-prefix mali_v9/mali_v11, so both arches'
-# MALI_PER_ARCH-named functions can sit in the same .so without colliding;
+# per GPU architecture, --device-prefix mali_v7/mali_v9/mali_v11, so every
+# arch's MALI_PER_ARCH-named functions can sit in the same .so without colliding;
 # mali_CreateDevice picks the table that matches the device (mali_device.c).
 # Instance- and physical-device-level commands keep one shared table under
 # --prefix, because an arch is not known until a physical device is probed.
@@ -84,7 +84,8 @@ mali_entrypoints = custom_target(
     prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
     '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@',
     '--prefix', 'mali', '--prefix', 'mali_waist',
-    '--device-prefix', 'mali_v9', '--device-prefix', 'mali_v11',
+    '--device-prefix', 'mali_v7', '--device-prefix', 'mali_v9',
+    '--device-prefix', 'mali_v11',
     '--beta', with_vulkan_beta.to_string(),
   ],
   depend_files : vk_entrypoints_gen_depend_files,
@@ -119,7 +120,7 @@ mali_shader_cache_id_h = custom_target(
   output : 'mali_shader_cache_id.h',
   command : [prog_python, files('vk/gen_shader_cache_id.py'),
              '--root', meson.project_source_root(),
-             '--arch', '@0@'.format(pan_arch), '--arch', '9',
+             '--arch', '@0@'.format(pan_arch), '--arch', '9', '--arch', '7',
              '--out-h', '@OUTPUT@'],
   build_always_stale : true,
 )
@@ -137,7 +138,7 @@ _vk_c_args = [
 # (mali_cmd_copy.c, on each back half's dispatch) and the image copies,
 # clears and blits (mali_cmd_image.c, on each back half's dispatch and
 # render pass). Each copy names its
-# functions mali_v9_* or mali_v11_* (MALI_PER_ARCH, vk/mali_arch.h).
+# functions mali_v7_*, mali_v9_* or mali_v11_* (MALI_PER_ARCH, vk/mali_arch.h).
 _vk_per_arch_files = files(
   'vk/mali_blend.c', 'vk/mali_cmd_copy.c', 'vk/mali_cmd_image.c', 'vk/mali_cmd_meta_gfx.c',
   'vk/mali_cmd_state.c',
@@ -200,18 +201,22 @@ malisx2_vk_v11 = static_library(
 # files, mali_sync.c and mali_wsi.c a second time, and the per-arch files,
 # at PAN_ARCH 9. Linked into the driver next to malisx2_vk; the device's
 # arch picks which back half a VkDevice uses (mali_device.c).
-malisx2_vk_v9 = static_library(
-  'mali_vk_v9',
-  files('vk/mali_jm_cmd_buffer.c', 'vk/mali_jm_cmd_dispatch.c', 'vk/mali_jm_cmd_draw.c',
-        'vk/mali_jm_cmd_render.c', 'vk/mali_jm_heap.c', 'vk/mali_jm_query.c',
-        'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_sync.c', 'vk/mali_wsi.c'),
+_vk_jm_files = files(
+  'vk/mali_jm_cmd_buffer.c', 'vk/mali_jm_cmd_dispatch.c', 'vk/mali_jm_cmd_draw.c',
+  'vk/mali_jm_cmd_render.c', 'vk/mali_jm_heap.c', 'vk/mali_jm_query.c',
+  'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_sync.c', 'vk/mali_wsi.c',
   # Timing and command-stream capture on the job manager (MALISX2_MEASURE):
   # their own implementation of what touches struct mali_cmd_buffer
   # directly, because that struct (mali_jm.h) differs from the CSF one
   # timing.c/recorder.c are compiled against; the device-level
   # configuration, output writers and mali_measure_harvest/collect in those
   # two files (built once, in malisx2_vk) are shared.
-  files('measurement/timing_jm.c', 'measurement/recorder_jm.c'),
+  'measurement/timing_jm.c', 'measurement/recorder_jm.c',
+)
+
+malisx2_vk_v9 = static_library(
+  'mali_vk_v9',
+  _vk_jm_files,
   _vk_per_arch_files,
   mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
   include_directories : _vk_inc,
@@ -219,6 +224,24 @@ malisx2_vk_v9 = static_library(
             '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version())],
   dependencies : [_vk_per_arch_deps, idep_pan_format_by_arch['9'],
                   idep_pan_packers_by_arch['9']],
+  gnu_symbol_visibility : 'hidden',
+)
+
+# The job-manager back half a second time at PAN_ARCH 7, for the Bifrost
+# Mali-G52 (mali_v7_*). The same kbase JM frontend and job-chain model as
+# v9; the descriptors differ (Bifrost attribute/varying buffers, renderer
+# state, texture/sampler/blend descriptors), and the places that still pack
+# v9's are stubbed with a TODO v7 marker until they are ported from panvk_v7.
+malisx2_vk_v7 = static_library(
+  'mali_vk_v7',
+  _vk_jm_files,
+  _vk_per_arch_files,
+  mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
+  include_directories : _vk_inc,
+  c_args : [pre_args, malisx2_c_args, '-DPAN_ARCH=7',
+            '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version())],
+  dependencies : [_vk_per_arch_deps, idep_pan_format_by_arch['7'],
+                  idep_pan_packers_by_arch['7']],
   gnu_symbol_visibility : 'hidden',
 )
 
@@ -237,9 +260,10 @@ endforeach
 # For the driver .so and the tests: the front half, the runtime, kbase, the
 # compiler. The waist behaviour is added by the user of the dependency.
 idep_mali_vk = declare_dependency(
-  link_whole : [malisx2_vk, malisx2_vk_v11, malisx2_vk_v9],
+  link_whole : [malisx2_vk, malisx2_vk_v11, malisx2_vk_v9, malisx2_vk_v7],
   link_with : [malisx2_kbase, libpanfrost_pixel_format_by_arch['11'],
-               libpanfrost_pixel_format_by_arch['9']],
+               libpanfrost_pixel_format_by_arch['9'],
+               libpanfrost_pixel_format_by_arch['7']],
   sources : [mali_entrypoints[0]],
   include_directories : [inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],

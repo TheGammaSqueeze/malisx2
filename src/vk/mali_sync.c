@@ -29,7 +29,7 @@
  * (mali_jm_queue.c) instead of waiting for an event thread.
  */
 
-#if defined(PAN_ARCH) && PAN_ARCH == 9
+#if defined(PAN_ARCH) && PAN_ARCH < 10
 #include "mali_jm.h"
 #else
 #include "mali_queue.h"

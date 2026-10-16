@@ -70,9 +70,53 @@
 #include "util/log.h"
 #include "vk_log.h"
 
-#if PAN_ARCH != 9
-#error "mali_jm_cmd_draw.c is the v9 (job manager) back half"
+#if PAN_ARCH != 7 && PAN_ARCH != 9
+#error "mali_jm_cmd_draw.c is the job manager back half (PAN_ARCH 7 or 9)"
 #endif
+
+#if PAN_ARCH < 9
+
+/*
+ * TODO v7: Bifrost has no Malloc Vertex (IDVS) job. A draw is a Vertex job
+ * (Invocation, Draw with the attribute/varying buffers and descriptors,
+ * the uniform buffers, textures, samplers, push uniforms, the vertex
+ * Renderer State Descriptor and thread storage) and a Tiler job that
+ * depends on it (Invocation, Primitive, Primitive Size, the Tiler
+ * Context pointer, and a Draw with the fragment Renderer State Descriptor,
+ * the varyings read by the fragment shader, the Viewport and occlusion
+ * pointers), one pair per draw: panvk_v7 jm/panvk_vX_cmd_draw.c
+ * panvk_per_arch(cmd_draw) with panvk_draw_prepare_vertex_job /
+ * panvk_draw_prepare_tiler_job, panvk_vX_cmd_draw.c prepare_vs / prepare_fs
+ * (emit_rsd), prepare_vp, prepare_varyings, prepare_vs_attribs. Until that
+ * is ported every draw fails the command buffer.
+ */
+
+void
+mali_jm_draw_tmpl_init(struct mali_jm_draw_tmpl *t)
+{
+   memset(t, 0, sizeof(*t));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
+                       uint32_t firstVertex, uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   MALI_TODO_V7("draws");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount,
+                              uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset,
+                              uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   MALI_TODO_V7("indexed draws");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+}
+
+#else /* PAN_ARCH >= 9 */
 
 /* ---------------------------------------------------------------------- */
 /* The template's layout                                                   */
@@ -443,3 +487,5 @@ MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount
    };
    draw(cmd, &di);
 }
+
+#endif /* PAN_ARCH >= 9 */

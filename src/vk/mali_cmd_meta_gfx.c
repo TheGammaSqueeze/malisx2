@@ -349,12 +349,20 @@ MALI_PER_ARCH(cmd_pack_plane_texture)(struct mali_cmd_buffer *cmd, const struct 
                                       unsigned plane, enum pipe_format format, unsigned level,
                                       unsigned first_layer, unsigned layer_count, uint32_t out[8])
 {
+#if PAN_ARCH < 9
+   /* TODO v7: see mali_image_view.c (surface pointers, not plane
+    * descriptors). Preloads and blits fail until it is ported. */
+   MALI_TODO_V7("attachment texture descriptors");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   return false;
+#else
    struct mali_ptr p = mali_cmd_alloc(cmd, mali_image_plane_texture_desc_size(layer_count), 64);
    if (!p.cpu)
       return false;
    MALI_PER_ARCH(image_pack_plane_texture)(image, plane, format, level, first_layer, layer_count,
                                            p.cpu, p.gpu, out);
    return true;
+#endif
 }
 
 bool
@@ -363,6 +371,18 @@ MALI_PER_ARCH(meta_fs_dcd)(struct mali_cmd_buffer *cmd, const struct mali_shader
                            const uint32_t (*textures)[8], unsigned texture_count,
                            const uint32_t *sampler, bool frame_shader, void *out)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: a frame shader or in-pass draw on Bifrost is a Draw section
+    * (the v7 DRAW: uniform buffers, textures, samplers, push uniforms, the
+    * fragment Renderer State Descriptor with the blend descriptors behind
+    * it, thread storage, viewport), not v9's Draw with Shader Environment
+    * and resource table: panvk_v7 panvk_vX_cmd_frame_shaders.c
+    * (pre/post frame shader DCDs) and panvk_vX_cmd_meta.c; Mesa's gallium
+    * pan_blitter.c pan_preload_emit_dcd is the same shape. */
+   MALI_TODO_V7("frame shader draw descriptors");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   return false;
+#else
    struct mali_render_state *r = &cmd->gfx.render;
    assert(r->tsd);
 
@@ -496,6 +516,7 @@ MALI_PER_ARCH(meta_fs_dcd)(struct mali_cmd_buffer *cmd, const struct mali_shader
       cfg.shader.fau_count = fs->fau.total_count;
    }
    return true;
+#endif /* PAN_ARCH >= 9 */
 }
 
 /* ---------------------------------------------------------------------- */

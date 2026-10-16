@@ -14,8 +14,8 @@
  * mali_cmd_state.[ch] and mali_cmd_meta_gfx.c are shared with the
  * job-manager back half and built per arch, as are the back halves'
  * functions declared here (mali_cmd_render.c and mali_cmd_draw.c on v11,
- * the mali_jm_* files on v9): every function below has a mali_v9_ and a
- * mali_v11_ variant (MALI_PER_ARCH).
+ * the mali_jm_* files on v7 and v9): every function below has a mali_v7_,
+ * a mali_v9_ and a mali_v11_ variant (MALI_PER_ARCH).
  */
 
 #ifndef MALI_CMD_GFX_H

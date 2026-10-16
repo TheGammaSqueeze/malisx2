@@ -299,9 +299,11 @@ mali_shader_code_va(const struct mali_shader *s)
 /* The cache object operations, per arch (a v9 shader object uploads and
  * builds v9 SPDs); also the physical device's pipeline_cache_import_ops
  * entry. */
+extern const struct vk_pipeline_cache_object_ops mali_v7_shader_cache_ops;
 extern const struct vk_pipeline_cache_object_ops mali_v9_shader_cache_ops;
 extern const struct vk_pipeline_cache_object_ops mali_v11_shader_cache_ops;
 /* NULL-terminated lists for vk_physical_device::pipeline_cache_import_ops. */
+extern const struct vk_pipeline_cache_object_ops *const mali_v7_pipeline_cache_import_ops[];
 extern const struct vk_pipeline_cache_object_ops *const mali_v9_pipeline_cache_import_ops[];
 extern const struct vk_pipeline_cache_object_ops *const mali_v11_pipeline_cache_import_ops[];
 

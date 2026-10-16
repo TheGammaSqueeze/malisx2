@@ -132,7 +132,14 @@ mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_sha
       cs->cs.local_size[0] * cs->cs.local_size[1] * cs->cs.local_size[2];
    const uint64_t total = (uint64_t)groups[0] * groups[1] * groups[2];
 
+#if PAN_ARCH >= 9
    *axis = MALI_TASK_AXIS_X;
+#else
+   /* TODO v7: the v7 Compute job has no task axis; its Invocation section
+    * carries a job_task_split instead (Mesa pan_pack_work_groups_compute,
+    * panvk_v7 jm/panvk_vX_cmd_dispatch.c). */
+   *axis = 0;
+#endif
    *inc = 1;
    if (!total || !threads_per_wg)
       return;
@@ -225,6 +232,15 @@ mali_compute_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *cs
                        const struct mali_desc_state *desc, const uint32_t (*textures)[8],
                        unsigned texture_count)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: no resource tables on Bifrost; a dispatch gets separate
+    * uniform-buffer, texture, sampler and attribute (image) tables in its
+    * Draw section (panvk_v7 panvk_vX_cmd_desc_state.c
+    * panvk_per_arch(cmd_prepare_dyn_ssbos/ubos/textures/samplers) and
+    * jm/panvk_vX_cmd_dispatch.c). */
+   MALI_TODO_V7("the compute resource table");
+   return 0;
+#else
    const struct mali_shader_desc_info *di = &cs->desc;
 
    uint32_t drv_count = 1 + di->dyn_bufs.count + texture_count;
@@ -267,6 +283,7 @@ mali_compute_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *cs
       MALI_PER_ARCH(descriptor_set_pack_resource)(s, (uint8_t *)t.cpu + i * MALI_RESOURCE_SIZE);
    }
    return t.gpu | count;
+#endif
 }
 
 /* Local Storage descriptor of a dispatch (pan_emit_tls): the command
@@ -324,8 +341,13 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    pan_cast_and_pack(p.cpu, LOCAL_STORAGE, cfg) {
       if (tls_ptr) {
          cfg.tls_size = util_logbase2_ceil(DIV_ROUND_UP(cs->info.tls_size, 16));
+#if PAN_ARCH >= 9
          cfg.tls_address_mode = MALI_ADDRESS_MODE_PACKED;
          cfg.tls_base_pointer = tls_ptr >> 8;
+#else
+         /* v7 has no address mode: the full pointer (Mesa pan_emit_tls). */
+         cfg.tls_base_pointer = tls_ptr;
+#endif
       }
       if (wls_ptr) {
          cfg.wls_base_pointer = wls_ptr;
@@ -409,6 +431,8 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
 
 /* ---------------------------------------------------------------------- */
 /* Graphics: resource tables                                               */
+
+#if PAN_ARCH >= 9
 
 static inline void
 mali_gfx_pack_dyn_bufs(const struct mali_shader_desc_info *di, const struct mali_desc_state *desc,
@@ -602,6 +626,34 @@ mali_gfx_fs_srt(struct mali_cmd_buffer *cmd)
    mali_gfx_pack_dyn_bufs(&fs->desc, &cmd->gfx.desc, descs + (prefix + 1) * MALI_DESCRIPTOR_SIZE);
    return mali_gfx_res_table(cmd, fs, &cmd->gfx.desc, t.gpu, count);
 }
+
+#else /* PAN_ARCH < 9 */
+
+/*
+ * TODO v7: Bifrost has no resource tables. A draw's vertex stage takes
+ * Attribute Buffer and Attribute descriptors (one buffer per vertex
+ * binding, one attribute per location, panvk_v7 panvk_vX_cmd_draw.c
+ * prepare_vs_attribs / emit_attrib_bufs) and both stages take Varying
+ * Buffer and Varying descriptors (prepare_varyings, emit_varying_descs),
+ * uniform-buffer tables, texture and sampler tables
+ * (panvk_vX_cmd_desc_state.c). Until that is ported the builders return 0,
+ * which their callers treat as failure.
+ */
+static inline uint64_t
+mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+{
+   MALI_TODO_V7("the vertex stage descriptor tables");
+   return 0;
+}
+
+static inline uint64_t
+mali_gfx_fs_srt(struct mali_cmd_buffer *cmd)
+{
+   MALI_TODO_V7("the fragment stage descriptor tables");
+   return 0;
+}
+
+#endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
 /* Graphics: blend                                                         */
@@ -849,6 +901,7 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
    maxx = maxx > minx ? maxx - 1 : maxx;
    maxy = maxy > miny ? maxy - 1 : maxy;
 
+#if PAN_ARCH >= 9
    struct mali_scissor_packed s;
    pan_pack(&s, SCISSOR, cfg) {
       cfg.scissor_minimum_x = CLAMP(minx, 0, UINT16_MAX);
@@ -857,6 +910,13 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
       cfg.scissor_maximum_y = CLAMP(maxy, 0, UINT16_MAX);
    }
    return s.opaque[0] | (uint64_t)s.opaque[1] << 32;
+#else
+   /* TODO v7: no Scissor descriptor on Bifrost; the box and the depth
+    * range go into a Viewport descriptor the Draw points at (panvk_v7
+    * panvk_vX_cmd_draw.c prepare_vp). */
+   MALI_TODO_V7("the scissor box");
+   return 0;
+#endif
 }
 
 static inline enum mali_index_type

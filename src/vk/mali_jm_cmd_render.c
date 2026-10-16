@@ -70,8 +70,8 @@
 
 #include "mali_measure.h"
 
-#if PAN_ARCH != 9
-#error "mali_jm_cmd_render.c is the v9 (job manager) back half"
+#if PAN_ARCH != 7 && PAN_ARCH != 9
+#error "mali_jm_cmd_render.c is the job manager back half (PAN_ARCH 7 or 9)"
 #endif
 
 /* What one tiled pass adds to its batch's heap estimate on top of its
@@ -148,11 +148,19 @@ pack_tiler_context(struct mali_cmd_buffer *cmd, const struct mali_render_state *
       cfg.polygon_list = 0;
       cfg.hierarchy_mask = mask;
       cfg.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
+#if PAN_ARCH >= 9
       cfg.first_provoking_vertex = r->first_provoking_vertex;
+#endif
       cfg.fb_width = r->desc.width;
       cfg.fb_height = r->desc.height;
+#if PAN_ARCH >= 9
       cfg.layer_count = 1;
       cfg.layer_offset = 0;
+#else
+      /* v7: no layers in the context (one context per layer here either
+       * way) and the provoking vertex is a Primitive bit of each tiler
+       * job (Mesa pan_emit_tiler_ctx at PAN_ARCH 7). */
+#endif
       cfg.heap = heap;
    }
    memcpy(dst, &tc, sizeof(tc));
@@ -244,6 +252,15 @@ static void
 fullscreen_jobs(struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
                 uint32_t base_layer, uint32_t layer_count, bool barrier)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: no Fullscreen job on Bifrost. In-pass clears and the
+    * fragment barrier are a Tiler job drawing a quad with an internal
+    * vertex shader (panvk_v7 goes through vk_meta: jm/panvk_vX_cmd_draw.c
+    * panvk_per_arch(cmd_draw) from panvk_vX_cmd_meta.c, or Mesa's gallium
+    * pan_blitter for the same hardware). */
+   MALI_TODO_V7("full-screen jobs");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+#else
    struct mali_render_state *r = &cmd->gfx.render;
    if (!MALI_PER_ARCH(cmd_render_tiler)(cmd)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -287,6 +304,7 @@ fullscreen_jobs(struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
       memcpy((uint8_t *)job.cpu + 32, tmpl + 32, sizeof(tmpl) - 32);
    }
    r->draws++;
+#endif /* PAN_ARCH >= 9 */
 }
 
 void
@@ -311,6 +329,14 @@ MALI_PER_ARCH(cmd_run_fullscreen)(struct mali_cmd_buffer *cmd, uint64_t dcd, con
 void
 MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: the Draw and Depth Stencil descriptors above are v9's; on
+    * Bifrost the same barrier is a Tiler job whose Renderer State
+    * Descriptor has no shader and whose Draw sets Primitive Barrier
+    * (fullscreen_jobs above, once ported). */
+   MALI_TODO_V7("the in-pass fragment barrier");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+#else
    struct mali_render_state *r = &cmd->gfx.render;
    struct mali_ptr zsd = mali_cmd_alloc(cmd, pan_size(DEPTH_STENCIL), 32);
    struct mali_ptr dcd = mali_cmd_alloc(cmd, pan_size(DRAW), 64);
@@ -334,6 +360,7 @@ MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
    }
    const VkRect2D all = {{0, 0}, {r->desc.width, r->desc.height}};
    fullscreen_jobs(cmd, dcd.gpu, &all, 0, MAX2(r->desc.layer_count, 1), false);
+#endif /* PAN_ARCH >= 9 */
 }
 
 /* ---------------------------------------------------------------------- */

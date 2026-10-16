@@ -7,10 +7,10 @@
 # does not touch the compiler, and is thrown away when one does.
 #
 # There is one hash per GPU architecture the driver is built for (--arch),
-# because each GPU only runs shaders built for its own: a file only one
-# architecture's build compiles (the job-manager back half, mali_jm*, is
-# v9 only) is left out of the other architectures' hashes, so a change to
-# it does not empty the other GPU's pipeline cache. The first --arch is the
+# because each GPU only runs shaders built for its own: a file only some
+# architectures' builds compile (the job-manager back half, mali_jm*, is
+# built at 7 and 9 only) is left out of the other architectures' hashes, so
+# a change to it does not empty the other GPU's pipeline cache. The first --arch is the
 # one MALI_SHADER_CACHE_ID names; each also gets MALI_SHADER_CACHE_ID_V<n>.
 #
 # Hashing too much only costs a needless recompile; hashing too little lets a
@@ -75,12 +75,16 @@ EXCLUDE_FILES = {
 }
 
 
-# Files only one architecture's build compiles or reads: arch -> a test on
-# the path relative to the source root.
-ARCH_ONLY = {
-    9: lambda rel: (rel.startswith('src/vk/mali_jm') or
-                    rel == 'mesa/src/panfrost/genxml/v9.xml'),
-}
+# Files only some architectures' builds compile or read: a test on the path
+# relative to the source root -> the architectures that use it. The
+# job-manager back half (mali_jm*) is built at 7 and 9, never at 11; each
+# arch reads only its own genxml.
+ARCH_ONLY = [
+    (lambda rel: rel.startswith('src/vk/mali_jm'), {7, 9}),
+    (lambda rel: rel == 'mesa/src/panfrost/genxml/v7.xml', {7}),
+    (lambda rel: rel == 'mesa/src/panfrost/genxml/v9.xml', {9}),
+    (lambda rel: rel == 'mesa/src/panfrost/genxml/v11.xml', {11}),
+]
 
 
 def excluded(rel, arch):
@@ -88,7 +92,7 @@ def excluded(rel, arch):
         return True
     if '__pycache__' in rel.split('/'):
         return True
-    if any(a != arch and only(rel) for a, only in ARCH_ONLY.items()):
+    if any(arch not in archs and only(rel) for only, archs in ARCH_ONLY):
         return True
     return any(rel.startswith(d + '/') for d in EXCLUDE_DIRS)
 

@@ -40,10 +40,12 @@
 #include "vk_util.h"
 
 static_assert(sizeof(struct mali_hw_desc) == MALI_DESCRIPTOR_SIZE, "descriptor size");
-static_assert(pan_size(BUFFER) == MALI_DESCRIPTOR_SIZE, "descriptor size");
 static_assert(pan_size(TEXTURE) == MALI_DESCRIPTOR_SIZE, "descriptor size");
+#if PAN_ARCH >= 9
+static_assert(pan_size(BUFFER) == MALI_DESCRIPTOR_SIZE, "descriptor size");
 static_assert(pan_size(NULL_DESCRIPTOR) == MALI_DESCRIPTOR_SIZE, "descriptor size");
 static_assert(pan_size(RESOURCE) == MALI_RESOURCE_SIZE, "descriptor size");
+#endif
 
 /* Where a dynamic buffer bound to nothing points: an address the GPU's
  * memory sink absorbs (panvk). */
@@ -74,6 +76,15 @@ MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *
    if (!view)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+#if PAN_ARCH < 9
+   /* TODO v7: a texel buffer is a 1D Texture descriptor with one surface
+    * on Bifrost (panvk_v7 panvk_vX_buffer_view.c
+    * panvk_per_arch(CreateBufferView)). */
+   MALI_TODO_V7("buffer views");
+   (void)buffer;
+   vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+   return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+#else
    const enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.format);
    const unsigned stride = util_format_get_blocksize(pfmt);
    const uint64_t size = view->vk.elements * stride;
@@ -97,6 +108,7 @@ MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *
 
    *pView = mali_buffer_view_to_handle(view);
    return VK_SUCCESS;
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -134,9 +146,18 @@ static void
 write_null(const struct mali_descriptor_set *set, uint32_t binding, uint32_t elem,
            enum mali_subdesc sub)
 {
+#if PAN_ARCH >= 9
    struct mali_null_descriptor_packed null_desc;
    pan_pack(&null_desc, NULL_DESCRIPTOR, cfg);
    write_slot(set, binding, elem, sub, &null_desc);
+#else
+   /* TODO v7: no Null descriptor on Bifrost; panvk_v7's per-type tables
+    * (panvk_vX_descriptor_set.c) leave an unused slot zero. The slot layout
+    * itself (one 32-byte slot per descriptor, mali_descriptor_set_layout.c)
+    * is v9's and is also to be ported. */
+   const uint8_t null_desc[MALI_DESCRIPTOR_SIZE] = {0};
+   write_slot(set, binding, elem, sub, null_desc);
+#endif
 }
 
 static enum mali_subdesc
@@ -192,6 +213,14 @@ write_image(const struct mali_descriptor_set *set, const VkDescriptorImageInfo *
 static void
 pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: a uniform buffer is a Uniform Buffer descriptor (16-byte
+    * entry count and pointer), a storage buffer an address/size pair in
+    * the driver's own UBO (panvk_v7 panvk_vX_descriptor_set.c
+    * panvk_write_ubo_desc / panvk_write_ssbo_desc). */
+   MALI_TODO_V7("buffer descriptors");
+   memset(out, 0, MALI_DESCRIPTOR_SIZE);
+#else
    const uint64_t size = align64(range, ssbo ? 4 : 16);
    pan_cast_and_pack(out, BUFFER, cfg) {
       cfg.address = addr;
@@ -202,6 +231,7 @@ pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
       cfg.size = MIN2(size, UINT32_MAX & ~(uint64_t)(ssbo ? 3 : 15));
 #endif
    }
+#endif /* PAN_ARCH >= 9 */
 }
 
 static void
@@ -676,6 +706,13 @@ MALI_PER_ARCH(FreeDescriptorSets)(VkDevice _device, VkDescriptorPool _pool, uint
 void
 MALI_PER_ARCH(descriptor_set_pack_resource)(const struct mali_descriptor_set *set, void *out)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: no Resource entries on Bifrost; a bound set's descriptors
+    * are copied into the per-type tables of the draw or dispatch instead
+    * (panvk_v7 panvk_vX_cmd_desc_state.c). */
+   MALI_TODO_V7("resource table entries");
+   memset(out, 0, MALI_RESOURCE_SIZE);
+#else
    pan_cast_and_pack(out, RESOURCE, cfg) {
       if (set && set->gpu) {
          cfg.address = set->gpu;
@@ -687,6 +724,7 @@ MALI_PER_ARCH(descriptor_set_pack_resource)(const struct mali_descriptor_set *se
          cfg.contains_descriptors = false;
       }
    }
+#endif
 }
 
 void

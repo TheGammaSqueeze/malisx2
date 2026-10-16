@@ -4,8 +4,9 @@
  */
 
 /*
- * The job-manager (JM) back half of a VkDevice, for the Mali-G57 (arch v9).
- * Compiled only at PAN_ARCH 9; the CSF counterpart is mali_queue.h.
+ * The job-manager (JM) back half of a VkDevice, for the Mali-G57 (arch v9)
+ * and the Mali-G52 (arch v7, Bifrost). Compiled at PAN_ARCH 7 and 9; the
+ * CSF counterpart is mali_queue.h.
  *
  * What the command-buffer side and the queue agree on:
  *
@@ -52,8 +53,8 @@
 
 #include "kbase/kbase.h"
 
-#if !defined(PAN_ARCH) || PAN_ARCH != 9
-#error "mali_jm.h is the v9 (job manager) back half: build with PAN_ARCH=9"
+#if !defined(PAN_ARCH) || (PAN_ARCH != 7 && PAN_ARCH != 9)
+#error "mali_jm.h is the job manager back half: build with PAN_ARCH=7 or 9"
 #endif
 #include "genxml/gen_macros.h"
 

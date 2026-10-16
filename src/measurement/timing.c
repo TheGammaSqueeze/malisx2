@@ -83,8 +83,10 @@ mali_measure_harvest(struct mali_measure *m, struct mali_measure_cmd *mc)
 static bool
 completed(struct mali_measure *m, const struct mali_measure_cmd *mc)
 {
-   if (m->dev->jm)
-      return mali_jm_measure_reached(m->dev->jm, mc->submit);
+   if (m->dev->jm) {
+      const uint32_t arch = mali_device_physical(m->dev)->arch;
+      return mali_jm_arch_dispatch(arch, jm_measure_reached, m->dev->jm, mc->submit);
+   }
    struct mali_csf_queue *q = m->dev->csf ? m->dev->csf->queue : NULL;
    if (!q)
       return true;

@@ -472,6 +472,8 @@ pack_blend(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 /* ---------------------------------------------------------------------- */
 /* Early depth/stencil                                                      */
 
+#if PAN_ARCH >= 9 /* TODO v7: the same decisions feed the v7 RSD properties */
+
 enum zs_read {
    ZS_NOT_READ,
    ZS_READ,
@@ -612,9 +614,34 @@ compare_func(VkCompareOp op)
    return (enum mali_func)op;
 }
 
+#else
+/* TODO v7: the early-ZS decisions above feed the v7 Renderer State
+ * Descriptor's properties; until then nothing reads these. */
+static inline bool
+writes_depth(const struct mali_gfx_pack_input *in)
+{
+   return false;
+}
+
+static inline bool
+writes_stencil(const struct mali_gfx_pack_input *in)
+{
+   return false;
+}
+#endif /* PAN_ARCH >= 9 */
+
 static void
 pack_zsd(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: no Depth Stencil descriptor on Bifrost; the depth and
+    * stencil state is part of the fragment Renderer State Descriptor
+    * (multisample_misc, stencil_mask_misc, stencil_front/back, depth
+    * units/factor/clamp: panvk_v7 panvk_vX_cmd_draw.c emit_rsd /
+    * panvk_vX_shader.c). The baked words stay zero; v7 draws fail before
+    * reading them (mali_jm_cmd_draw.c). */
+   MALI_TODO_V7("the depth/stencil descriptor");
+#else
    const struct vk_depth_stencil_state *ds = &in->dyn->ds;
    const struct vk_rasterization_state *rs = &in->dyn->rs;
    const bool test_s = has_stencil(in->rp) && ds->stencil.test_enable;
@@ -661,6 +688,7 @@ pack_zsd(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       cfg.depth_factor = rs->depth_bias.slope_factor;
       cfg.depth_bias_clamp = rs->depth_bias.clamp;
    }
+#endif /* PAN_ARCH >= 9 */
 }
 
 /* ---------------------------------------------------------------------- */
@@ -698,6 +726,7 @@ color_attachment_read_mask(const struct mali_shader *fs,
    return mask;
 }
 
+#if PAN_ARCH >= 9
 static bool
 attachment_read(const struct mali_shader *fs, uint8_t att)
 {
@@ -705,6 +734,7 @@ attachment_read(const struct mali_shader *fs, uint8_t att)
                   att != MESA_VK_ATTACHMENT_UNUSED   ? BITFIELD_BIT(att + 1) : 0;
    return fs->fs.input_attachment_read & bit;
 }
+#endif
 
 static enum mali_draw_mode
 draw_mode(enum mesa_prim prim)
@@ -753,6 +783,21 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       modifies_coverage = fs->info.fs.writes_coverage || fs->info.fs.can_discard || a2c;
    }
 
+#if PAN_ARCH < 9
+   /* TODO v7: no DCD flag words on Bifrost; the culling, early-ZS,
+    * multisample and occlusion state goes into the fragment Renderer
+    * State Descriptor's properties and multisample_misc, and the face
+    * culling into the Draw section of the tiler job (panvk_v7
+    * panvk_vX_cmd_draw.c emit_rsd, jm/panvk_vX_cmd_draw.c
+    * panvk_draw_prepare_tiler_job). */
+   MALI_TODO_V7("the draw flag words");
+   (void)writes_zs;
+   (void)modifies_coverage;
+   (void)msaa;
+   out->dcd0[0] = out->dcd0[1] = 0;
+   out->dcd1 = 0;
+   out->dcd2 = 0;
+#else
    for (unsigned oq = 0; oq < 2; oq++) {
       struct mali_dcd_flags_0_packed dcd0;
 
@@ -845,6 +890,7 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    /* No Flags 2 on v9: the tile-buffer read and write masks have no home. */
    out->dcd2 = 0;
 #endif
+#endif /* PAN_ARCH >= 9 */
 
    /* Tiler flags; the index type is set per draw. */
    const bool points = prim == MESA_PRIM_POINTS;
@@ -853,19 +899,30 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 #if PAN_ARCH >= 10
    struct mali_primitive_flags_packed tiler;
    pan_pack(&tiler, PRIMITIVE_FLAGS, cfg) {
-#else
+#elif PAN_ARCH == 9
    /* The Primitive section of the Malloc Vertex job; word 0 is the flags. */
    struct mali_primitive_packed tiler;
    pan_pack(&tiler, PRIMITIVE, cfg) {
       cfg.allow_rotating_primitives = false;
+#else
+   /* v7: the Primitive section of the Tiler job (word 0 is the flags; no
+    * rotation, index override or layer bits). The provoking vertex is a
+    * bit of this word on v7 (first_provoking_vertex), set per draw from
+    * the pass (TODO v7: mali_jm_cmd_draw.c). */
+   struct mali_primitive_packed tiler;
+   pan_pack(&tiler, PRIMITIVE, cfg) {
 #endif
       cfg.draw_mode = draw_mode(prim);
       cfg.primitive_index_enable = fs_reads_prim_id;
+#if PAN_ARCH >= 9
       cfg.primitive_index_override =
          fs_reads_prim_id && (vs->info.outputs_written & VARYING_BIT_PRIMITIVE_ID);
+#endif
       cfg.point_size_array_format = writes_psiz ? MALI_POINT_SIZE_ARRAY_FORMAT_FP16
                                                 : MALI_POINT_SIZE_ARRAY_FORMAT_NONE;
+#if PAN_ARCH >= 9
       cfg.layer_index_enable = vs->info.outputs_written & VARYING_BIT_LAYER;
+#endif
 #if PAN_ARCH >= 10
       cfg.position_fifo_format = (writes_psiz || vs->info.vs.needs_extended_fifo) ?
                                     MALI_FIFO_FORMAT_EXTENDED : MALI_FIFO_FORMAT_BASIC;
