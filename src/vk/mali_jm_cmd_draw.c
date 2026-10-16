@@ -206,13 +206,16 @@ mali_jm_draw_tmpl_init(struct mali_jm_draw_tmpl *t)
    memset(t, 0, sizeof(*t));
 }
 
-/* The Primitive word's First provoking vertex bit. */
+/* The Primitive word's First provoking vertex bit (word 0 only; the count
+ * is packed as 1 because the v7 packer encodes it minus one and asserts
+ * it is at least 1). */
 static inline uint32_t
 prim_provoking_bit(void)
 {
    struct mali_primitive_packed p;
    pan_pack_nodefaults(&p, PRIMITIVE, cfg) {
       cfg.first_provoking_vertex = true;
+      cfg.index_count = 1;
    }
    return p.opaque[0];
 }
