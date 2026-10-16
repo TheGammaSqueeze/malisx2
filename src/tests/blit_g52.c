@@ -15,10 +15,10 @@
  * image is optimally tiled (u-interleaved, as azahar's are), and every
  * result is read back through vkCmdCopyImageToBuffer and checked on the CPU:
  *
- *   A  2x nearest into 64x64: dst(X, Y) = src(X / 2, Y / 2), exact;
+ *   A  2x nearest into 64x64: dst(X, Y) = src(X / 2, Y / 2);
  *   B  2x linear into 64x64: bilinear with clamp to edge, within 2;
- *   C  mirrored on X (destination offsets reversed), 32x32, exact;
- *   D  mirrored on Y (source offsets reversed), 32x32, exact;
+ *   C  mirrored on X (destination offsets reversed), 32x32;
+ *   D  mirrored on Y (source offsets reversed), 32x32;
  *   E  RGBA8 -> R5G6B5 1:1 (conversion), within one 5/6-bit step;
  *   F  that R5G6B5 image -> RGBA8 1:1, within 1 of the expanded values;
  *   G  RGBA8 -> RGBA8 sRGB 1:1 (encode), within 1;
@@ -29,6 +29,10 @@
  *      through a depth copy;
  *   J  D24_UNORM_S8_UINT 2x nearest, mirrored on Y, depth and stencil in
  *      one region: depth within 1 (24-bit units), stencil exact.
+ *
+ * The colour cases allow one LSB per channel (the float round trip through
+ * the shader and the blender); neighbouring texels of the pattern differ by
+ * at least 3 in some channel, so a wrong texel is never within it.
  *
  * Formats the device does not offer as blit source and destination are
  * skipped with a line saying so (I and J need the v7 depth/stencil blit
@@ -719,14 +723,14 @@ main(int argc, char **argv)
    }
 
    pass &= run_rgba8_case('A', "2x nearest", &src, VK_FORMAT_R8G8B8A8_UNORM, BIG, BIG, 0, 0,
-                          SRC_W, SRC_H, 0, 0, BIG, BIG, VK_FILTER_NEAREST, expect_a, 0, false);
+                          SRC_W, SRC_H, 0, 0, BIG, BIG, VK_FILTER_NEAREST, expect_a, 1, false);
    pass &= run_rgba8_case('B', "2x linear", &src, VK_FORMAT_R8G8B8A8_UNORM, BIG, BIG, 0, 0,
                           SRC_W, SRC_H, 0, 0, BIG, BIG, VK_FILTER_LINEAR, expect_b, 2, false);
    pass &= run_rgba8_case('C', "mirrored on X", &src, VK_FORMAT_R8G8B8A8_UNORM, SRC_W, SRC_H, 0,
-                          0, SRC_W, SRC_H, SRC_W, 0, 0, SRC_H, VK_FILTER_NEAREST, expect_c, 0,
+                          0, SRC_W, SRC_H, SRC_W, 0, 0, SRC_H, VK_FILTER_NEAREST, expect_c, 1,
                           false);
    pass &= run_rgba8_case('D', "mirrored on Y", &src, VK_FORMAT_R8G8B8A8_UNORM, SRC_W, SRC_H, 0,
-                          SRC_H, SRC_W, 0, 0, 0, SRC_W, SRC_H, VK_FILTER_NEAREST, expect_d, 0,
+                          SRC_H, SRC_W, 0, 0, 0, SRC_W, SRC_H, VK_FILTER_NEAREST, expect_d, 1,
                           false);
    pass &= run_565_cases(&src);
    if (format_blits(VK_FORMAT_R8G8B8A8_SRGB, "R8G8B8A8_SRGB"))
@@ -737,7 +741,7 @@ main(int argc, char **argv)
       printf("SKIP G: no R8G8B8A8_SRGB blits\n");
    pass &= run_rgba8_case('H', "rectangle (5, 3) .. (42, 32), outside untouched", &src,
                           VK_FORMAT_R8G8B8A8_UNORM, BIG, BIG, 0, 0, SRC_W, SRC_H, H_X0, H_Y0, H_X1,
-                          H_Y1, VK_FILTER_NEAREST, expect_h, 0, true);
+                          H_Y1, VK_FILTER_NEAREST, expect_h, 1, true);
    pass &= run_d32_case();
    pass &= run_d24s8_case();
 
