@@ -527,6 +527,17 @@ mali_physical_device_sample_counts(const struct mali_physical_device *pdev,
    return sample_counts(bytes_per_pixel, tilebuf_budget(&pdev->props));
 }
 
+/* The colour tile buffer of one shader core in bytes (tilebuf_budget above),
+ * for the render pass's tile size choice on v7 (mali_fb.c), where the two
+ * G52 revisions differ. Declared in mali_image.h. */
+unsigned mali_physical_device_tilebuf_color_bytes(const struct mali_physical_device *pdev);
+
+unsigned
+mali_physical_device_tilebuf_color_bytes(const struct mali_physical_device *pdev)
+{
+   return tilebuf_budget(&pdev->props);
+}
+
 static void
 hash_uuid(uint8_t out[VK_UUID_SIZE], const void *data, size_t size)
 {

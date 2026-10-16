@@ -315,3 +315,6 @@ configure_file(
 devenv = environment()
 devenv.set('VK_DRIVER_FILES', meson.current_build_dir() / 'mali_devenv_icd.json')
 meson.add_devenv(devenv)
+
+# Standalone device tests (dlopen the driver; no loader).
+subdir('tests')

@@ -236,7 +236,14 @@ static void
 select_tile_size(struct mali_cmd_buffer *cmd, struct mali_render_state *r)
 {
    uint32_t rt_budget, z_budget;
-   if (PAN_ARCH < 10) {
+   if (PAN_ARCH == 7) {
+      /* The G52's colour tile buffer is 16 KiB on the r0 silicon and 8 KiB
+       * on the r1 (Mesa's model table, by GPU ID in mali_physical_device.c);
+       * the depth budget is 8 KiB on both. Half of each, as
+       * pan_query_optimal_tib_size does for v7. */
+      rt_budget = mali_physical_device_tilebuf_color_bytes(mali_device_physical(cmd->dev)) / 2;
+      z_budget = V9_TILEBUF_Z / 2;
+   } else if (PAN_ARCH < 10) {
       rt_budget = V9_TILEBUF_COLOR / 2;
       z_budget = V9_TILEBUF_Z / 2;
    } else {
