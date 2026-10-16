@@ -39,6 +39,10 @@
  * fragment work, typically a copy of what a pass just rendered) is done by
  * the fragment-side copy pass instead, which stays in the batch behind a
  * barrier in its fragment chain.
+ *
+ * On Bifrost (v7) the blit pass runs on the v7 frame shaders and also
+ * blits depth and stencil (blit_region_v7); image copies stay on the
+ * compute copy (no fragment-side copy pass yet, copy_on_fragment).
  */
 
 #if PAN_ARCH >= 10
@@ -704,6 +708,208 @@ blit_axis(int32_t s0, int32_t s1, int32_t d0, int32_t d1, uint32_t size, float *
    *offset = ((float)s0 - (float)d0 * k) / (float)size;
 }
 
+#if PAN_ARCH < 9
+/*
+ * One region of vkCmdBlitImage2 on Bifrost (v7): the v9 blit pass (a
+ * render pass on the destination whose frame shader samples the source
+ * inside the destination rectangle and reloads the destination outside
+ * it), which the v7 frame shaders run (mali_cmd_meta_gfx.c meta_fs_dcd),
+ * plus what the v9 pass leaves out:
+ *
+ *  - depth and stencil: the frame shader writes them (MALI_META_FS_BLIT as
+ *    z_op / s_op, the source and target planes as textures), the
+ *    destination's planes are the pass's depth and stencil targets, always
+ *    written back. Vulkan only allows these between identical formats,
+ *    with NEAREST;
+ *  - a single slice of a 3D image on either side: the slice is that
+ *    side's layer (the texture's first surface, the target's base);
+ *  - a 1:1 region between identical formats (same extent, both offsets
+ *    increasing, no compressed or AFBC image) is a raw copy of every
+ *    aspect's plane on the compute copy (dispatch_copy), exact and cheaper
+ *    than the pass. A 1:1 region between different formats (UNORM and
+ *    sRGB, RGBA and BGRA) converts, so it takes the pass.
+ *
+ * Scaling and flips on either axis come from the per-axis transform
+ * (blit_axis; a negative scale mirrors), the filter from the Sampler
+ * (nearest or linear, normalized coordinates, clamp to edge), format
+ * conversion from sampling the source in its own format and storing in
+ * the destination's (sRGB decoded by the texture unit and encoded by the
+ * Blend descriptor).
+ */
+static void
+blit_region_v7(struct mali_cmd_buffer *cmd, const struct mali_image *src,
+               const struct mali_image *dst, const VkImageBlit2 *r, VkFilter filter)
+{
+   const VkImageAspectFlags aspects = r->dstSubresource.aspectMask &
+                                      (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT |
+                                       VK_IMAGE_ASPECT_STENCIL_BIT);
+   if (!aspects)
+      return;
+   const bool color = aspects & VK_IMAGE_ASPECT_COLOR_BIT;
+   const bool depth = (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && vk_format_has_depth(dst->vk.format);
+   const bool stencil =
+      (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && vk_format_has_stencil(dst->vk.format);
+   const unsigned slevel = r->srcSubresource.mipLevel;
+   const unsigned dlevel = r->dstSubresource.mipLevel;
+
+   const int32_t dx0 = MIN2(r->dstOffsets[0].x, r->dstOffsets[1].x);
+   const int32_t dx1 = MAX2(r->dstOffsets[0].x, r->dstOffsets[1].x);
+   const int32_t dy0 = MIN2(r->dstOffsets[0].y, r->dstOffsets[1].y);
+   const int32_t dy1 = MAX2(r->dstOffsets[0].y, r->dstOffsets[1].y);
+   if (dx1 <= dx0 || dy1 <= dy0)
+      return;
+
+   /* Layers, or the slice of a 3D side. */
+   const bool src3d = src->vk.image_type == VK_IMAGE_TYPE_3D;
+   const bool dst3d = dst->vk.image_type == VK_IMAGE_TYPE_3D;
+   uint32_t layers, src_layer, dst_layer;
+   if (src3d || dst3d) {
+      const int32_t sz0 = MIN2(r->srcOffsets[0].z, r->srcOffsets[1].z);
+      const int32_t sz1 = MAX2(r->srcOffsets[0].z, r->srcOffsets[1].z);
+      const int32_t dz0 = MIN2(r->dstOffsets[0].z, r->dstOffsets[1].z);
+      const int32_t dz1 = MAX2(r->dstOffsets[0].z, r->dstOffsets[1].z);
+      if ((src3d && sz1 - sz0 != 1) || (dst3d && dz1 - dz0 != 1)) {
+         /* TODO v7: a 3D blit over several slices is a pass per
+          * destination slice with the source's Z in the transform (panvk
+          * goes through vk_meta's blit with a 3D source). */
+         MALI_TODO_V7("blits over more than one slice of a 3D image");
+         if (!mali_v7_census()) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         /* Census: the first slice of each side only. */
+      }
+      layers = 1;
+      src_layer = src3d ? (uint32_t)MAX2(sz0, 0) : r->srcSubresource.baseArrayLayer;
+      dst_layer = dst3d ? (uint32_t)MAX2(dz0, 0) : r->dstSubresource.baseArrayLayer;
+   } else {
+      layers = vk_image_subresource_layer_count(&dst->vk, &r->dstSubresource);
+      src_layer = r->srcSubresource.baseArrayLayer;
+      dst_layer = r->dstSubresource.baseArrayLayer;
+   }
+
+   const int32_t sx0 = r->srcOffsets[0].x, sx1 = r->srcOffsets[1].x;
+   const int32_t sy0 = r->srcOffsets[0].y, sy1 = r->srcOffsets[1].y;
+   const enum pipe_format sfmt = src->planes[0].format;
+   const bool one_to_one =
+      src->vk.format == dst->vk.format && sx1 > sx0 && sy1 > sy0 &&
+      r->dstOffsets[1].x > r->dstOffsets[0].x && r->dstOffsets[1].y > r->dstOffsets[0].y &&
+      sx1 - sx0 == dx1 - dx0 && sy1 - sy0 == dy1 - dy0 &&
+      util_format_get_blockwidth(sfmt) == 1 && util_format_get_blockheight(sfmt) == 1 &&
+      !mali_image_is_afbc(src) && !mali_image_is_afbc(dst) &&
+      (src3d || dst3d || vk_image_subresource_layer_count(&src->vk, &r->srcSubresource) == layers);
+   if (one_to_one) {
+      u_foreach_bit(a, aspects) {
+         const VkImageAspectFlags aspect = BITFIELD_BIT(a);
+         if ((aspect == VK_IMAGE_ASPECT_DEPTH_BIT && !depth) ||
+             (aspect == VK_IMAGE_ASPECT_STENCIL_BIT && !stencil))
+            continue;
+         struct copy_surface s, d;
+         image_surface(src, aspect, slevel, src_layer, &s);
+         image_surface(dst, aspect, dlevel, dst_layer, &d);
+         dispatch_copy(cmd, &s, sx0, sy0, &d, dx0, dy0, (uint32_t)(dx1 - dx0),
+                       (uint32_t)(dy1 - dy0), layers);
+      }
+      return;
+   }
+
+   struct mali_meta_fs_key key = {
+      .layered = layers > 1,
+   };
+   struct mali_meta_fs_push push = {
+      .area = {dx0, dy0, dx1 - 1, dy1 - 1},
+   };
+   blit_axis(r->srcOffsets[0].x, r->srcOffsets[1].x, r->dstOffsets[0].x, r->dstOffsets[1].x,
+             u_minify(src->vk.extent.width, slevel), &push.blit_scale[0], &push.blit_offset[0]);
+   blit_axis(r->srcOffsets[0].y, r->srcOffsets[1].y, r->dstOffsets[0].y, r->dstOffsets[1].y,
+             u_minify(src->vk.extent.height, slevel), &push.blit_scale[1], &push.blit_offset[1]);
+
+   struct mali_render_desc d = {
+      .width = u_minify(dst->vk.extent.width, dlevel),
+      .height = u_minify(dst->vk.extent.height, dlevel),
+      .area = {{dx0, dy0}, {(uint32_t)(dx1 - dx0), (uint32_t)(dy1 - dy0)}},
+      .layer_count = layers,
+   };
+   const struct mali_fb_target base = {
+      .image = dst,
+      .level = dlevel,
+      .layer = dst_layer,
+      .load = MALI_ATT_LOAD_DONT_CARE,
+      .store = true,
+      .always_write = true,
+   };
+
+   /* Textures in the shader's order: colour source and target, then depth
+    * source and target, then stencil's. */
+   uint32_t tex[6][8];
+   unsigned ntex = 0;
+   bool ok = true;
+   if (color) {
+      const enum pipe_format dfmt = dst->planes[0].format;
+      key.rt_op[0] = MALI_META_FS_BLIT;
+      key.rt_type[0] = fs_type(dfmt);
+      ok = ok && MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, src, 0, sfmt, slevel, src_layer,
+                                                       layers, tex[ntex++]);
+      ok = ok && MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, dst, 0, dfmt, dlevel, dst_layer,
+                                                       layers, tex[ntex++]);
+      d.rt_count = 1;
+      d.rt[0] = base;
+      d.rt[0].plane = 0;
+      d.rt[0].format = dfmt;
+   }
+   const VkImageAspectFlags zs[2] = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0,
+                                     stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0};
+   for (unsigned k = 0; k < 2; k++) {
+      if (!zs[k])
+         continue;
+      const unsigned splane = aspect_plane(src, zs[k]);
+      const unsigned dplane = aspect_plane(dst, zs[k]);
+      ok = ok && MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, src, splane,
+                                                       src->planes[splane].format, slevel,
+                                                       src_layer, layers, tex[ntex++]);
+      ok = ok && MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, dst, dplane,
+                                                       dst->planes[dplane].format, dlevel,
+                                                       dst_layer, layers, tex[ntex++]);
+      struct mali_fb_target *t = k ? &d.s : &d.z;
+      *t = base;
+      t->plane = dplane;
+      t->format = dst->planes[dplane].format;
+      if (k)
+         key.s_op = MALI_META_FS_BLIT;
+      else
+         key.z_op = MALI_META_FS_BLIT;
+   }
+   if (!ok) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   if (!ntex)
+      return;
+
+   /* Depth and stencil blits are nearest by Vulkan's rules; colour takes
+    * the command's filter. */
+   const bool nearest = filter == VK_FILTER_NEAREST || !color;
+   uint32_t sampler[8];
+   pan_cast_and_pack(sampler, SAMPLER, cfg) {
+      cfg.seamless_cube_map = false;
+      cfg.normalized_coordinates = true;
+      cfg.minify_nearest = nearest;
+      cfg.magnify_nearest = nearest;
+      cfg.clamp_integer_array_indices = true;
+   }
+
+   const struct mali_render_blit blit = {
+      .key = &key,
+      .push = &push,
+      .textures = (const uint32_t(*)[8])tex,
+      .texture_count = ntex,
+      .sampler = sampler,
+   };
+   d.blit = &blit;
+   transfer_pass(cmd, &d);
+}
+#endif /* PAN_ARCH < 9 */
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInfo2 *info)
 {
@@ -716,6 +922,12 @@ MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInf
 
    for (uint32_t i = 0; i < info->regionCount; i++) {
       const VkImageBlit2 *r = &info->pRegions[i];
+#if PAN_ARCH < 9
+      blit_region_v7(cmd, src, dst, r, info->filter);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+      continue;
+#endif
       if (!(r->dstSubresource.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)) {
          vk_logw(VK_LOG_OBJS(cmd), "malisx2: depth/stencil blits are not supported");
          continue;
@@ -732,48 +944,6 @@ MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInf
       const int32_t dy1 = MAX2(r->dstOffsets[0].y, r->dstOffsets[1].y);
       if (dx1 <= dx0 || dy1 <= dy0)
          continue;
-
-#if PAN_ARCH < 9
-      /*
-       * Bifrost: the blit pass needs the frame shaders (mali_cmd_meta_gfx.c
-       * meta_fs_dcd and the attachment textures, not ported yet). A blit
-       * that neither scales, flips, converts nor reads a compressed or
-       * AFBC image is a copy: same extent in both images, both offsets
-       * increasing, size-compatible single-block formats, one Z slice.
-       * Those go through the compute copy (dispatch_copy); the rest is
-       * refused with the TODO line until the texture family lands.
-       */
-      {
-         const int32_t sx0 = r->srcOffsets[0].x, sx1 = r->srcOffsets[1].x;
-         const int32_t sy0 = r->srcOffsets[0].y, sy1 = r->srcOffsets[1].y;
-         const bool one_to_one =
-            sx1 > sx0 && sy1 > sy0 && r->dstOffsets[1].x > r->dstOffsets[0].x &&
-            r->dstOffsets[1].y > r->dstOffsets[0].y && sx1 - sx0 == dx1 - dx0 &&
-            sy1 - sy0 == dy1 - dy0 && r->srcOffsets[1].z - r->srcOffsets[0].z == 1 &&
-            r->dstOffsets[1].z - r->dstOffsets[0].z == 1 &&
-            util_format_get_blocksize(sfmt) == util_format_get_blocksize(dfmt) &&
-            util_format_get_blockwidth(sfmt) == 1 && util_format_get_blockheight(sfmt) == 1 &&
-            util_format_get_blockwidth(dfmt) == 1 && util_format_get_blockheight(dfmt) == 1 &&
-            !mali_image_is_afbc(src) && !mali_image_is_afbc(dst) &&
-            (r->srcSubresource.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) &&
-            vk_image_subresource_layer_count(&src->vk, &r->srcSubresource) == layers;
-         if (!one_to_one) {
-            MALI_TODO_V7("scaled, flipped or converting blits");
-            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-            return;
-         }
-         const bool src3d = src->vk.image_type == VK_IMAGE_TYPE_3D;
-         const bool dst3d = dst->vk.image_type == VK_IMAGE_TYPE_3D;
-         struct copy_surface s, d;
-         image_surface(src, VK_IMAGE_ASPECT_COLOR_BIT, slevel,
-                       src3d ? r->srcOffsets[0].z : r->srcSubresource.baseArrayLayer, &s);
-         image_surface(dst, VK_IMAGE_ASPECT_COLOR_BIT, dlevel,
-                       dst3d ? r->dstOffsets[0].z : r->dstSubresource.baseArrayLayer, &d);
-         dispatch_copy(cmd, &s, sx0, sy0, &d, dx0, dy0, (uint32_t)(dx1 - dx0),
-                       (uint32_t)(dy1 - dy0), layers);
-         continue;
-      }
-#endif
 
       struct mali_meta_fs_key key = {
          .layered = layers > 1,

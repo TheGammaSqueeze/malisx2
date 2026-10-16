@@ -615,6 +615,29 @@ unsigned mali_v7_compute_task_split(const uint32_t local[3]);
 
 /* Frees the device's copy shader. */
 void mali_v7_desc_finish(struct mali_device *dev);
+
+/* ---------------------------------------------------------------------- */
+/* Internal draws inside a Bifrost pass (mali_jm_cmd_render.c)              */
+
+/*
+ * v7 has no Fullscreen job: an internal fragment shader drawn inside the
+ * current pass (vkCmdClearAttachments, the in-pass fragment barrier) is,
+ * per layer in [base_layer, base_layer + layer_count), one Tiler job
+ * drawing `rect` as a 4-vertex triangle strip whose screen-space positions
+ * the CPU writes, with no Vertex job in front (Mesa gallium
+ * pan_fb_preload.c pan_preload_emit_tiler_job and GENX(pan_preload_fb):
+ * the rectangle, primitive, primitive size and invocation of that job).
+ * `draw` is the Draw section's template (a struct mali_draw_packed, from
+ * meta_fs_dcd without frame_shader); each job gets the rectangle as its
+ * position and scissor. barrier sets the job header's Barrier bit.
+ */
+void mali_v7_cmd_meta_quads(struct mali_cmd_buffer *cmd, const void *draw, const VkRect2D *rect,
+                            uint32_t base_layer, uint32_t layer_count, bool barrier);
+
+/* The four positions (x, y, 0, 1) of the rectangle [x0, x1) x [y0, y1) as
+ * a triangle strip, in command memory (mali_cmd_meta_gfx.c). 0 on failure. */
+uint64_t mali_v7_meta_rect_positions(struct mali_cmd_buffer *cmd, float x0, float y0, float x1,
+                                     float y1);
 #endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */

@@ -471,7 +471,9 @@ enum mali_meta_fs_op {
    MALI_META_FS_CLEAR_IN_AREA, /* clear inside the push-constant rect, load outside */
    MALI_META_FS_BLIT,          /* inside the area: sample texture 0 at the
                                 * transformed position; outside: fetch
-                                * texture 1 (the target itself) */
+                                * texture 1 (the target itself). On v7 also
+                                * a z_op / s_op (depth and stencil blits,
+                                * two textures each after the colour ones) */
    MALI_META_FS_COPY,          /* raw copy into an AFBC target read as a
                                 * uint format of its block size: inside the
                                 * area, the source block at the fragment's
@@ -507,7 +509,10 @@ struct mali_meta_fs_push {
    float blit_layer;
    float clear_depth;
    uint32_t clear_stencil;
-   uint32_t pad;
+   /* v7: the layer a frame shader runs for (v7 has no frame argument; each
+    * layer gets its own frame shader DCDs, mali_cmd_meta_gfx.c). Unused on
+    * v9 and v11, which read the layer from the frame argument. */
+   uint32_t layer;
    uint32_t clear_color[8][4];
    /* COPY: source block = fragment position + delta (in blocks); a raw
     * source surface is addressed as the raw compute copy does
@@ -562,12 +567,23 @@ MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_quad_get,
 MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_tex_get,
                    (struct mali_cmd_buffer *cmd, unsigned elem_log2));
 
+/* Frame shader Draw descriptors of a framebuffer descriptor: colour preload,
+ * depth/stencil preload, post-frame (panvk's slots 0, 1, 2). On v7 every
+ * layer has its own three, layer after layer (mali_fb.c fb_build). */
+#define MALI_FRAME_SHADER_DCDS 3
+
 /*
  * Pack into `out` (a Draw descriptor, 64-byte aligned) the frame-shader or
  * full-screen draw that runs `fs` with `key`'s outputs over the current
  * render pass. `textures` are packed Texture descriptors in output order
  * (one per output that reads), `sampler` a packed Sampler (NULL: nearest).
  * False on failure.
+ *
+ * v7: a frame shader's `out` is its slot in layer 0's triple, and one Draw
+ * per layer of the pass is written, MALI_FRAME_SHADER_DCDS Draw
+ * descriptors apart, each with the layer in its push constants. Without
+ * frame_shader, `out` is a CPU template of a Tiler job's Draw section
+ * (mali_v7_cmd_meta_quads fills in the position and viewport per job).
  */
 MALI_PER_ARCH_DECL(bool, meta_fs_dcd,
                    (struct mali_cmd_buffer *cmd, const struct mali_shader *fs,

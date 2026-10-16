@@ -97,6 +97,13 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
 
    if (f->bind & PAN_BIND_DEPTH_STENCIL)
       feat |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+#if PAN_ARCH < 9
+   /* v7 blits depth and stencil through a frame shader that writes them
+    * (mali_cmd_image.c), so its depth/stencil formats are blit
+    * destinations too (nearest only, identical formats, as Vulkan asks). */
+   if ((f->bind & PAN_BIND_DEPTH_STENCIL) && (f->bind & PAN_BIND_SAMPLER_VIEW))
+      feat |= VK_FORMAT_FEATURE_BLIT_DST_BIT;
+#endif
 
    return feat;
 }
