@@ -7,7 +7,7 @@
  * Blend shaders (mali_blend.h), built per arch.
  *
  * The shader follows Mesa's pan_blend_create_shader (src/panfrost/lib/
- * pan_blend.c, MIT) for v9+: read the fragment shader's colour output(s)
+ * pan_blend.c, MIT) for v6+: read the fragment shader's colour output(s)
  * from the blend input registers, read the destination from the tile
  * buffer, blend with nir_lower_blend's helpers (logic op, equation, colour
  * mask), write back with an opaque BLEND and return to the fragment shader.
@@ -18,6 +18,19 @@
  * pan_blend.c is not vendored: its PAN_ARCH half includes pan_texture.h,
  * which pulls in the panthor kernel interface (kmod/pan_kmod.h). The
  * fixed-function half is in mali_pipeline_state.c.
+ *
+ * The same NIR serves the Bifrost (v7) build, compiled with Mesa's
+ * Bifrost backend instead of kraid (mali_compiler.c). What differs on v7
+ * is the calling convention around the shader, not the shader: the
+ * fragment shader's BLEND jumps to the Blend descriptor's PC and the blend
+ * shader's blend_return_pan jumps to the descriptor's Return Value, which
+ * the draw sets to the fragment code plus the compiler's return offset for
+ * that render target (mali_cmd_state.h mali_gfx_blend_v7,
+ * info.bifrost.blend[].return_offset); on v9+ the link register carries
+ * it. The opaque Internal Blend word the shader uses for its tile read and
+ * write names the register format on v7 (pan_blend_get_internal_desc at
+ * PAN_ARCH < 9), and the blend constants reach it through the fragment
+ * shader's push uniform block (FAU words 0 and 1) on both.
  *
  * Placement: the code goes into the device's executable pool with the
  * pipelines' shaders, so it shares their
@@ -64,7 +77,6 @@ struct blend_cache {
    struct hash_table *ht;        /* key -> struct blend_shader */
 };
 
-#if PAN_ARCH >= 9
 static uint32_t
 key_hash(const void *key)
 {
@@ -76,7 +88,6 @@ key_equal(const void *a, const void *b)
 {
    return !memcmp(a, b, sizeof(struct mali_blend_shader_key));
 }
-#endif
 
 /* ---------------------------------------------------------------------- */
 /* NIR                                                                     */
@@ -95,11 +106,33 @@ shader_format(enum pipe_format format)
    }
 }
 
+#if PAN_ARCH < 9
+/* pan_blend.c get_register_format: the register file format of the type
+ * the shader blends in (8-bit types are widened to 16). */
+static enum mali_register_file_format
+register_format(nir_alu_type t)
+{
+   switch (t) {
+   case nir_type_float16: return MALI_REGISTER_FILE_FORMAT_F16;
+   case nir_type_float32: return MALI_REGISTER_FILE_FORMAT_F32;
+   case nir_type_int8:
+   case nir_type_int16: return MALI_REGISTER_FILE_FORMAT_I16;
+   case nir_type_int32: return MALI_REGISTER_FILE_FORMAT_I32;
+   case nir_type_uint8:
+   case nir_type_uint16: return MALI_REGISTER_FILE_FORMAT_U16;
+   case nir_type_uint32: return MALI_REGISTER_FILE_FORMAT_U32;
+   default: UNREACHABLE("invalid blend register type");
+   }
+}
+#endif
+
 /* The Internal Blend word pair of an opaque store of `format` to render
- * target `rt` (pan_blend_get_internal_desc for v9+). The shader's own
- * tile read and BLEND use it. */
+ * target `rt` (pan_blend_get_internal_desc). The shader's own tile read
+ * and BLEND use it. `dest_type` is the type the shader blends in: on v7
+ * the conversion names the register format it stores from (the Bifrost
+ * blender converts from the register file); v9+ has no such field. */
 static uint64_t
-opaque_internal_desc(enum pipe_format format, unsigned rt)
+opaque_internal_desc(enum pipe_format format, unsigned rt, nir_alu_type dest_type)
 {
    const struct util_format_description *desc = util_format_description(format);
    struct mali_internal_blend_packed res;
@@ -108,6 +141,11 @@ opaque_internal_desc(enum pipe_format format, unsigned rt)
       cfg.mode = MALI_BLEND_MODE_OPAQUE;
       cfg.fixed_function.num_comps = desc->nr_channels;
       cfg.fixed_function.rt = rt;
+#if PAN_ARCH < 9
+      cfg.fixed_function.conversion.register_format = register_format(dest_type);
+#else
+      (void)dest_type;
+#endif
       cfg.fixed_function.conversion.memory_format =
          GENX(pan_dithered_format_from_pipe_format)(format, false);
    }
@@ -160,7 +198,7 @@ MALI_PER_ARCH(blend_shader_nir)(const struct mali_blend_shader_key *key)
       src1 = nir_vector_insert_imm(b, src1, one, 3);
    }
 
-   const uint64_t opaque = opaque_internal_desc(format, key->rt);
+   const uint64_t opaque = opaque_internal_desc(format, key->rt, dest_type);
    nir_def *sample = key->nr_samples > 1 ? nir_load_sample_id(b) : nir_imm_int(b, 0);
    nir_def *dest = nir_load_tile_pan(
       b, 4, dest_bits, pan_nir_tile_rt_sample(b, nir_imm_int(b, key->rt), sample),
@@ -200,7 +238,6 @@ MALI_PER_ARCH(blend_shader_nir)(const struct mali_blend_shader_key *key)
    return b->shader;
 }
 
-#if PAN_ARCH >= 9
 /* The blend constants are the first four 32-bit FAU words of the fragment
  * shader that calls the blend shader (panvk lower_load_blend_const). */
 static bool
@@ -215,7 +252,6 @@ lower_blend_const(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    nir_def_replace(&intr->def, c);
    return true;
 }
-#endif
 
 /* ---------------------------------------------------------------------- */
 /* Compile and cache                                                       */
@@ -264,7 +300,6 @@ MALI_PER_ARCH(blend_shaders_prepare)(struct mali_device *dev, struct mali_graphi
    }
 }
 
-#if PAN_ARCH >= 9
 static VkResult
 compile_blend_shader(struct mali_device *dev, const struct mali_blend_shader_key *key,
                      struct mali_bo_ref *code)
@@ -308,23 +343,11 @@ compile_blend_shader(struct mali_device *dev, const struct mali_blend_shader_key
    util_dynarray_fini(&bin);
    return VK_SUCCESS;
 }
-#endif /* PAN_ARCH >= 9 */
 
 VkResult
 MALI_PER_ARCH(blend_shader_get)(struct mali_device *dev, const struct mali_blend_shader_key *key,
                                 uint64_t *addr)
 {
-#if PAN_ARCH < 9
-   /* TODO v7: Bifrost blend shaders have their own calling convention (the
-    * fragment shader's BLEND jumps to the shader and it returns to the
-    * return address in the Blend descriptor, panvk_v7 panvk_vX_blend.c
-    * emit_blend_desc, fs_info->bifrost.blend[].return_offset), and the
-    * shader above is written for the v9+ convention. The draw stores the
-    * colour unblended for such a target (mali_cmd_state.h
-    * mali_gfx_blend_v7). */
-   MALI_TODO_V7("blend shaders");
-   return VK_ERROR_FEATURE_NOT_PRESENT;
-#else
    VkResult result = VK_SUCCESS;
 
    simple_mtx_lock(&dev->meta_lock);
@@ -361,7 +384,6 @@ MALI_PER_ARCH(blend_shader_get)(struct mali_device *dev, const struct mali_blend
    }
    simple_mtx_unlock(&dev->meta_lock);
    return result;
-#endif /* PAN_ARCH >= 9 */
 }
 
 unsigned

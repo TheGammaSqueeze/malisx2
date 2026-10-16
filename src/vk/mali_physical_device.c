@@ -388,8 +388,10 @@ dual_src_blend_for_arch(uint32_t arch)
    case 11:
       return true;
    case 7:
-      /* TODO v7: panvk_v7 reports dualSrcBlend through Bifrost blend
-       * shaders (panvk_vX_blend.c); off until that path is ported. */
+      /* Off by choice on the Mali-G52: panvk_v7 does it through Bifrost
+       * blend shaders (blend2_pan, the second source in the blend input
+       * registers), which this driver's blend shaders do not emit on v7
+       * yet; nothing of ours asks for it there. */
       return false;
    default:
       return false;
@@ -705,9 +707,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * which is panvk's for v11: 7 sets, 2^20 descriptors per type, 16
        * dynamic uniform and 8 dynamic storage buffers, 16 vertex buffers,
        * 1 MiB uniform buffers (12-bit entry count of 16-byte entries),
-       * 256 bytes of push constants.
+       * 256 bytes of push constants. v7's Uniform Buffer descriptor has
+       * a 12-bit count of 16-byte entries: 64 KiB (panvk_v7).
        */
-      .maxUniformBufferRange = 1u << 20,
+      .maxUniformBufferRange = v7 ? 1u << 16 : 1u << 20,
       .maxPushConstantsSize = 256,
       .maxBoundDescriptorSets = 7,
 

@@ -219,6 +219,34 @@ struct mali_jm_draw_tmpl {
 #define MALI_V7_VARY_BUF_PSIZ 2
 #define MALI_V7_VARY_BUF_COUNT 3
 
+/*
+ * The Bifrost descriptor tables of one stage of a draw or dispatch
+ * (mali_shader.h, "Bifrost (v7) descriptor model"; mali_jm_desc_v7.c): what
+ * the Draw section's Uniform buffers, Textures, Samplers, Attribute buffers
+ * and Attributes pointers take, the dynamic storage buffer table and the
+ * set addresses the stage's system values carry. Built by
+ * mali_v7_desc_prepare for the draw's vertex and fragment shaders and for
+ * every dispatch; the entries copied from the sets are written by
+ * mali_v7_desc_copy (a copy job in front of the job that reads them).
+ */
+struct mali_v7_desc_tables {
+   /* MALI_V7_DESC_TABLE_*, 0 for a table the shader does not have: 8-byte
+    * Uniform Buffer descriptors (the dynamic ones behind the others), the
+    * images' Attribute Buffer pairs, Texture and Sampler descriptors (a
+    * dummy Sampler for a shader with textures and no sampler). */
+   uint64_t tables[MALI_V7_DESC_TABLE_COUNT];
+   uint64_t img_attribs;                      /* the images' Attribute descriptors */
+   uint64_t dyn_ssbos;                        /* dynamic storage buffer address/size pairs */
+   uint64_t sets[MALI_MAX_SETS];              /* the bound sets' memory, 0 when unbound */
+   uint32_t set_desc_counts[MALI_MAX_SETS];   /* their slot counts */
+   /* CPU views of the copied tables, for the CPU fill
+    * (MALISX2_V7_CPU_DESC_COPY, mali_jm_desc_v7.c). */
+   void *tables_cpu[MALI_V7_DESC_TABLE_COUNT];
+   void *img_attribs_cpu;
+   /* The shader the tables were built for (their layout is its own). */
+   const struct mali_shader *shader;
+};
+
 struct mali_jm_draw_tmpl {
    /* Per pipeline (MALI_GFX_DIRTY_PIPELINE). */
    uint32_t prim0;          /* Primitive word 0 without index type and provoking vertex */
@@ -233,6 +261,8 @@ struct mali_jm_draw_tmpl {
    bool lines;
    /* Per state group. */
    uint64_t fs_rsd;         /* fragment RSD followed by the Blend descriptors (PIPELINE, BLEND, ZSD) */
+   void *fs_rsd_cpu;        /* its CPU view, for the MALISX2_DUMP_DRAW dump */
+   struct mali_v7_desc_tables vs_tab, fs_tab;   /* descriptor tables (VS_SRT, FS_SRT) */
    uint64_t vs_fau, fs_fau; /* push uniform blocks (VS_FAU, FS_FAU) */
    uint64_t viewport;       /* Viewport descriptor (VIEWPORT) */
    uint64_t tiler, tsd;     /* layer 0's Tiler Context, the pass's Local Storage (PASS) */
@@ -527,49 +557,50 @@ bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
 /* Bifrost descriptor tables (mali_jm_desc_v7.c)                            */
 
 /*
- * What a Bifrost dispatch or draw points its Draw descriptor at for one
- * shader's descriptor sets (mali_shader.h, "Bifrost (v7) descriptor
- * model"): the four tables, the image Attribute descriptors, the dynamic
- * storage buffer table, and the desc.sets system values. Built from the
- * bound sets by mali_v7_desc_prepare; the regular entries of the tables
- * are filled on the GPU by the copy job (mali_v7_desc_copy_job), which
- * runs before the job that uses them, so a set updated between recording
- * and submission is read as the application left it.
+ * The one table builder of the Bifrost draws and dispatches (struct
+ * mali_v7_desc_tables above): allocates the shader's tables in command
+ * memory and fills what the CPU packs (panvk_v7
+ * cmd_prepare_shader_desc_tables, panvk_cmd_fill_dyn_ubos,
+ * cmd_prepare_dyn_ssbos): the dynamic uniform buffers behind the regular
+ * ones, the dynamic storage buffer table, the dummy sampler, the bound
+ * sets' addresses. With img false the image tables are not allocated: a
+ * vertex shader's images live behind the vertex buffers in the draw's own
+ * Attribute Buffer and Attribute tables, which the draw points
+ * tables[MALI_V7_DESC_TABLE_IMG] and img_attribs at. desc may be NULL for a
+ * shader without descriptor sets. False with the command buffer's error
+ * set.
  */
-struct mali_v7_desc_tables {
-   uint64_t tables[MALI_V7_TABLE_COUNT];   /* 0 when the shader has none */
-   uint64_t img_attribs;                    /* Attribute descriptors of the images */
-   uint64_t dyn_ssbos;                      /* address/size pairs */
-   uint64_t sets[MALI_V7_SETS];             /* the bound sets' memory */
-   uint32_t set_desc_counts[MALI_V7_SETS];  /* slots of each */
-   bool any;                                /* a copy job is needed */
-};
-
-/* Allocates and fills what the CPU can (dynamic buffers, the dummy
- * sampler, the set bases); desc may be NULL for a shader without sets.
- * False with the command buffer's error set. */
 bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
-                          const struct mali_desc_state *desc, struct mali_v7_desc_tables *out);
+                          const struct mali_desc_state *desc, bool img,
+                          struct mali_v7_desc_tables *out);
 
 /*
- * The copy job: a Compute job on chain c that copies the shader's regular
- * descriptors from the sets into the tables (one invocation per entry).
- * attrib_buf_idx_offset: what the image Attribute descriptors' buffer
- * indices start at (0 for compute and fragment, twice the vertex binding
- * count for a vertex shader). *index: the job's index, for the dependency
- * of the job that follows; 0 when no job was needed. False on failure.
+ * The table entries copied from the sets (the shader's copy map): by a
+ * Compute job on chain c running the copy shader, one invocation per
+ * entry (panvk_v7 meta_get_copy_desc_job). *index: that job's index, the
+ * Dependency 1 of the job that reads the tables; 0 when the shader has no
+ * such entry. attrib_buf_idx_offset: the buffer index the image Attribute
+ * descriptors start at (twice the vertex binding count for a vertex
+ * shader, 0 otherwise). With MALISX2_V7_CPU_DESC_COPY=1 the CPU copies the
+ * entries here instead (a debugging switch that takes the copy shader out
+ * of a failing run; *index is then 0). False on failure, with the command
+ * buffer's error set.
  */
-bool mali_v7_desc_copy_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
-                           const struct mali_shader *s, const struct mali_v7_desc_tables *t,
-                           uint32_t attrib_buf_idx_offset, uint16_t *index);
+bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                       const struct mali_shader *s, const struct mali_desc_state *desc,
+                       const struct mali_v7_desc_tables *t, uint32_t attrib_buf_idx_offset,
+                       uint16_t *index);
 
-/* The desc.sets system values of the compute stage, from the tables. */
-void mali_v7_desc_compute_sysvals(const struct mali_v7_desc_tables *t,
-                                  struct mali_compute_sysvals *sv);
+/* The desc.sets system values of one stage (graphics v7_desc.sets, compute
+ * v7_desc.sets): the addresses of the bound sets the shader reads, and at
+ * MALI_V7_DESC_TABLE_DYN_SSBOS its dynamic storage buffer table. */
+void mali_v7_desc_sysvals(const struct mali_v7_desc_tables *t, const struct mali_shader *s,
+                          uint64_t sets[MALI_MAX_SETS + 1]);
 
 /* The FAU block of a dispatch on Bifrost (mali_cmd_state.h mali_compute_fau
- * with the desc.sets and constant data system values): the block's
- * address, 0 when the shader has no FAU or on failure. */
+ * with the desc.sets and constant data system values; t may be NULL for an
+ * internal shader without descriptor sets): the block's address, 0 when
+ * the shader has no FAU or on failure. */
 uint64_t mali_v7_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                              const struct mali_v7_desc_tables *t, const void *push,
                              uint32_t push_size, const uint32_t base[3],

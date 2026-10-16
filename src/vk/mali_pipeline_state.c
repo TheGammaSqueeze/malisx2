@@ -61,8 +61,9 @@
 
 
 /* Formats the fixed-function blender handles (Mesa's blendable format
- * table for v9+: 8-bit UNORM/sRGB, 565, 4444, 5551, 10-10-10-2 and the
- * 16-bit/11-11-10 float formats). */
+ * table: 8-bit UNORM/sRGB, 565, 4444, 5551, 10-10-10-2 and, from v9, the
+ * 16-bit/11-11-10 float formats; the Bifrost table has no float entries,
+ * so a blended float target takes a blend shader on v7). */
 static bool
 format_supports_hw_blend(VkFormat format)
 {
@@ -90,11 +91,14 @@ format_supports_hw_blend(VkFormat format)
    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      return true;
+#if PAN_ARCH >= 9
    case VK_FORMAT_R16_SFLOAT:
    case VK_FORMAT_R16G16_SFLOAT:
    case VK_FORMAT_R16G16B16A16_SFLOAT:
    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
       return true;
+#endif
    default:
       return false;
    }
@@ -1017,9 +1021,10 @@ pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
             cfg.properties.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
             cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
          }
-         /* panvk's v7 rule: sample shading only (a blend shader under
-          * multisampling is the Bifrost driver's business, and blend
-          * shaders are not ported, mali_blend.c). */
+         /* panvk's v7 rule: sample shading only. A blend shader under
+          * multisampling also needs per-sample evaluation; the draw ORs
+          * it in once it knows which targets got one (mali_jm_cmd_draw.c
+          * build_fs_rsd: the dynamic blend constants can add some). */
          cfg.multisample_misc.evaluate_per_sample =
             fs->info.fs.sample_shading && dyn->ms.rasterization_samples > 1;
       } else {

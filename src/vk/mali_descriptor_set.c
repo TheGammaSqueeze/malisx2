@@ -11,9 +11,18 @@
  * into each slot, because Mesa's compiler reads the slots; pool memory
  * and accounting follow the blob.
  *
- * Built per arch. The one hardware difference: v9's Buffer descriptor has
- * no size-hi word (v11 word 5), so buffer sizes are 32 bits there; the
- * T820 blob writes the same v9 fields.
+ * Built per arch. v9's Buffer descriptor has no size-hi word (v11 word
+ * 5), so buffer sizes are 32 bits there; the T820 blob writes the same v9
+ * fields. v7 (Bifrost) keeps the same slot layout with panvk_v7's slot
+ * contents (panvk_vX_descriptor_set.c at PAN_ARCH < 9): a uniform buffer
+ * is an 8-byte Uniform Buffer descriptor at the start of its slot, a
+ * storage buffer an address and size pair the shader reads straight from
+ * the set, a sampled image a Texture descriptor, a buffer view a 1D
+ * Attribute Buffer and an Attribute (below), a storage image an Attribute
+ * Buffer pair (mali_image_view.c), an unused slot zero. The draws and
+ * dispatches copy the uniform buffer, image, texture and sampler slots a
+ * shader uses into its per-type tables with a small GPU job
+ * (mali_jm_desc_v7.c).
  */
 
 #ifndef PAN_ARCH
@@ -81,11 +90,11 @@ MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *
     * Bifrost: a texel buffer is an image for the shader (a 1D Attribute
     * Buffer and an Attribute descriptor the compiler reads with LEA_ATTR,
     * Mesa pan_buffer.c pan_buffer_texture_emit at PAN_ARCH 6..7; panvk_v7
-    * panvk_vX_buffer_view.c). The slot holds the pair as the copy job
-    * expects it (mali_jm_desc_v7.c set_to_table_img_copy): the Attribute
-    * Buffer in the first 16 bytes, the Attribute in the next 8, zero after.
-    * The buffer address has its low 6 bits moved into the Attribute's
-    * offset (the Attribute Buffer pointer is 64-byte aligned).
+    * panvk_vX_buffer_view.c). The slot holds the pair as the dispatch's
+    * copy job expects it (mali_jm_desc_v7.c set_to_table_img_copy): the
+    * Attribute Buffer in the first 16 bytes, the Attribute in the next 8,
+    * zero after. The buffer address has its low 6 bits moved into the
+    * Attribute's offset (the Attribute Buffer pointer is 64-byte aligned).
     */
    const enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.format);
    const unsigned stride = util_format_get_blocksize(pfmt);
@@ -183,10 +192,10 @@ write_null(const struct mali_descriptor_set *set, uint32_t binding, uint32_t ele
    pan_pack(&null_desc, NULL_DESCRIPTOR, cfg);
    write_slot(set, binding, elem, sub, &null_desc);
 #else
-   /* No Null descriptor on Bifrost: a slot bound to nothing is zero, as
-    * panvk_v7's (panvk_vX_descriptor_set.c write_nulldesc). The slot
-    * layout (one 32-byte slot per descriptor, mali_descriptor_set_layout.c)
-    * is the same on both: panvk uses it for Bifrost too. */
+   /* No Null descriptor on Bifrost: an unused slot is zero, as panvk_v7's
+    * (panvk_vX_descriptor_set.c). Reading through one is not robust
+    * (nullDescriptor is not exposed): a zero Texture, Uniform Buffer or
+    * Attribute Buffer reads from address 0. */
    const uint8_t null_desc[MALI_DESCRIPTOR_SIZE] = {0};
    write_slot(set, binding, elem, sub, null_desc);
 #endif
@@ -246,34 +255,23 @@ static void
 pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
 {
 #if PAN_ARCH < 9
-   /*
-    * Bifrost (panvk_v7 panvk_vX_descriptor_set.c write_buffer_desc): a
-    * uniform buffer is an 8-byte Uniform Buffer descriptor (16-byte entry
-    * count, 16-byte aligned pointer) at the start of its slot, which the
-    * copy job moves into the dispatch's UBO table; a storage buffer is a
-    * 64-bit address and 32-bit size the shader reads from the slot itself
-    * (mali_nir_lower_descriptors.c, mali_jm_desc_v7.c struct ssbo_addr).
-    * Sizes round up as on Valhall (4 for storage, 16 for uniform); a
-    * uniform buffer counts at least one entry (the packer encodes the
-    * count minus one), and its pointer alignment is the API's 16.
-    */
+   /* panvk_v7 write_buffer_desc: a storage buffer is the address and size
+    * pair the shader's load_vulkan_descriptor reads from the set
+    * (panvk_ssbo_addr: base, 32-bit size, the rest zero); a uniform buffer
+    * the hardware's Uniform Buffer descriptor (16-byte entries, 12 bits
+    * minus one: at most 64 KiB, the maxUniformBufferRange of this arch; a
+    * zero range still packs one entry, the packer refuses zero). */
    memset(out, 0, MALI_DESCRIPTOR_SIZE);
    if (ssbo) {
-      struct {
-         uint64_t base_addr;
-         uint32_t size;
-      } desc = {
-         .base_addr = addr,
-         .size = (uint32_t)MIN2(align64(range, 4), UINT32_MAX & ~3u),
-      };
-      memcpy(out, &desc, sizeof(desc));
+      const uint64_t size = align64(range, 4);
+      const uint32_t size32 = (uint32_t)MIN2(size, UINT32_MAX & ~3ull);
+      memcpy(out, &addr, sizeof(addr));
+      memcpy((uint8_t *)out + 8, &size32, sizeof(size32));
    } else {
-      struct mali_uniform_buffer_packed ubo;
-      pan_pack(&ubo, UNIFORM_BUFFER, cfg) {
+      pan_cast_and_pack(out, UNIFORM_BUFFER, cfg) {
          cfg.pointer = addr;
-         cfg.entries = MAX2(DIV_ROUND_UP(range, 16), 1);
+         cfg.entries = CLAMP(DIV_ROUND_UP(range, 16), 1, 1u << 12);
       }
-      memcpy(out, &ubo, sizeof(ubo));
    }
 #else
    const uint64_t size = align64(range, ssbo ? 4 : 16);
@@ -465,7 +463,8 @@ copy_descriptors(const VkCopyDescriptorSet *c)
 
 /* Set memory is CPU-uncached: the GPU sees these writes without any cache
  * maintenance, and reads the set in place when a command buffer that bound
- * it executes (so updates after the bind are seen, as with the blob). */
+ * it executes (so updates after the bind are seen, as with the blob; on v7
+ * the descriptor copy job reads it when the command buffer runs). */
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(UpdateDescriptorSets)(VkDevice _device, uint32_t descriptorWriteCount,
                                     const VkWriteDescriptorSet *pDescriptorWrites,
@@ -762,9 +761,9 @@ void
 MALI_PER_ARCH(descriptor_set_pack_resource)(const struct mali_descriptor_set *set, void *out)
 {
 #if PAN_ARCH < 9
-   /* No Resource entries on Bifrost: a bound set's descriptors are copied
-    * into the per-stage tables of the dispatch or draw (mali_jm_desc_v7.c)
-    * and never reach this. */
+   /* TODO v7: no Resource entries on Bifrost; a bound set's descriptors
+    * are copied into the per-type tables of the draw or dispatch instead
+    * (panvk_v7 panvk_vX_cmd_desc_state.c). */
    MALI_TODO_V7("resource table entries");
    memset(out, 0, MALI_RESOURCE_SIZE);
 #else

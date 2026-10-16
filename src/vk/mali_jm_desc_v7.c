@@ -4,34 +4,60 @@
  */
 
 /*
- * Bifrost (v7) descriptor tables for a dispatch or draw, and the compute
- * job sizing helpers (mali_jm.h, "Bifrost descriptor tables"). Built only
- * at PAN_ARCH 7 (the file is part of the job-manager back half, which is
- * also built at 9, where it is empty).
+ * The Bifrost (v7) descriptor tables of a draw or dispatch, built by one
+ * builder for both (mali_jm.h, struct mali_v7_desc_tables), and the
+ * compute job sizing helpers. Built only at PAN_ARCH 7: src/meson.build
+ * adds this file to the v7 job-manager library alone.
  *
  * Ported from panvk's Bifrost job-manager path in the pinned Mesa:
  * src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
  * (cmd_prepare_shader_desc_tables, cmd_prepare_dyn_ssbos,
  * panvk_cmd_fill_dyn_ubos), vulkan/bifrost/panvk_vX_meta_desc_copy.c (the
- * copy shader and its job), vulkan/panvk_vX_cmd_dispatch.c
- * (cmd_prepare_dispatch_sysvals) and lib/pan_encoder.h
+ * copy shader and its job), vulkan/panvk_vX_cmd_dispatch.c and
+ * panvk_vX_cmd_draw.c (the desc.sets system values) and lib/pan_encoder.h
  * (pan_pack_work_groups_compute), onto this driver's command memory,
  * shader objects and job chains.
  *
- * Why a GPU copy job rather than copying on the CPU when the command is
- * recorded: Vulkan lets an application update a bound descriptor set
- * after the command buffer is recorded and before it is submitted, and
- * the Valhall back half honours that (its resource tables point at the
- * set's memory). The tables here are copies, so the copy is made when the
- * command buffer runs: one small Compute job (one invocation per
- * descriptor) in front of the job that reads them, which depends on it.
+ * The model, the same for the vertex and fragment stage of a draw and for
+ * a dispatch:
+ *
+ *  - mali_v7_desc_prepare allocates the stage's tables in command memory
+ *    and writes what only the CPU knows: the dynamic uniform buffers
+ *    (behind the regular ones in the Uniform Buffer table) and the dynamic
+ *    storage buffer table, both with the bound dynamic offsets applied, the
+ *    dummy sampler, and the bound sets' addresses;
+ *  - mali_v7_desc_copy fills the entries that come from the sets (uniform
+ *    buffers, textures, samplers, images and texel buffers, in the order of
+ *    the shader's copy map) with one small Compute job in the same chain.
+ *    The job that reads the tables depends on it: the Vertex job on the
+ *    vertex shader's, the dispatch on the compute shader's. A fragment
+ *    shader's tables are read by the fragment job, which starts only once
+ *    the whole vtc atom is done, so the Tiler job needs no dependency on
+ *    that copy job (panvk adds none either);
+ *  - storage buffers and size queries are not copied: the shader reads the
+ *    set itself through the set addresses in its system values
+ *    (mali_v7_desc_sysvals).
+ *
+ * The copy runs on the GPU, as panvk's does, so the tables hold the sets as
+ * they are when the command buffer executes. A copy on the CPU when the
+ * command is recorded would be as correct (no update-after-bind feature is
+ * exposed, so a set must not change while a command buffer that bound it
+ * is pending), but set memory is CPU-uncached and each entry would be an
+ * uncached read. MALISX2_V7_CPU_DESC_COPY=1 does exactly that, as a
+ * debugging switch that takes the copy shader out of a failing run.
  */
 
 #include "mali_cmd_state.h"
 
-#if PAN_ARCH < 9
+#if PAN_ARCH >= 9
+#error "mali_jm_desc_v7.c is the Bifrost (PAN_ARCH 7) descriptor model"
+#endif
+
+#include <stdlib.h>
+#include <string.h>
 
 #include "nir_builder.h"
+#include "util/log.h"
 #include "util/mesa-blake3.h"
 #include "vk_log.h"
 #include "vk_pipeline.h"
@@ -39,12 +65,13 @@
 #include "mali_arch.h"
 #include "mali_memory.h"
 
-/* The address of a dynamic buffer bound to nothing: the GPU's memory sink
- * (panvk). */
+/* The address of a dynamic storage buffer bound to nothing: the GPU's
+ * memory sink (panvk). */
 #define NULL_BUFFER_ADDR (0x8ull << 60)
 
-/* An SSBO slot of a set, and an entry of the dynamic SSBO table
- * (panvk_ssbo_addr): what the shader's load_vulkan_descriptor reads. */
+/* A storage buffer slot of a set, and an entry of the dynamic storage
+ * buffer table (panvk_ssbo_addr): what the shader's load_vulkan_descriptor
+ * reads (mali_nir_lower_descriptors_v7.c). */
 struct ssbo_addr {
    uint64_t base_addr;
    uint32_t size;
@@ -90,127 +117,177 @@ mali_v7_compute_task_split(const uint32_t local[3])
 }
 
 /* ---------------------------------------------------------------------- */
+/* The bound sets                                                          */
+
+/* The slot a copy handle names, NULL when its set is not bound or is
+ * smaller than the layout the shader was compiled against (the CPU fill;
+ * the copy shader makes the same test with the set's slot count). */
+static const uint8_t *
+set_slot(const struct mali_desc_state *desc, uint32_t handle)
+{
+   const uint32_t set = MALI_COPY_DESC_HANDLE_SET(handle);
+   const uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(handle);
+   const struct mali_descriptor_set *s = desc && set < MALI_MAX_SETS ? desc->sets[set] : NULL;
+   if (!s || !s->cpu || idx >= s->layout->desc_count)
+      return NULL;
+   return (const uint8_t *)s->cpu + (size_t)idx * MALI_DESCRIPTOR_SIZE;
+}
+
+/* The dynamic buffer a copy handle names: its address with the bound
+ * dynamic offset applied, and its range. False when its set is not
+ * bound. */
+static bool
+dyn_buf(const struct mali_desc_state *desc, uint32_t handle, uint64_t *addr, uint64_t *range)
+{
+   const uint32_t set = MALI_COPY_DESC_HANDLE_SET(handle);
+   const uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(handle);
+   const struct mali_descriptor_set *s = desc && set < MALI_MAX_SETS ? desc->sets[set] : NULL;
+   if (!s || idx >= s->layout->dyn_buf_count)
+      return false;
+   *addr = s->dyn_bufs[idx].addr + desc->dyn_offsets[set][idx];
+   *range = s->dyn_bufs[idx].range;
+   return true;
+}
+
+/* ---------------------------------------------------------------------- */
 /* The tables                                                              */
+
+static unsigned
+table_entry_size(unsigned t)
+{
+   return t == MALI_V7_DESC_TABLE_UBO ? pan_size(UNIFORM_BUFFER) : MALI_DESCRIPTOR_SIZE;
+}
 
 bool
 mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
-                     const struct mali_desc_state *desc, struct mali_v7_desc_tables *out)
+                     const struct mali_desc_state *desc, bool img,
+                     struct mali_v7_desc_tables *out)
 {
-   const struct mali_shader_desc_info *di = &s->desc;
+   const struct mali_v7_shader_desc *v7 = &s->v7;
+   /* desc.dyn_bufs.map: the dynamic uniform buffers first, then the
+    * dynamic storage buffers (mali_nir_lower_descriptors_v7.c). */
+   const uint32_t dyn_ubo_count = v7->dyn_ubo_count;
+   const uint32_t dyn_ssbo_count = s->desc.dyn_bufs.count - dyn_ubo_count;
+   const uint32_t *dyn_ubo_map = s->desc.dyn_bufs.map;
+   const uint32_t *dyn_ssbo_map = s->desc.dyn_bufs.map + dyn_ubo_count;
 
    memset(out, 0, sizeof(*out));
-   if (!mali_shader_desc_info_uses_sets(di))
+   out->shader = s;
+   if (!s->desc.used_set_mask && !v7->map_count && !s->desc.dyn_bufs.count)
       return true;
 
-   for (unsigned i = 0; i < MALI_V7_SETS; i++) {
+   /* Every bound set: the copy shader's sources (panvk passes them all). */
+   for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       out->sets[i] = set ? set->gpu : 0;
       out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
    }
 
-   for (unsigned t = 0; t < MALI_V7_TABLE_COUNT; t++) {
-      const uint32_t regular = di->v7.count[t];
-      const uint32_t count = regular + (t == MALI_V7_TABLE_UBO ? di->v7.dyn_ubos.count : 0);
-      const unsigned entry = t == MALI_V7_TABLE_UBO ? pan_size(UNIFORM_BUFFER)
-                                                    : MALI_DESCRIPTOR_SIZE;
-      if (!count)
+   for (unsigned t = 0; t < MALI_V7_DESC_TABLE_COUNT; t++) {
+      const uint32_t regular = v7->count[t];
+      const uint32_t count = regular + (t == MALI_V7_DESC_TABLE_UBO ? dyn_ubo_count : 0);
+      const unsigned entry = table_entry_size(t);
+      if (!count || (t == MALI_V7_DESC_TABLE_IMG && !img))
          continue;
 
-      struct mali_ptr p = mali_cmd_alloc(cmd, (uint64_t)count * entry, 64);
+      /* The image table is an Attribute Buffer table: an empty entry after
+       * the pairs stops the Bifrost prefetcher, as behind the vertex and
+       * varying buffers of a draw. */
+      const uint64_t tail = t == MALI_V7_DESC_TABLE_IMG ? pan_size(ATTRIBUTE_BUFFER) : 0;
+      struct mali_ptr p = mali_cmd_alloc(cmd, (uint64_t)count * entry + tail, 64);
       if (!p.cpu)
          return false;
       out->tables[t] = p.gpu;
+      out->tables_cpu[t] = p.cpu;
 
-      if (t == MALI_V7_TABLE_UBO) {
+      if (t == MALI_V7_DESC_TABLE_UBO && dyn_ubo_count) {
          /* The dynamic uniform buffers behind the regular ones, with their
           * offsets applied (panvk_cmd_fill_dyn_ubos). Packed in cached
-          * memory, copied out at the end: command memory is uncached. */
+          * memory and copied out once: command memory is uncached. One
+          * bound to nothing (or to the null buffer, whose sink address
+          * does not fit the descriptor) reads as one zero entry. */
          struct mali_uniform_buffer_packed dyn[MALI_MAX_DYNAMIC_UNIFORM_BUFFERS];
-         for (uint32_t i = 0; i < di->v7.dyn_ubos.count; i++) {
-            const uint32_t h = di->v7.dyn_ubos.map[i];
-            const uint32_t set_idx = MALI_COPY_DESC_HANDLE_SET(h);
-            const uint32_t buf = MALI_COPY_DESC_HANDLE_INDEX(h);
-            const struct mali_descriptor_set *set = desc ? desc->sets[set_idx] : NULL;
-            uint64_t addr = NULL_BUFFER_ADDR, range = 0;
-            if (set && buf < set->layout->dyn_buf_count && set->dyn_bufs[buf].range) {
-               addr = set->dyn_bufs[buf].addr + desc->dyn_offsets[set_idx][buf];
-               range = set->dyn_bufs[buf].range;
-            }
+         assert(dyn_ubo_count <= ARRAY_SIZE(dyn));
+         for (uint32_t i = 0; i < dyn_ubo_count; i++) {
+            uint64_t addr = 0, range = 0;
+            if (!dyn_buf(desc, dyn_ubo_map[i], &addr, &range) || (addr >> 56))
+               addr = range = 0;
             pan_pack(&dyn[i], UNIFORM_BUFFER, cfg) {
                cfg.pointer = addr;
                /* 16-byte entries, at least one (the packer encodes the
-                * count minus one). */
-               cfg.entries = MAX2(DIV_ROUND_UP(range, 16), 1);
+                * count minus one), at most the 12-bit field: 64 KiB, the
+                * maxUniformBufferRange of this arch. */
+               cfg.entries = CLAMP(DIV_ROUND_UP(range, 16), 1, 1u << 12);
             }
          }
-         memcpy((uint8_t *)p.cpu + (uint64_t)regular * entry, dyn,
-                di->v7.dyn_ubos.count * sizeof(dyn[0]));
+         memcpy((uint8_t *)p.cpu + (uint64_t)regular * entry, dyn, dyn_ubo_count * sizeof(dyn[0]));
       }
 
-      if (t == MALI_V7_TABLE_IMG) {
-         /* One Attribute descriptor per image, written by the copy job
-          * next to the Attribute Buffer pairs. */
+      if (t == MALI_V7_DESC_TABLE_IMG) {
+         memset((uint8_t *)p.cpu + (uint64_t)count * entry, 0, tail);
+         /* One Attribute descriptor per image, written by the copy next to
+          * the Attribute Buffer pairs. */
          struct mali_ptr a = mali_cmd_alloc(cmd, (uint64_t)count * pan_size(ATTRIBUTE), 64);
          if (!a.cpu)
             return false;
          out->img_attribs = a.gpu;
+         out->img_attribs_cpu = a.cpu;
       }
    }
 
    /* A shader with textures and no sampler of its own gets one: texel
-    * fetches still name a sampler (panvk). */
-   if (di->v7.count[MALI_V7_TABLE_TEXTURE] && !di->v7.count[MALI_V7_TABLE_SAMPLER]) {
+    * fetches still name sampler 0 (panvk). */
+   if (v7->count[MALI_V7_DESC_TABLE_TEXTURE] && !v7->count[MALI_V7_DESC_TABLE_SAMPLER]) {
       struct mali_ptr p = mali_cmd_alloc(cmd, pan_size(SAMPLER), 64);
       if (!p.cpu)
          return false;
-      pan_cast_and_pack(p.cpu, SAMPLER, cfg) {
+      struct mali_sampler_packed sampler;
+      pan_pack(&sampler, SAMPLER, cfg) {
          cfg.clamp_integer_array_indices = false;
       }
-      out->tables[MALI_V7_TABLE_SAMPLER] = p.gpu;
+      memcpy(p.cpu, &sampler, sizeof(sampler));
+      out->tables[MALI_V7_DESC_TABLE_SAMPLER] = p.gpu;
    }
 
    /* The dynamic storage buffers: address and size, offset applied
     * (cmd_prepare_dyn_ssbos). */
-   if (di->v7.dyn_ssbos.count) {
+   if (dyn_ssbo_count) {
       struct mali_ptr p =
-         mali_cmd_alloc(cmd, (uint64_t)di->v7.dyn_ssbos.count * sizeof(struct ssbo_addr), 64);
+         mali_cmd_alloc(cmd, (uint64_t)dyn_ssbo_count * sizeof(struct ssbo_addr), 64);
       if (!p.cpu)
          return false;
       struct ssbo_addr entries[MALI_MAX_DYNAMIC_STORAGE_BUFFERS];
+      assert(dyn_ssbo_count <= ARRAY_SIZE(entries));
       memset(entries, 0, sizeof(entries));
-      for (uint32_t i = 0; i < di->v7.dyn_ssbos.count; i++) {
-         const uint32_t h = di->v7.dyn_ssbos.map[i];
-         const uint32_t set_idx = MALI_COPY_DESC_HANDLE_SET(h);
-         const uint32_t buf = MALI_COPY_DESC_HANDLE_INDEX(h);
-         const struct mali_descriptor_set *set = desc ? desc->sets[set_idx] : NULL;
+      for (uint32_t i = 0; i < dyn_ssbo_count; i++) {
+         uint64_t addr = 0, range = 0;
          entries[i].base_addr = NULL_BUFFER_ADDR;
-         if (set && buf < set->layout->dyn_buf_count && set->dyn_bufs[buf].range) {
-            entries[i].base_addr = set->dyn_bufs[buf].addr + desc->dyn_offsets[set_idx][buf];
-            entries[i].size = (uint32_t)MIN2(align64(set->dyn_bufs[buf].range, 4), UINT32_MAX);
+         if (dyn_buf(desc, dyn_ssbo_map[i], &addr, &range) && range) {
+            entries[i].base_addr = addr;
+            entries[i].size = (uint32_t)MIN2(align64(range, 4), UINT32_MAX & ~3ull);
          }
       }
-      memcpy(p.cpu, entries, di->v7.dyn_ssbos.count * sizeof(entries[0]));
+      memcpy(p.cpu, entries, dyn_ssbo_count * sizeof(entries[0]));
       out->dyn_ssbos = p.gpu;
    }
-
-   out->any = di->v7.copy_count > 0;
    return true;
 }
 
 void
-mali_v7_desc_compute_sysvals(const struct mali_v7_desc_tables *t, struct mali_compute_sysvals *sv)
+mali_v7_desc_sysvals(const struct mali_v7_desc_tables *t, const struct mali_shader *s,
+                     uint64_t sets[MALI_MAX_SETS + 1])
 {
-   for (unsigned i = 0; i < MALI_V7_SETS; i++)
-      sv->desc.sets[i] = t->sets[i];
-   sv->desc.sets[MALI_V7_DESC_SETS_CS_DYN_SSBOS] = t->dyn_ssbos;
+   for (unsigned i = 0; i < MALI_MAX_SETS; i++)
+      sets[i] = (s->desc.used_set_mask & BITFIELD_BIT(i)) ? t->sets[i] : 0;
+   sets[MALI_V7_DESC_TABLE_DYN_SSBOS] = t->dyn_ssbos;
 }
 
 /* ---------------------------------------------------------------------- */
 /* The FAU block of a dispatch                                             */
 
 /* mali_cmd_state.h mali_compute_fau, with the Bifrost system values added:
- * the set bases and dynamic storage buffer table, and the constant data
- * buffer. */
+ * the set addresses and the dynamic storage buffer table, and the
+ * constant data buffer. */
 uint64_t
 mali_v7_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                     const struct mali_v7_desc_tables *t, const void *push, uint32_t push_size,
@@ -235,9 +312,9 @@ mali_v7_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    sv.local_group_size.y = cs->cs.local_size[1];
    sv.local_group_size.z = cs->cs.local_size[2];
    sv.common.push_uniforms = p.gpu;
-   sv.common.constant_data = cs->v7.const_data_mem.gpu_va;
+   sv.common.constant_data = cs->v7.data_mem.gpu_va;
    if (t)
-      mali_v7_desc_compute_sysvals(t, &sv);
+      mali_v7_desc_sysvals(t, cs, sv.v7_desc.sets);
 
    uint64_t pc[MALI_MAX_PUSH_CONST_FAUS];
    memset(pc, 0, sizeof(pc));
@@ -274,15 +351,15 @@ mali_v7_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
 
 /* Its push constants (FAU). */
 struct desc_copy_info {
-   uint64_t sets[MALI_V7_SETS];
-   uint64_t tables[MALI_V7_TABLE_COUNT];
+   uint64_t sets[MALI_MAX_SETS];
+   uint64_t tables[MALI_V7_DESC_TABLE_COUNT];
    uint64_t img_attrib_table;
    struct {
-      uint64_t table;                          /* the shader's copy map */
-      uint32_t limits[MALI_V7_TABLE_COUNT];    /* cumulative entry counts */
+      uint64_t table;                             /* the shader's copy map */
+      uint32_t limits[MALI_V7_DESC_TABLE_COUNT];  /* cumulative entry counts */
       uint32_t attrib_buf_idx_offset;
    } desc_copy;
-   uint32_t set_desc_counts[MALI_V7_SETS];
+   uint32_t set_desc_counts[MALI_MAX_SETS];
 };
 static_assert(sizeof(struct desc_copy_info) <= MALI_MAX_PUSH_CONSTANTS_SIZE,
               "the copy shader's inputs fit the push constant block");
@@ -300,7 +377,7 @@ get_array_entry(nir_builder *b, unsigned array_offset, unsigned array_size,
    assert(array_size > 0);
    assert(array_stride == 4 || array_stride == 8);
 
-   nir_def *lut[MALI_V7_SETS];
+   nir_def *lut[MALI_MAX_SETS];
    assert(array_size <= ARRAY_SIZE(lut));
    for (unsigned i = 0; i < array_size; i++) {
       lut[i] = nir_load_push_constant(b, 1, array_stride * 8,
@@ -427,12 +504,14 @@ set_to_table_img_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
    }
    nir_push_else(b, NULL);
    {
+      /* (panvk swaps the two alignments here; an Attribute entry is only
+       * 8-byte aligned.) */
       nir_def *desc = zero_vec(b, MAX2(attrib_buf_comps, attrib_comps));
       nir_store_global(b, desc, nir_iadd(b, attrib_buf_table_ptr, attrib_buf_offset),
-                       .align_mul = pan_size(ATTRIBUTE),
+                       .align_mul = element_size,
                        .write_mask = nir_component_mask(attrib_buf_comps));
       nir_store_global(b, desc, nir_iadd(b, attrib_table_ptr, attrib_offset),
-                       .align_mul = element_size,
+                       .align_mul = pan_size(ATTRIBUTE),
                        .write_mask = nir_component_mask(attrib_comps));
    }
    nir_pop_if(b, NULL);
@@ -453,14 +532,14 @@ single_desc_copy(nir_builder *b, nir_def *desc_copy_idx)
 
    nir_def *set_ptr = get_input_array_slot(b, sets, set_idx);
    nir_def *set_desc_count = get_input_array_slot(b, set_desc_counts, set_idx);
-   nir_def *ubo_end = get_input_field(b, desc_copy.limits[MALI_V7_TABLE_UBO]);
-   nir_def *img_end = get_input_field(b, desc_copy.limits[MALI_V7_TABLE_IMG]);
-   nir_def *tex_end = get_input_field(b, desc_copy.limits[MALI_V7_TABLE_TEXTURE]);
-   nir_def *sampler_end = get_input_field(b, desc_copy.limits[MALI_V7_TABLE_SAMPLER]);
+   nir_def *ubo_end = get_input_field(b, desc_copy.limits[MALI_V7_DESC_TABLE_UBO]);
+   nir_def *img_end = get_input_field(b, desc_copy.limits[MALI_V7_DESC_TABLE_IMG]);
+   nir_def *tex_end = get_input_field(b, desc_copy.limits[MALI_V7_DESC_TABLE_TEXTURE]);
+   nir_def *sampler_end = get_input_field(b, desc_copy.limits[MALI_V7_DESC_TABLE_SAMPLER]);
 
    nir_push_if(b, nir_ult(b, desc_copy_idx, ubo_end));
    {
-      nir_def *table_ptr = get_input_field(b, tables[MALI_V7_TABLE_UBO]);
+      nir_def *table_ptr = get_input_field(b, tables[MALI_V7_DESC_TABLE_UBO]);
       set_to_table_copy(b, set_ptr, set_desc_count, src_desc_idx, table_ptr, desc_copy_idx,
                         pan_size(UNIFORM_BUFFER));
    }
@@ -468,7 +547,7 @@ single_desc_copy(nir_builder *b, nir_def *desc_copy_idx)
    {
       nir_push_if(b, nir_ult(b, desc_copy_idx, img_end));
       {
-         nir_def *table_ptr = get_input_field(b, tables[MALI_V7_TABLE_IMG]);
+         nir_def *table_ptr = get_input_field(b, tables[MALI_V7_DESC_TABLE_IMG]);
          nir_def *attrib_table_ptr = get_input_field(b, img_attrib_table);
          set_to_table_img_copy(b, set_ptr, set_desc_count, src_desc_idx, attrib_table_ptr,
                                table_ptr, nir_isub(b, desc_copy_idx, ubo_end));
@@ -477,7 +556,7 @@ single_desc_copy(nir_builder *b, nir_def *desc_copy_idx)
       {
          nir_push_if(b, nir_ult(b, desc_copy_idx, tex_end));
          {
-            nir_def *table_ptr = get_input_field(b, tables[MALI_V7_TABLE_TEXTURE]);
+            nir_def *table_ptr = get_input_field(b, tables[MALI_V7_DESC_TABLE_TEXTURE]);
             set_to_table_copy(b, set_ptr, set_desc_count, src_desc_idx, table_ptr,
                               nir_isub(b, desc_copy_idx, img_end), pan_size(TEXTURE));
          }
@@ -485,7 +564,7 @@ single_desc_copy(nir_builder *b, nir_def *desc_copy_idx)
          {
             nir_push_if(b, nir_ult(b, desc_copy_idx, sampler_end));
             {
-               nir_def *table_ptr = get_input_field(b, tables[MALI_V7_TABLE_SAMPLER]);
+               nir_def *table_ptr = get_input_field(b, tables[MALI_V7_DESC_TABLE_SAMPLER]);
                set_to_table_copy(b, set_ptr, set_desc_count, src_desc_idx, table_ptr,
                                  nir_isub(b, desc_copy_idx, tex_end), pan_size(SAMPLER));
             }
@@ -504,6 +583,8 @@ build_desc_copy_nir(struct mali_device *dev)
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE), "%s",
       "mali_v7_desc_copy");
+   /* One invocation per workgroup: the job dispatches as many workgroups
+    * as the map has entries (mali_v7_desc_copy). */
    b.shader->info.workgroup_size[0] = 1;
    b.shader->info.workgroup_size[1] = 1;
    b.shader->info.workgroup_size[2] = 1;
@@ -559,39 +640,131 @@ mali_v7_desc_finish(struct mali_device *dev)
 }
 
 /* ---------------------------------------------------------------------- */
-/* The copy job                                                            */
+/* Filling the copied entries                                              */
+
+/*
+ * MALISX2_V7_CPU_DESC_COPY=1: the CPU copies the entries when the command
+ * is recorded, from the sets' CPU mappings, instead of the copy job (file
+ * comment).
+ */
+static bool
+cpu_copy_mode(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *e = getenv("MALISX2_V7_CPU_DESC_COPY");
+      mode = e && *e && strcmp(e, "0") != 0;
+      if (mode)
+         mesa_logi("malisx2: MALISX2_V7_CPU_DESC_COPY is set: Bifrost descriptor tables are "
+                   "filled on the CPU at record time, without the copy job");
+   }
+   return mode;
+}
+
+/* The CPU form of the copy shader's set_to_table_img_copy: one image or
+ * texel buffer slot (zero when unbound) into the Attribute Buffer table
+ * (the pair) and the Attribute table (an Attribute naming buffer
+ * 2 * idx + offset). */
+static void
+cpu_img_copy(const uint8_t *slot, uint32_t idx, uint32_t attrib_buf_idx_offset,
+             uint8_t *attrib_bufs, uint8_t *attribs)
+{
+   uint32_t src[8], buf[8] = {0}, attr[2] = {0};
+   if (slot) {
+      memcpy(src, slot, sizeof(src));
+      const uint32_t buf_idx = idx * 2 + attrib_buf_idx_offset;
+      if ((src[0] & BITFIELD_MASK(5)) == MALI_ATTRIBUTE_TYPE_1D) {
+         /* Texel buffer: its own Attribute (format, offset enable, offset),
+          * the Attribute Buffer alone. */
+         attr[0] = (src[4] & ~BITFIELD_MASK(9)) | buf_idx;
+         attr[1] = src[5];
+         buf[0] = src[0];
+         buf[1] = src[1];
+         buf[2] = src[2] & BITFIELD_MASK(7);
+         buf[3] = src[3];
+      } else {
+         /* Image: the format from the stride word, the pair as it is. */
+         attr[0] = (src[2] & 0xfffffc00u) | buf_idx;
+         memcpy(buf, src, sizeof(buf));
+         buf[2] = src[2] & BITFIELD_MASK(7);
+      }
+   }
+   memcpy(attrib_bufs + (size_t)idx * 2 * pan_size(ATTRIBUTE_BUFFER), buf, sizeof(buf));
+   memcpy(attribs + (size_t)idx * pan_size(ATTRIBUTE), attr, sizeof(attr));
+}
+
+/* The debugging fill: table by table in map order, from the sets' CPU
+ * mappings (an unbound or short set's entry zero, as the copy shader). */
+static void
+cpu_fill(const struct mali_shader *s, const struct mali_desc_state *desc,
+         const struct mali_v7_desc_tables *t, uint32_t attrib_buf_idx_offset)
+{
+   const uint32_t *map = s->v7.map;
+   for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++) {
+      const unsigned entry = table_entry_size(tab);
+      for (uint32_t i = 0; i < s->v7.count[tab]; i++) {
+         const uint8_t *slot = set_slot(desc, *map++);
+         if (tab == MALI_V7_DESC_TABLE_IMG) {
+            cpu_img_copy(slot, i, attrib_buf_idx_offset, t->tables_cpu[tab], t->img_attribs_cpu);
+         } else {
+            uint8_t *dst = (uint8_t *)t->tables_cpu[tab] + (size_t)i * entry;
+            if (slot)
+               memcpy(dst, slot, entry);
+            else
+               memset(dst, 0, entry);
+         }
+      }
+   }
+}
 
 bool
-mali_v7_desc_copy_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
-                      const struct mali_shader *s, const struct mali_v7_desc_tables *t,
-                      uint32_t attrib_buf_idx_offset, uint16_t *index)
+mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                  const struct mali_shader *s, const struct mali_desc_state *desc,
+                  const struct mali_v7_desc_tables *t, uint32_t attrib_buf_idx_offset,
+                  uint16_t *index)
 {
    *index = 0;
-   if (!t->any)
+   assert(t->shader == s);
+   if (!s->v7.map_count)
       return true;
+   /* Every table the map fills exists (a vertex shader's image tables are
+    * the draw's, mali_jm_cmd_draw.c). */
+   for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++)
+      assert(!s->v7.count[tab] || (t->tables[tab] && t->tables_cpu[tab]));
+   assert(!s->v7.count[MALI_V7_DESC_TABLE_IMG] || (t->img_attribs && t->img_attribs_cpu));
+
+   if (cpu_copy_mode()) {
+      cpu_fill(s, desc, t, attrib_buf_idx_offset);
+      return true;
+   }
 
    const struct mali_shader *copy = get_desc_copy(cmd);
    if (!copy || !copy->spd[MALI_SPD_MAIN])
       return false;
-   if (!s->v7.copy_map_mem.gpu_va)
+   if (!s->v7.map_mem.gpu_va) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return false;
+   }
 
    struct desc_copy_info info;
    memset(&info, 0, sizeof(info));
-   for (unsigned i = 0; i < MALI_V7_SETS; i++) {
+   for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
       info.sets[i] = t->sets[i];
       info.set_desc_counts[i] = t->set_desc_counts[i];
    }
-   for (unsigned i = 0; i < MALI_V7_TABLE_COUNT; i++) {
-      info.tables[i] = t->tables[i];
-      info.desc_copy.limits[i] = s->desc.v7.count[i] + (i ? info.desc_copy.limits[i - 1] : 0);
+   for (unsigned i = 0; i < MALI_V7_DESC_TABLE_COUNT; i++) {
+      info.tables[i] = s->v7.count[i] ? t->tables[i] : 0;
+      info.desc_copy.limits[i] = s->v7.count[i] + (i ? info.desc_copy.limits[i - 1] : 0);
    }
    info.img_attrib_table = t->img_attribs;
-   info.desc_copy.table = s->v7.copy_map_mem.gpu_va;
+   info.desc_copy.table = s->v7.map_mem.gpu_va;
    info.desc_copy.attrib_buf_idx_offset = attrib_buf_idx_offset;
-   const uint32_t copy_count = info.desc_copy.limits[MALI_V7_TABLE_COUNT - 1];
-   assert(copy_count == s->desc.v7.copy_count && copy_count > 0);
+   const uint32_t copy_count = info.desc_copy.limits[MALI_V7_DESC_TABLE_COUNT - 1];
+   assert(copy_count == s->v7.map_count && copy_count > 0);
 
+   /* copy_count workgroups of one invocation (panvk runs one workgroup of
+    * copy_count; this way the workgroup size the shader was compiled with
+    * is the one it runs with). */
    const uint32_t base[3] = {0, 0, 0};
    const uint32_t groups[3] = {copy_count, 1, 1};
    const uint32_t local[3] = {1, 1, 1};
@@ -618,5 +791,3 @@ mali_v7_desc_copy_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    *index = c->index;
    return true;
 }
-
-#endif /* PAN_ARCH < 9 */

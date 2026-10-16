@@ -49,11 +49,13 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
     * shifts, whose Parameters carry the job task split, and whose Draw
     * points at the shader's Renderer State Descriptor (built at upload,
     * spd[MALI_SPD_MAIN]), the push uniforms (the FAU block), the Local
-    * Storage descriptor and the descriptor tables mali_jm_desc_v7.c builds
-    * from the bound sets: Uniform Buffer descriptors, Texture and Sampler
-    * descriptors, and the images as Attribute Buffer pairs plus Attribute
-    * descriptors. The regular table entries are copied from the sets by a
-    * copy job in front of this one, which depends on it.
+    * Storage descriptor and the descriptor tables of the one builder draws
+    * use too (mali_jm_desc_v7.c): Uniform Buffer descriptors, Texture and
+    * Sampler descriptors, and the images as Attribute Buffer pairs plus
+    * Attribute descriptors. The entries copied from the sets are written
+    * by a copy job in front of this one, which depends on it. The tables
+    * are rebuilt for every dispatch (panvk keeps them while neither the
+    * shader nor the bound sets change; compute here has no dirty state).
     *
     * Internal dispatches that read a texture (the AFBC source copy) are
     * not reached on v7 (no AFBC images); they would need a texture table
@@ -67,10 +69,8 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
 
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
    struct mali_v7_desc_tables tables;
-   if (!mali_v7_desc_prepare(cmd, cs, desc, &tables)) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   if (!mali_v7_desc_prepare(cmd, cs, desc, true, &tables))
       return;
-   }
    const uint64_t fau = mali_v7_compute_fau(cmd, cs, &tables, push, push_size, base, groups);
    const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (cs->fau.total_count && !fau))
@@ -84,7 +84,7 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       return;
 
    uint16_t copy_dep = 0;
-   if (!mali_v7_desc_copy_job(cmd, c, cs, &tables, 0, &copy_dep)) {
+   if (!mali_v7_desc_copy(cmd, c, cs, desc, &tables, 0, &copy_dep)) {
       if (!vk_command_buffer_has_error(&cmd->vk))
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
@@ -118,12 +118,12 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
       cfg.state = cs->spd[MALI_SPD_MAIN];
       cfg.attributes = tables.img_attribs;
-      cfg.attribute_buffers = tables.tables[MALI_V7_TABLE_IMG];
+      cfg.attribute_buffers = tables.tables[MALI_V7_DESC_TABLE_IMG];
       cfg.thread_storage = tsd;
-      cfg.uniform_buffers = tables.tables[MALI_V7_TABLE_UBO];
+      cfg.uniform_buffers = tables.tables[MALI_V7_DESC_TABLE_UBO];
       cfg.push_uniforms = fau;
-      cfg.textures = tables.tables[MALI_V7_TABLE_TEXTURE];
-      cfg.samplers = tables.tables[MALI_V7_TABLE_SAMPLER];
+      cfg.textures = tables.tables[MALI_V7_DESC_TABLE_TEXTURE];
+      cfg.samplers = tables.tables[MALI_V7_DESC_TABLE_SAMPLER];
    }
    cmd->dispatches++;
    if (unlikely(mh))

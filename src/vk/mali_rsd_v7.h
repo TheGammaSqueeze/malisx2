@@ -41,6 +41,9 @@
 
 #define MALI_V7_RSD_STATE_WORD_FIRST 4
 #define MALI_V7_RSD_STATE_WORDS 8
+/* Word 8, Multisample Misc: the draw ORs per-sample evaluation into the
+ * baked word for a blend shader under multisampling (mali_jm_cmd_draw.c). */
+#define MALI_V7_RSD_MULTISAMPLE_MISC_WORD 8
 
 static inline enum mali_shader_register_allocation
 mali_v7_register_allocation(unsigned work_reg_count)

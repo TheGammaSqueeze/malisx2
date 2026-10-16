@@ -115,12 +115,21 @@
  *    index buffer has no CPU view fails the command buffer;
  *  - no occlusion queries, no multiview, layered passes draw into layer 0
  *    (file comment of the v9 half, which applies);
- *  - descriptor sets, textures, images and uniform buffers do not reach a
- *    draw: shaders using them are refused at compile time (mali_shader.c).
+ *  - descriptor sets: each stage's uniform buffer, image, texture and
+ *    sampler tables come from the builder the dispatches use too
+ *    (mali_jm_desc_v7.c), rebuilt when the stage's sets or shader change,
+ *    and the Draw sections point at them (the vertex shader's images
+ *    behind its vertex attributes, the fragment shader's in the Tiler
+ *    job's Attribute pointers); the set addresses and the dynamic storage
+ *    buffer table go through the stage's FAU block (sysvals).
  *
- * Job dependencies (Mesa pan_jc.h rules): the Tiler job's Dependency 1 is
- * the Vertex job's index, its Dependency 2 the previous tiler-side job
- * (mali_jm_cmd_add_job). The Vertex job carries any pending barrier.
+ * Job dependencies (Mesa pan_jc.h rules): a stage whose tables were
+ * rebuilt gets a descriptor copy job (a Compute job) first, the vertex
+ * shader's before the fragment shader's; the Vertex job's Dependency 1 is
+ * the vertex copy job, the Tiler job's Dependency 1 the Vertex job and its
+ * Dependency 2 the previous tiler-side job (mali_jm_cmd_add_job). A
+ * pending barrier goes to the draw's first job, and to the Vertex job as
+ * well when that first job is the fragment copy.
  */
 
 #include "mali_rsd_v7.h"
@@ -370,6 +379,11 @@ struct draw_data {
    /* Outputs of the builders. */
    uint64_t attribs, attrib_bufs;
    uint64_t vary_bufs, position, psiz;
+   /* The stages whose descriptor tables were rebuilt for this draw: their
+    * copied entries are still to be filled (mali_v7_desc_copy), and the
+    * buffer index the vertex shader's image Attributes start at. */
+   bool vs_copy, fs_copy;
+   uint32_t vs_img_buf_offset;
 };
 
 /*
@@ -486,6 +500,15 @@ emit_attrib_buf(const struct vk_vertex_binding_state *b, uint32_t stride, uint64
  * zero) and two Attribute Buffer entries per binding plus the empty
  * terminator. Rebuilt every draw: the instance count and base instance
  * are in the descriptors.
+ *
+ * A vertex shader's storage images and texel buffers are attributes too:
+ * their Attribute descriptors follow the 16 vertex attribute locations
+ * and their Attribute Buffer pairs follow the bindings', before the
+ * terminator. Those entries are the vertex shader's image table
+ * (MALI_V7_DESC_TABLE_IMG of its struct mali_v7_desc_tables, pointed here)
+ * and are written by its descriptor copy (mali_v7_desc_copy), which runs
+ * in front of the Vertex job; the image Attributes name buffer 2 x
+ * (binding count + image index).
  */
 static bool
 emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p,
@@ -494,17 +517,22 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    const struct vk_vertex_input_state *vi = d->vi;
    const uint16_t *strides = d->vi_strides;
+   struct mali_v7_desc_tables *vt = &cmd->jm.draw.vs_tab;
    const unsigned num_vbs = util_last_bit(vi->bindings_valid);
-   const unsigned num_attribs = MAX2(util_last_bit(vi->attributes_valid), p->vs->info.attribute_count);
-   const unsigned buf_count = num_vbs * 2;
+   const unsigned num_imgs = p->vs->v7.count[MALI_V7_DESC_TABLE_IMG];
+   const unsigned num_attribs =
+      num_imgs ? MALI_MAX_VS_ATTRIBS
+               : MAX2(util_last_bit(vi->attributes_valid), p->vs->info.attribute_count);
+   const unsigned buf_count = (num_vbs + num_imgs) * 2;
 
    struct mali_ptr bufs = mali_cmd_alloc(cmd, (buf_count + 1) * pan_size(ATTRIBUTE_BUFFER),
                                          pan_alignment(ATTRIBUTE_BUFFER));
    if (!bufs.cpu)
       return false;
    struct mali_ptr attrs = {0};
-   if (num_attribs) {
-      attrs = mali_cmd_alloc(cmd, num_attribs * pan_size(ATTRIBUTE), pan_alignment(ATTRIBUTE));
+   if (num_attribs + num_imgs) {
+      attrs = mali_cmd_alloc(cmd, (num_attribs + num_imgs) * pan_size(ATTRIBUTE),
+                             pan_alignment(ATTRIBUTE));
       if (!attrs.cpu)
          return false;
    }
@@ -522,7 +550,8 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
          memset(&bdescs[2 * b], 0, 2 * sizeof(bdescs[0]));
       }
    }
-   memset(&bdescs[buf_count], 0, sizeof(bdescs[0]));
+   /* The terminator (behind the images when the shader has any). */
+   memset(&bdescs[2 * num_vbs], 0, sizeof(bdescs[0]));
 
    for (unsigned i = 0; i < num_attribs; i++) {
       if (!(vi->attributes_valid & BITFIELD_BIT(i))) {
@@ -544,7 +573,21 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
       }
    }
 
-   memcpy(bufs.cpu, bdescs, (buf_count + 1) * sizeof(bdescs[0]));
+   if (!num_imgs) {
+      memcpy(bufs.cpu, bdescs, (buf_count + 1) * sizeof(bdescs[0]));
+   } else {
+      memcpy(bufs.cpu, bdescs, 2 * num_vbs * sizeof(bdescs[0]));
+      memcpy((uint8_t *)bufs.cpu + buf_count * pan_size(ATTRIBUTE_BUFFER), &bdescs[2 * num_vbs],
+             sizeof(bdescs[0]));
+      /* The vertex shader's image table: the copy fills it. */
+      const uint64_t img_bufs = 2ull * num_vbs * pan_size(ATTRIBUTE_BUFFER);
+      const uint64_t img_attrs = (uint64_t)MALI_MAX_VS_ATTRIBS * pan_size(ATTRIBUTE);
+      vt->tables[MALI_V7_DESC_TABLE_IMG] = bufs.gpu + img_bufs;
+      vt->tables_cpu[MALI_V7_DESC_TABLE_IMG] = (uint8_t *)bufs.cpu + img_bufs;
+      vt->img_attribs = attrs.gpu + img_attrs;
+      vt->img_attribs_cpu = (uint8_t *)attrs.cpu + img_attrs;
+      dd->vs_img_buf_offset = 2 * num_vbs;
+   }
    if (num_attribs)
       memcpy(attrs.cpu, adescs, num_attribs * sizeof(adescs[0]));
    dd->attrib_bufs = bufs.gpu;
@@ -558,7 +601,9 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
  * shader's info, the state half (words 4 to 11) baked by the pipeline
  * (mali_pipeline_state.c pack_rsd_state, or the command buffer's repack
  * for a pipeline with dynamic state), then one Blend descriptor per
- * render target of the pass.
+ * render target of the pass. The Blend descriptors come first: whether a
+ * target ended up with a blend shader (the dynamic blend constants decide
+ * some of them) feeds the RSD under multisampling.
  */
 static bool
 build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p,
@@ -570,18 +615,39 @@ build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p
    if (!m.cpu)
       return false;
 
+   if (!mali_gfx_blend_v7(cmd, (uint8_t *)m.cpu + pan_size(RENDERER_STATE), rt_count, t->fs_code))
+      return false;
+
+   /* A blend shader under multisampling runs once per sample and reads the
+    * sample ID and coverage (r61): on Bifrost the driver sets the RSD up
+    * for it (the compiler preloads those registers on its own on v9+ only;
+    * bifrost_compile.c). The bake knows the pipeline's own blend shaders,
+    * the dynamic blend constants can add some, so decide here. */
+   const struct vk_dynamic_graphics_state *st = p->bind.dynamic ? &cmd->vk.dynamic_graphics_state
+                                                                : &p->state;
+   const bool per_sample_blend = cmd->gfx.draw.blend_shader_mask &&
+                                 st->ms.rasterization_samples > 1;
+
    struct mali_renderer_state_packed rsd;
    pan_pack(&rsd, RENDERER_STATE, cfg) {
-      if (p->fs)
+      if (p->fs) {
          mali_v7_rsd_shader(&p->fs->info, t->fs_code, &cfg);
+         if (per_sample_blend)
+            cfg.preload.fragment.sample_mask_id = true;
+      }
    }
    STATIC_ASSERT(sizeof(bk->zsd) == MALI_V7_RSD_STATE_WORDS * sizeof(uint32_t));
    memcpy(&rsd.opaque[MALI_V7_RSD_STATE_WORD_FIRST], bk->zsd, sizeof(bk->zsd));
+   if (per_sample_blend) {
+      struct mali_multisample_misc_packed ms;
+      pan_pack_nodefaults(&ms, MULTISAMPLE_MISC, cfg) {
+         cfg.evaluate_per_sample = true;
+      }
+      rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] |= ms.opaque[0];
+   }
    memcpy(m.cpu, &rsd, sizeof(rsd));
-
-   if (!mali_gfx_blend_v7(cmd, (uint8_t *)m.cpu + pan_size(RENDERER_STATE), rt_count))
-      return false;
    t->fs_rsd = m.gpu;
+   t->fs_rsd_cpu = m.cpu;
    return true;
 }
 
@@ -636,12 +702,55 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          return false;
    }
 
+   /*
+    * The descriptor tables of each stage (mali_jm_desc_v7.c, the builder
+    * the dispatches use too; mali_gfx_build_vs_srt's v7 shape). Rebuilt
+    * when a set the stage reads was bound (VS_SRT / FS_SRT), when the
+    * stage's shader changed (the tables' layout is the shader's own, which
+    * the pipeline's table keys do not cover: two pipelines reading the
+    * same sets through different bindings share a key), and on every draw
+    * for a vertex shader with images, whose entries live in the draw's own
+    * attribute tables (emit_attributes). Their copy jobs go into the chain
+    * in front of the draw's jobs (draw()). A stage that reads the set
+    * addresses gets them through its FAU block, so its FAU group follows.
+    */
+   if (t->vs_tab.shader != p->vs || p->vs->v7.count[MALI_V7_DESC_TABLE_IMG])
+      d->dirty |= MALI_GFX_DIRTY_VS_SRT;
+   if (t->fs_tab.shader != p->fs)
+      d->dirty |= MALI_GFX_DIRTY_FS_SRT;
+   if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
+      if (!mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
+         return false;
+      dd->vs_copy = true;
+      d->vs_srt_key = bd->vs_srt_key;
+      d->vs_sets_dirty = 0;
+      if (p->vs->v7.needs_set_addrs)
+         d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+   }
+   if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
+      if (p->fs) {
+         if (!mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
+            return false;
+         dd->fs_copy = true;
+         if (p->fs->v7.needs_set_addrs)
+            d->dirty |= MALI_GFX_DIRTY_FS_FAU;
+      } else {
+         memset(&t->fs_tab, 0, sizeof(t->fs_tab));
+      }
+      d->fs_srt_key = bd->fs_srt_key;
+      d->fs_sets_dirty = 0;
+   }
+
    struct mali_graphics_sysvals sv;
    if (d->dirty & (MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_FS_FAU)) {
       mali_gfx_fill_sysvals(cmd, &sv);
       sv.vs.raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_VS_FAU) {
+      /* The stage's set addresses and constant data (the v7_desc words
+       * take the place of fs.blend_descs, which v7 shaders never read). */
+      mali_v7_desc_sysvals(&t->vs_tab, p->vs, sv.v7_desc.sets);
+      sv.common.constant_data = p->vs->v7.data_mem.gpu_va;
       if (!mali_gfx_build_vs_fau(cmd, &sv, &v))
          return false;
       /* The RSD's preload.uniform_count is the shader's FAU word count;
@@ -651,6 +760,10 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       t->raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_FAU) {
+      if (p->fs) {
+         mali_v7_desc_sysvals(&t->fs_tab, p->fs, sv.v7_desc.sets);
+         sv.common.constant_data = p->fs->v7.data_mem.gpu_va;
+      }
       if (!mali_gfx_build_fs_fau(cmd, &sv, &v))
          return false;
       assert(!v || !p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
@@ -762,7 +875,7 @@ dump_enabled(void)
 static void
 dump_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, const struct draw_data *dd,
           struct mali_ptr vj, uint16_t vindex, struct mali_ptr tj, uint16_t tindex,
-          uint32_t instance_size)
+          uint32_t instance_size, uint16_t vs_copy, uint16_t fs_copy)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    const struct mali_render_state *r = &cmd->gfx.render;
@@ -797,6 +910,32 @@ dump_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, const st
              r->rt_count, t->fs_rsd, t->fs_code, dd->position, t->fs_vary,
              t->fs_vary ? dd->vary_bufs : 0, t->viewport, t->fs_fau,
              p->fs ? p->fs->fau.total_count : 0, t->tsd, dd->psiz);
+   for (unsigned st = 0; st < 2; st++) {
+      const struct mali_shader *s = st ? p->fs : p->vs;
+      const struct mali_v7_desc_tables *tab = st ? &t->fs_tab : &t->vs_tab;
+      const uint16_t copy = st ? fs_copy : vs_copy;
+      if (!s)
+         continue;
+      mesa_logi("  %s tables: uniform_buffers 0x%" PRIx64 " (%u + %u dynamic), textures 0x%"
+                PRIx64 " (%u), samplers 0x%" PRIx64 " (%u), images 0x%" PRIx64
+                " (%u, attributes 0x%" PRIx64 "), dynamic ssbos 0x%" PRIx64
+                ", set mask 0x%x, constant data 0x%" PRIx64 ", copy map 0x%" PRIx64
+                " (%u entries), copy job %s (index %u)",
+                st ? "fragment" : "vertex", tab->tables[MALI_V7_DESC_TABLE_UBO],
+                s->v7.count[MALI_V7_DESC_TABLE_UBO], s->v7.dyn_ubo_count,
+                tab->tables[MALI_V7_DESC_TABLE_TEXTURE], s->info.texture_count,
+                tab->tables[MALI_V7_DESC_TABLE_SAMPLER], s->info.sampler_count,
+                tab->tables[MALI_V7_DESC_TABLE_IMG], s->v7.count[MALI_V7_DESC_TABLE_IMG],
+                tab->img_attribs, tab->dyn_ssbos, s->desc.used_set_mask, s->v7.data_mem.gpu_va,
+                s->v7.map_mem.gpu_va, s->v7.map_count,
+                copy ? "in this draw" : "none in this draw", copy);
+   }
+   for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
+      const struct mali_descriptor_set *set = cmd->gfx.desc.sets[i];
+      if (set)
+         mesa_logi("  bound set %u: 0x%" PRIx64 " (%u slots, %u dynamic buffers)", i, set->gpu,
+                   set->layout->desc_count, set->layout->dyn_buf_count);
+   }
    const struct vk_vertex_input_state *vi = d->vi;
    for (unsigned i = 0; i < util_last_bit(vi->bindings_valid); i++) {
       if (vi->bindings_valid & BITFIELD_BIT(i))
@@ -821,6 +960,23 @@ dump_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, const st
              "vs attribute_count %u, vs varyings %u, fs varyings %u",
              t->prim0, t->prim, r->first_provoking_vertex, t->dcd0, p->vs->info.attribute_count,
              p->vs->info.varyings.formats.count, p->fs ? p->fs->info.varyings.formats.count : 0);
+   /* The RSD state words and the Blend descriptors, as the hardware reads
+    * them (the RSD block is command memory: read back once for the dump). */
+   const uint32_t *rsd = t->fs_rsd_cpu;
+   if (rsd) {
+      mesa_logi("  fs RSD words 4-11: properties 0x%08x, depth units %f factor %f clamp %f, "
+                "multisample_misc 0x%08x, stencil_mask_misc 0x%08x, stencil front 0x%08x back 0x%08x, "
+                "preload 0x%08x",
+                rsd[4], uif(rsd[5]), uif(rsd[6]), uif(rsd[7]), rsd[8], rsd[9], rsd[10], rsd[11],
+                rsd[12]);
+      for (unsigned i = 0; i < r->rt_count; i++) {
+         const uint32_t *bd = rsd + pan_size(RENDERER_STATE) / 4 + i * pan_size(BLEND) / 4;
+         static const char *const modes[4] = {"shader", "opaque", "fixed-function", "off"};
+         mesa_logi("  blend %u: flags 0x%08x equation 0x%08x internal 0x%08x 0x%08x (%s%s)", i,
+                   bd[0], bd[1], bd[2], bd[3], modes[bd[2] & 3],
+                   (d->blend_shader_mask & BITFIELD_BIT(i)) ? ", blend shader" : "");
+      }
+   }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -881,8 +1037,25 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    const uint32_t instance_size = di->instance_count > 1 ? dd.padded_count : 1;
 
    struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
+
+   /* The descriptor copies of the stages whose tables were rebuilt, in
+    * front of the Vertex job (panvk_cmd_draw): the Vertex job depends on
+    * the vertex shader's; the fragment shader's tables are read by the
+    * fragment job, which follows the whole vtc atom. A barrier pending on
+    * the chain goes to the first of these jobs; when that is the fragment
+    * copy, the Vertex job, which does not depend on it, carries the
+    * barrier too. */
+   const bool pending = c->pending != 0;
+   uint16_t vs_copy = 0, fs_copy = 0;
+   if (dd.vs_copy &&
+       !mali_v7_desc_copy(cmd, c, p->vs, &cmd->gfx.desc, &t->vs_tab, dd.vs_img_buf_offset,
+                          &vs_copy))
+      return;
+   if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &cmd->gfx.desc, &t->fs_tab, 0, &fs_copy))
+      return;
+
    struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
-                                            false, 0);
+                                            pending && !vs_copy && fs_copy, vs_copy);
    if (!vj.cpu)
       return;
    const uint16_t vertex_index = c->index;
@@ -902,7 +1075,9 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       cfg.offset_start = dd.raw_vertex_offset;
       cfg.instance_size = instance_size;
       cfg.push_uniforms = t->vs_fau;
-      /* No uniform buffer, texture or sampler tables (mali_shader.c). */
+      cfg.uniform_buffers = t->vs_tab.tables[MALI_V7_DESC_TABLE_UBO];
+      cfg.textures = t->vs_tab.tables[MALI_V7_DESC_TABLE_TEXTURE];
+      cfg.samplers = t->vs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
    }
 
    if (tiling) {
@@ -949,6 +1124,9 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       pan_pack(&dcd, DRAW, cfg) {
          cfg.position = dd.position;
          cfg.state = t->fs_rsd;
+         /* The fragment shader's images (panvk_emit_tiler_dcd). */
+         cfg.attributes = t->fs_tab.img_attribs;
+         cfg.attribute_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_IMG];
          cfg.viewport = t->viewport;
          cfg.varyings = t->fs_vary;
          cfg.varying_buffers = t->fs_vary ? dd.vary_bufs : 0;
@@ -957,15 +1135,20 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          cfg.instance_size = instance_size;
          cfg.instance_primitive_size = padded_vertex_count(MAX2(prims_per_instance, 1));
          cfg.push_uniforms = t->fs_fau;
+         cfg.uniform_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_UBO];
+         cfg.textures = t->fs_tab.tables[MALI_V7_DESC_TABLE_TEXTURE];
+         cfg.samplers = t->fs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
          cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
       }
       dcd.opaque[0] |= t->dcd0;
       memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
 
       if (unlikely(dump_enabled()))
-         dump_draw(cmd, di, &dd, vj, vertex_index, tj, c->index, instance_size);
+         dump_draw(cmd, di, &dd, vj, vertex_index, tj, c->index, instance_size, vs_copy,
+                   fs_copy);
    } else if (unlikely(dump_enabled())) {
-      dump_draw(cmd, di, &dd, vj, vertex_index, (struct mali_ptr){0}, 0, instance_size);
+      dump_draw(cmd, di, &dd, vj, vertex_index, (struct mali_ptr){0}, 0, instance_size,
+                vs_copy, fs_copy);
    }
 
    /* Heap use: polygon-list entries for the primitives, as the v9 guess. */

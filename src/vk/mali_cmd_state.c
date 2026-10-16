@@ -147,7 +147,11 @@ MALI_PER_ARCH(CmdBindVertexBuffers2)(VkCommandBuffer commandBuffer, uint32_t fir
    }
    if (pStrides)
       vk_cmd_set_vertex_binding_strides(&cmd->vk, firstBinding, bindingCount, pStrides);
+#if PAN_ARCH >= 9
+   /* The vertex attributes are in the VS table (v9+; a v7 draw packs them
+    * every draw and its VS_SRT group is only the descriptor tables). */
    d->dirty |= MALI_GFX_DIRTY_VS_SRT;
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
