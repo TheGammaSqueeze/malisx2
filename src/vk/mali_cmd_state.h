@@ -637,25 +637,171 @@ mali_gfx_fs_srt(struct mali_cmd_buffer *cmd)
 
 /*
  * Bifrost has no resource tables: the v7 draw (mali_jm_cmd_draw.c) builds
- * its Attribute Buffer, Attribute and Varying descriptors itself and does
- * not call these. What is left of the v9 model here is the uniform-buffer,
- * texture, sampler and image tables a shader with descriptor sets would
- * need (panvk_v7 panvk_vX_cmd_desc_state.c), which are not ported: such
- * shaders are refused at compile time (mali_shader.c v7_fixup_info), so
- * these are never reached on v7.
+ * its Attribute Buffer, Attribute and Varying descriptors itself, and a
+ * stage's descriptors reach the shader through per-type tables the Draw
+ * section points at (panvk_v7 panvk_vX_cmd_desc_state.c
+ * cmd_prepare_shader_desc_tables / cmd_fill_dyn_ubos / cmd_prepare_dyn_ssbos).
+ * panvk copies the descriptors out of the sets with a compute shader
+ * (bifrost/panvk_vX_meta_desc_copy.c); here the CPU copies them when the
+ * draw is recorded, from the sets' CPU mappings (set memory is CPU
+ * readable), following the map the shader's lowering left
+ * (mali_v7_shader_desc::map).
  */
-static inline uint64_t
-mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+
+/* The slot a copy handle names, NULL when its set is not bound. */
+static inline const uint8_t *
+mali_v7_set_slot(const struct mali_desc_state *desc, uint32_t handle)
 {
-   MALI_TODO_V7("the vertex stage descriptor tables");
-   return 0;
+   const uint32_t set = MALI_COPY_DESC_HANDLE_SET(handle);
+   const uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(handle);
+   const struct mali_descriptor_set *s = set < MALI_MAX_SETS ? desc->sets[set] : NULL;
+   if (!s || !s->cpu || idx >= s->layout->desc_count)
+      return NULL;
+   return (const uint8_t *)s->cpu + (size_t)idx * MALI_DESCRIPTOR_SIZE;
 }
 
-static inline uint64_t
-mali_gfx_fs_srt(struct mali_cmd_buffer *cmd)
+/* The dynamic buffer a copy handle names: its address with the bound
+ * dynamic offset applied, and its range. False when its set is not
+ * bound. */
+static inline bool
+mali_v7_dyn_buf(const struct mali_desc_state *desc, uint32_t handle, uint64_t *addr,
+                uint64_t *range)
 {
-   MALI_TODO_V7("the fragment stage descriptor tables");
-   return 0;
+   const uint32_t set = MALI_COPY_DESC_HANDLE_SET(handle);
+   const uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(handle);
+   const struct mali_descriptor_set *s = set < MALI_MAX_SETS ? desc->sets[set] : NULL;
+   if (!s || idx >= s->layout->dyn_buf_count)
+      return false;
+   *addr = s->dyn_bufs[idx].addr + desc->dyn_offsets[set][idx];
+   *range = s->dyn_bufs[idx].range;
+   return true;
+}
+
+/*
+ * The tables of one stage: the Uniform Buffer descriptors (the static ones
+ * copied from their slots, then the dynamic ones packed with their
+ * offsets), the Texture and Sampler descriptors copied from their slots
+ * (a dummy sampler when the stage fetches texels but names no sampler),
+ * and the dynamic storage buffer address pairs. Entries whose set is not
+ * bound are zero. False on allocation failure (the command buffer has the
+ * error).
+ */
+static inline bool
+mali_v7_stage_tables(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                     const struct mali_desc_state *desc, struct mali_v7_stage_tables *out)
+{
+   const struct mali_v7_shader_desc *v7 = &s->v7;
+   const uint32_t *map = v7->map;
+   const uint32_t ubo_count = v7->count[MALI_V7_DESC_TABLE_UBO];
+   const uint32_t tex_count = v7->count[MALI_V7_DESC_TABLE_TEXTURE];
+   const uint32_t sampler_count = v7->count[MALI_V7_DESC_TABLE_SAMPLER];
+   const uint32_t dyn_ubo_count = v7->dyn_ubo_count;
+   const uint32_t dyn_ssbo_count = s->desc.dyn_bufs.count - dyn_ubo_count;
+   /* The map's tables in enum order. */
+   const uint32_t *ubo_map = map;
+   const uint32_t *tex_map = map + ubo_count + v7->count[MALI_V7_DESC_TABLE_IMG];
+   const uint32_t *sampler_map = tex_map + tex_count;
+
+   memset(out, 0, sizeof(*out));
+   assert(!v7->count[MALI_V7_DESC_TABLE_IMG]);
+
+   if (ubo_count + dyn_ubo_count) {
+      const uint32_t n = ubo_count + dyn_ubo_count;
+      struct mali_ptr p = mali_cmd_alloc(cmd, n * pan_size(UNIFORM_BUFFER), 64);
+      if (!p.cpu)
+         return false;
+      uint8_t *o = p.cpu;
+      for (uint32_t i = 0; i < ubo_count; i++, o += pan_size(UNIFORM_BUFFER)) {
+         const uint8_t *slot = mali_v7_set_slot(desc, ubo_map[i]);
+         if (slot)
+            memcpy(o, slot, pan_size(UNIFORM_BUFFER));
+         else
+            memset(o, 0, pan_size(UNIFORM_BUFFER));
+      }
+      for (uint32_t i = 0; i < dyn_ubo_count; i++, o += pan_size(UNIFORM_BUFFER)) {
+         uint64_t addr = 0, range = 0;
+         if (!mali_v7_dyn_buf(desc, s->desc.dyn_bufs.map[i], &addr, &range) || !range)
+            addr = 0;
+         pan_cast_and_pack(o, UNIFORM_BUFFER, cfg) {
+            cfg.pointer = addr;
+            cfg.entries = CLAMP(DIV_ROUND_UP(range, 16), 1, 1u << 12);
+         }
+      }
+      out->ubos = p.gpu;
+   }
+
+   if (tex_count) {
+      struct mali_ptr p = mali_cmd_alloc(cmd, tex_count * MALI_DESCRIPTOR_SIZE, 64);
+      if (!p.cpu)
+         return false;
+      uint8_t *o = p.cpu;
+      for (uint32_t i = 0; i < tex_count; i++, o += MALI_DESCRIPTOR_SIZE) {
+         const uint8_t *slot = mali_v7_set_slot(desc, tex_map[i]);
+         if (slot)
+            memcpy(o, slot, MALI_DESCRIPTOR_SIZE);
+         else
+            memset(o, 0, MALI_DESCRIPTOR_SIZE);
+      }
+      out->textures = p.gpu;
+   }
+
+   if (sampler_count) {
+      struct mali_ptr p = mali_cmd_alloc(cmd, sampler_count * MALI_DESCRIPTOR_SIZE, 64);
+      if (!p.cpu)
+         return false;
+      uint8_t *o = p.cpu;
+      for (uint32_t i = 0; i < sampler_count; i++, o += MALI_DESCRIPTOR_SIZE) {
+         const uint8_t *slot = mali_v7_set_slot(desc, sampler_map[i]);
+         if (slot)
+            memcpy(o, slot, MALI_DESCRIPTOR_SIZE);
+         else
+            MALI_PER_ARCH(pack_dummy_sampler)(o);
+      }
+      out->samplers = p.gpu;
+   } else if (tex_count) {
+      /* Texel fetches name sampler 0 (panvk's dummy sampler). */
+      struct mali_ptr p = mali_cmd_alloc(cmd, MALI_DESCRIPTOR_SIZE, 64);
+      if (!p.cpu)
+         return false;
+      MALI_PER_ARCH(pack_dummy_sampler)(p.cpu);
+      out->samplers = p.gpu;
+   }
+
+   if (dyn_ssbo_count) {
+      struct mali_ptr p = mali_cmd_alloc(cmd, dyn_ssbo_count * MALI_DESCRIPTOR_SIZE, 64);
+      if (!p.cpu)
+         return false;
+      uint8_t *o = p.cpu;
+      for (uint32_t i = 0; i < dyn_ssbo_count; i++, o += MALI_DESCRIPTOR_SIZE) {
+         uint64_t addr = 0, range = 0;
+         if (!mali_v7_dyn_buf(desc, s->desc.dyn_bufs.map[dyn_ubo_count + i], &addr, &range))
+            addr = range = 0;
+         /* panvk_ssbo_addr: base, 32-bit size, zero. */
+         const uint32_t size = (uint32_t)MIN2(align64(range, 4), UINT32_MAX & ~3ull);
+         memset(o, 0, MALI_DESCRIPTOR_SIZE);
+         memcpy(o, &addr, sizeof(addr));
+         memcpy(o + 8, &size, sizeof(size));
+      }
+      out->dyn_ssbos = p.gpu;
+   }
+   return true;
+}
+
+/* The stage's words of the sysvals that depend on its tables and
+ * shader: the bound sets' addresses (storage buffers and size queries
+ * read the sets directly), its dynamic storage buffer table, its constant
+ * data buffer. Called before each stage's FAU block is built. */
+static inline void
+mali_v7_stage_sysvals(struct mali_graphics_sysvals *sv, const struct mali_shader *s,
+                      const struct mali_desc_state *desc, const struct mali_v7_stage_tables *t)
+{
+   for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
+      const struct mali_descriptor_set *set =
+         (s->desc.used_set_mask & BITFIELD_BIT(i)) ? desc->sets[i] : NULL;
+      sv->v7_desc.sets[i] = set ? set->gpu : 0;
+   }
+   sv->v7_desc.sets[MALI_V7_DESC_TABLE_DYN_SSBOS] = t->dyn_ssbos;
+   sv->common.constant_data = s->v7.data_mem.gpu_va;
 }
 
 #endif /* PAN_ARCH < 9 */
@@ -1377,8 +1523,10 @@ mali_gfx_build_fs_fau(struct mali_cmd_buffer *cmd, const struct mali_graphics_sy
    return true;
 }
 
+#if PAN_ARCH >= 9
 /* MALI_GFX_DIRTY_VS_SRT / FS_SRT: *out = the stage's resource table
- * pointer (0 for a pipeline without a fragment shader). */
+ * pointer (0 for a pipeline without a fragment shader). (v7 builds its
+ * per-type tables instead: mali_v7_stage_tables from mali_jm_cmd_draw.c.) */
 static inline bool
 mali_gfx_build_vs_srt(struct mali_cmd_buffer *cmd, uint64_t *out)
 {
@@ -1405,6 +1553,7 @@ mali_gfx_build_fs_srt(struct mali_cmd_buffer *cmd, uint64_t *out)
    d->fs_sets_dirty = 0;
    return true;
 }
+#endif /* PAN_ARCH >= 9 */
 
 /* MALI_GFX_DIRTY_ZSD: *out = the Depth/stencil descriptor: the pipeline's
  * own, or a copy of the repacked one (dbk from mali_gfx_update_dirty). */

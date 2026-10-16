@@ -58,8 +58,9 @@
 /* System values                                                           */
 
 /* A magic push-constant base marking system values until the FAU packing
- * below gives everything its final offset. */
-#define SYSVALS_PUSH_CONST_BASE MALI_MAX_PUSH_CONSTANTS_SIZE
+ * below gives everything its final offset (also used by the v7 descriptor
+ * lowering, which emits set address loads). */
+#define SYSVALS_PUSH_CONST_BASE MALI_SYSVALS_PUSH_CONST_BASE
 /* And one marking the shader's constant FAU words (fau.consts), above any
  * sysval offset. */
 #define CONSTS_PUSH_CONST_BASE (SYSVALS_PUSH_CONST_BASE + 4096)
@@ -587,13 +588,40 @@ MALI_PER_ARCH(shader_nir_options)(struct mali_device *dev, mesa_shader_stage sta
    return pan_get_nir_shader_compiler_options(PAN_ARCH, stage, false);
 }
 
+/* The buffer address formats of this arch (panvk_buffer_ubo_addr_format /
+ * panvk_buffer_ssbo_addr_format): Valhall's resource handles, or on
+ * Bifrost a Uniform Buffer table index and a global address pair read out
+ * of the set (bounds-checked by nir_lower_explicit_io when storage buffers
+ * are robust). */
+static nir_address_format
+ubo_addr_format(void)
+{
+#if PAN_ARCH < 9
+   return nir_address_format_32bit_index_offset;
+#else
+   return nir_address_format_vec2_index_32bit_offset;
+#endif
+}
+
+static nir_address_format
+ssbo_addr_format(const struct vk_pipeline_robustness_state *rs)
+{
+#if PAN_ARCH < 9
+   return rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ?
+             nir_address_format_64bit_bounded_global :
+             nir_address_format_64bit_global_32bit_offset;
+#else
+   (void)rs;
+   return nir_address_format_vec2_index_32bit_offset;
+#endif
+}
+
 struct spirv_to_nir_options
 MALI_PER_ARCH(shader_spirv_options)(const struct vk_pipeline_robustness_state *rs)
 {
-   (void)rs;
    return (struct spirv_to_nir_options){
-      .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
-      .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .ubo_addr_format = ubo_addr_format(),
+      .ssbo_addr_format = ssbo_addr_format(rs),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .push_const_addr_format = nir_address_format_32bit_offset,
       .shared_addr_format = nir_address_format_32bit_offset,
@@ -643,6 +671,7 @@ MALI_PER_ARCH(shader_preprocess)(struct mali_device *dev, nir_shader *nir)
    pan_preprocess_nir(nir, pdev->props.gpu_id);
 }
 
+#if PAN_ARCH >= 9
 /* The valhall backend wants the 32bit_index_offset format; we lower buffer
  * access with vec2_index_32bit_offset so the descriptor walk keeps the
  * array size for bounds checks, and fold the index back here. */
@@ -715,6 +744,7 @@ lower_get_ssbo_size(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data
    nir_def_replace(&intr->def, size);
    return true;
 }
+#endif /* PAN_ARCH >= 9 */
 
 static bool
 mark_all_access_non_uniform(nir_builder *b, nir_instr *instr, void *data)
@@ -782,7 +812,9 @@ shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
    *align = comp_size * (length == 3 ? 4 : length);
 }
 
-/* Resource lowering (panvk_lower_nir). */
+/* Resource lowering (panvk_lower_nir). On v7 a descriptor table map that
+ * could not be allocated stops the lowering and sets s->v7.failed; the
+ * compile checks it before the backend. */
 static void
 lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
           struct mali_shader *s, bool allow_merging_workgroups)
@@ -796,26 +828,38 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
    };
    NIR_PASS(_, nir, nir_opt_access, &access_options);
 
+#if PAN_ARCH < 9
+   /* Bifrost: per-type descriptor tables, set addresses in the sysvals
+    * (mali_nir_lower_descriptors_v7.c). */
+   if (!mali_nir_lower_descriptors_v7(nir, rs, info->layout, &s->desc, &s->v7)) {
+      s->v7.failed = true;
+      return;
+   }
+#else
    mali_nir_lower_descriptors(nir, rs, info->layout, &s->desc);
+#endif
 
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_memcpy);
 
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
-            nir_address_format_vec2_index_32bit_offset);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            nir_address_format_vec2_index_32bit_offset);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo, ubo_addr_format());
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, ssbo_addr_format(rs));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
 
+#if PAN_ARCH >= 9
    if (rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
       NIR_PASS(_, nir, nir_lower_robust_access, is_robust_ssbo_intr, NULL);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
    }
+#else
+   /* The bounded global format bounds-checks storage buffer accesses in
+    * nir_lower_explicit_io itself. */
+#endif
 
    if (allow_merging_workgroups) {
       /* Accesses uniform in the source may not be once workgroups share a
@@ -829,6 +873,11 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
       nir_lower_non_uniform_texture_access | nir_lower_non_uniform_texture_query |
       nir_lower_non_uniform_image_access | nir_lower_non_uniform_image_query |
       nir_lower_non_uniform_get_ssbo_size;
+#if PAN_ARCH < 9
+   /* Bifrost texture instructions take their indices as immediates or
+    * uniform registers. */
+   non_uniform_types |= nir_lower_non_uniform_texture_offset_access;
+#endif
 
    if (allow_merging_workgroups ||
        nir_has_non_uniform_access(nir, non_uniform_types)) {
@@ -839,10 +888,16 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
       NIR_PASS(_, nir, nir_lower_non_uniform_access, &opts);
    }
 
+#if PAN_ARCH >= 9
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_get_ssbo_size,
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_instructions_pass, pack_buf_idx,
             nir_metadata_control_flow, NULL);
+#else
+   /* v7: get_ssbo_size is the size word of the address pair, which
+    * nir_lower_explicit_io took care of; load_ubo already carries a plain
+    * table index. */
+#endif
 
    if (mesa_shader_stage_uses_workgroup(nir->info.stage)) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
@@ -1268,32 +1323,28 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
 /*
  * After the Bifrost compile (panvk_vX_shader.c panvk_compile_nir at
  * PAN_ARCH < 9): the descriptor counts the RSD carries come from the
- * driver's tables, not from NIR's num_ubos / textures_used, and the vertex
- * attribute count is the highest generic location read plus one (holes
- * included), since the attribute table has one descriptor per location.
+ * driver's tables (mali_nir_lower_descriptors_v7.c), not from NIR's
+ * num_ubos / textures_used; a stage with textures but no sampler gets the
+ * dummy sampler the draw provides; and the vertex attribute count is the
+ * highest generic location read plus one (holes included), since the
+ * attribute table has one descriptor per location.
  *
- * The v7 descriptor tables (uniform buffers, textures, samplers, images,
- * the dynamic SSBO address table) and the constant data buffer are not
- * ported yet: a shader that needs any of them is refused here, with the
- * TODO v7 log line, rather than compiled against the v9 resource handles
- * the descriptor lowering produced (which Bifrost would read as table
- * indices and fault on). Push constants, vertex attributes and varyings
- * are the whole Bifrost resource model this build supports.
+ * Still refused, with the TODO v7 log line: storage images and texel
+ * buffers (the image Attribute table of a draw or dispatch and the
+ * attribute pair in the set, panvk_v7 panvk_vX_image_view.c
+ * prepare_attr_buf_descs and panvk_vX_buffer_view.c), and compute shaders
+ * that read the set addresses (storage buffers, size queries), which need
+ * the v7_desc.sets words in struct mali_compute_sysvals and a dispatch
+ * that fills them (mali_jm_cmd_dispatch.c).
  */
 static VkResult
 v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader *s)
 {
    const char *missing = NULL;
-   if (s->desc.used_set_mask || s->desc.dyn_bufs.count)
-      missing = "descriptor sets (uniform buffer, texture, sampler and image tables)";
-   else if (s->info.texture_count || s->info.sampler_count)
-      missing = "texture and sampler tables";
-   else if (s->info.images_used)
-      missing = "image attribute tables";
-   else if (nir->constant_data_size)
-      missing = "the constant data buffer";
-   else if (s->info.ubo_count)
-      missing = "uniform buffer tables";
+   if (s->info.images_used || s->v7.count[MALI_V7_DESC_TABLE_IMG])
+      missing = "storage image and texel buffer attribute tables";
+   else if (s->stage == MESA_SHADER_COMPUTE && s->v7.needs_set_addrs)
+      missing = "the descriptor set address sysvals of a compute dispatch";
    if (missing) {
       MALI_TODO_V7(missing);
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
@@ -1301,9 +1352,20 @@ v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader
                        mesa_shader_stage_name(s->stage), missing);
    }
 
-   s->info.ubo_count = 0;
-   s->info.texture_count = 0;
-   s->info.sampler_count = 0;
+   s->info.ubo_count = s->v7.count[MALI_V7_DESC_TABLE_UBO] + s->v7.dyn_ubo_count;
+   s->info.texture_count = s->v7.count[MALI_V7_DESC_TABLE_TEXTURE];
+   s->info.sampler_count = s->v7.count[MALI_V7_DESC_TABLE_SAMPLER];
+   if (s->info.texture_count && !s->info.sampler_count)
+      s->info.sampler_count = 1;
+
+   if (nir->constant_data_size) {
+      s->v7.data = malloc(nir->constant_data_size);
+      if (!s->v7.data)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      memcpy(s->v7.data, nir->constant_data, nir->constant_data_size);
+      s->v7.data_size = nir->constant_data_size;
+   }
+
    if (s->stage == MESA_SHADER_VERTEX) {
       const uint32_t generic =
          (s->info.attributes_read & VERT_BIT_GENERIC_ALL) >> VERT_ATTRIB_GENERIC0;
@@ -1488,6 +1550,15 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
    assert(s->code.gpu_va >> 32 == (s->code.gpu_va + padded - 1) >> 32);
 
 #if PAN_ARCH < 9
+   /* The constant data buffer the common.constant_data sysval points at
+    * (panvk_shader_upload at PAN_ARCH < 9: 64-byte aligned). */
+   if (s->v7.data_size) {
+      if (mali_bo_pool_alloc(&dev->desc_pool, s->v7.data_size, 64, &s->v7.data_mem) !=
+          MALI_KBASE_SUCCESS)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      memcpy(s->v7.data_mem.cpu, s->v7.data, s->v7.data_size);
+   }
+
    /*
     * v7 has no Shader Program Descriptor: a draw's jobs point at Renderer
     * State Descriptors (panvk_v7 panvk_vX_shader.c panvk_shader_upload at
@@ -1597,6 +1668,11 @@ shader_alloc(struct mali_device *dev, mesa_shader_stage stage, const void *key,
 static void
 shader_destroy(struct mali_device *dev, struct mali_shader *s)
 {
+#if PAN_ARCH < 9
+   mali_bo_pool_free(&dev->desc_pool, &s->v7.data_mem);
+   free(s->v7.data);
+   free(s->v7.map);
+#endif
    mali_bo_pool_free(&dev->desc_pool, &s->spd_mem);
    mali_bo_pool_free(&dev->exec_pool, &s->code);
    free(s->bin);
@@ -1771,6 +1847,13 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       goto fail;
    }
 
+#if PAN_ARCH < 9
+   if (s->v7.failed) {
+      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail;
+   }
+#endif
+
    result = compile_nir(dev, nir, &inputs, state, s);
    if (result != VK_SUCCESS)
       goto fail;
@@ -1826,6 +1909,16 @@ shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
    }
    blob_write_uint32(blob, s->bin_size);
    blob_write_bytes(blob, s->bin, s->bin_size);
+#if PAN_ARCH < 9
+   /* The Bifrost descriptor tables and constant data. */
+   blob_write_bytes(blob, s->v7.count, sizeof(s->v7.count));
+   blob_write_uint32(blob, s->v7.dyn_ubo_count);
+   blob_write_uint32(blob, s->v7.needs_set_addrs);
+   blob_write_uint32(blob, s->v7.map_count);
+   blob_write_bytes(blob, s->v7.map, s->v7.map_count * sizeof(uint32_t));
+   blob_write_uint32(blob, s->v7.data_size);
+   blob_write_bytes(blob, s->v7.data, s->v7.data_size);
+#endif
 
    return !blob->out_of_memory;
 }
@@ -1859,6 +1952,15 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    }
    s->bin_size = blob_read_uint32(blob);
    const void *bin = blob_read_bytes(blob, s->bin_size);
+#if PAN_ARCH < 9
+   blob_copy_bytes(blob, s->v7.count, sizeof(s->v7.count));
+   s->v7.dyn_ubo_count = blob_read_uint32(blob);
+   s->v7.needs_set_addrs = blob_read_uint32(blob);
+   s->v7.map_count = blob_read_uint32(blob);
+   const void *map = blob_read_bytes(blob, s->v7.map_count * sizeof(uint32_t));
+   s->v7.data_size = blob_read_uint32(blob);
+   const void *data = blob_read_bytes(blob, s->v7.data_size);
+#endif
 
    if (blob->overrun || s->info.stage != stage ||
        s->desc.dyn_bufs.count > MALI_MAX_DYNAMIC_BUFFERS)
@@ -1870,6 +1972,20 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
          goto fail;
       memcpy(s->bin, bin, s->bin_size);
    }
+#if PAN_ARCH < 9
+   if (s->v7.map_count) {
+      s->v7.map = malloc(s->v7.map_count * sizeof(uint32_t));
+      if (!s->v7.map)
+         goto fail;
+      memcpy(s->v7.map, map, s->v7.map_count * sizeof(uint32_t));
+   }
+   if (s->v7.data_size) {
+      s->v7.data = malloc(s->v7.data_size);
+      if (!s->v7.data)
+         goto fail;
+      memcpy(s->v7.data, data, s->v7.data_size);
+   }
+#endif
 
    if (shader_upload(dev, s) != VK_SUCCESS)
       goto fail;

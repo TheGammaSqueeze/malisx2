@@ -163,7 +163,8 @@ malisx2_vk = static_library(
         'vk/mali_image.c', 'vk/mali_image_layout.c'),
   # Shader lowering and memory pools, descriptor set layouts.
   files('vk/mali_bo_pool.c', 'vk/mali_descriptor_set_layout.c',
-        'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_input_attachments.c'),
+        'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_descriptors_v7.c',
+        'vk/mali_nir_lower_input_attachments.c'),
   # Command buffers, the CSF queue, submit and sync.
   files('vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_queue.c',
         'vk/mali_sync.c'),

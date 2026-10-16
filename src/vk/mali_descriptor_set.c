@@ -11,9 +11,16 @@
  * into each slot, because Mesa's compiler reads the slots; pool memory
  * and accounting follow the blob.
  *
- * Built per arch. The one hardware difference: v9's Buffer descriptor has
- * no size-hi word (v11 word 5), so buffer sizes are 32 bits there; the
- * T820 blob writes the same v9 fields.
+ * Built per arch. v9's Buffer descriptor has no size-hi word (v11 word
+ * 5), so buffer sizes are 32 bits there; the T820 blob writes the same v9
+ * fields. v7 (Bifrost) keeps the same slot layout with panvk_v7's slot
+ * contents (panvk_vX_descriptor_set.c at PAN_ARCH < 9): a uniform buffer
+ * is an 8-byte Uniform Buffer descriptor at the start of its slot, a
+ * storage buffer an address and size pair the shader reads straight from
+ * the set, an unused slot zero; the draw copies the uniform buffer,
+ * texture and sampler slots a shader uses into its per-type tables
+ * (mali_cmd_state.h). Buffer views and storage images (an attribute
+ * descriptor pair on v7) are not ported yet.
  */
 
 #ifndef PAN_ARCH
@@ -214,12 +221,24 @@ static void
 pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
 {
 #if PAN_ARCH < 9
-   /* TODO v7: a uniform buffer is a Uniform Buffer descriptor (16-byte
-    * entry count and pointer), a storage buffer an address/size pair in
-    * the driver's own UBO (panvk_v7 panvk_vX_descriptor_set.c
-    * panvk_write_ubo_desc / panvk_write_ssbo_desc). */
-   MALI_TODO_V7("buffer descriptors");
+   /* panvk_v7 write_buffer_desc: a storage buffer is the address and size
+    * pair the shader's load_vulkan_descriptor reads from the set
+    * (panvk_ssbo_addr: base, 32-bit size, the rest zero); a uniform buffer
+    * the hardware's Uniform Buffer descriptor (16-byte entries, 12 bits
+    * minus one: at most 64 KiB, the maxUniformBufferRange of this arch; a
+    * zero range still packs one entry, the packer refuses zero). */
    memset(out, 0, MALI_DESCRIPTOR_SIZE);
+   if (ssbo) {
+      const uint64_t size = align64(range, 4);
+      const uint32_t size32 = (uint32_t)MIN2(size, UINT32_MAX & ~3ull);
+      memcpy(out, &addr, sizeof(addr));
+      memcpy((uint8_t *)out + 8, &size32, sizeof(size32));
+   } else {
+      pan_cast_and_pack(out, UNIFORM_BUFFER, cfg) {
+         cfg.pointer = addr;
+         cfg.entries = CLAMP(DIV_ROUND_UP(range, 16), 1, 1u << 12);
+      }
+   }
 #else
    const uint64_t size = align64(range, ssbo ? 4 : 16);
    pan_cast_and_pack(out, BUFFER, cfg) {

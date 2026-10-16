@@ -115,8 +115,12 @@
  *    index buffer has no CPU view fails the command buffer;
  *  - no occlusion queries, no multiview, layered passes draw into layer 0
  *    (file comment of the v9 half, which applies);
- *  - descriptor sets, textures, images and uniform buffers do not reach a
- *    draw: shaders using them are refused at compile time (mali_shader.c).
+ *  - descriptor sets: each stage's uniform buffer, texture and sampler
+ *    tables are copied out of the bound sets when the stage's table group
+ *    is dirty (mali_cmd_state.h mali_v7_stage_tables), and the Draw
+ *    sections point at them; the set addresses and the dynamic storage
+ *    buffer table go through the stage's FAU block (sysvals). Storage
+ *    images and texel buffers are not ported (refused at compile time).
  *
  * Job dependencies (Mesa pan_jc.h rules): the Tiler job's Dependency 1 is
  * the Vertex job's index, its Dependency 2 the previous tiler-side job
@@ -636,12 +640,37 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          return false;
    }
 
+   /* The descriptor tables (mali_gfx_build_vs_srt's v7 shape): a stage
+    * that reads the set addresses gets them through its FAU block, so its
+    * FAU group follows. */
+   if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
+      if (!mali_v7_stage_tables(cmd, p->vs, &cmd->gfx.desc, &t->vs_tab))
+         return false;
+      d->vs_srt_key = bd->vs_srt_key;
+      d->vs_sets_dirty = 0;
+      if (p->vs->v7.needs_set_addrs)
+         d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+   }
+   if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
+      if (p->fs) {
+         if (!mali_v7_stage_tables(cmd, p->fs, &cmd->gfx.desc, &t->fs_tab))
+            return false;
+         if (p->fs->v7.needs_set_addrs)
+            d->dirty |= MALI_GFX_DIRTY_FS_FAU;
+      } else {
+         memset(&t->fs_tab, 0, sizeof(t->fs_tab));
+      }
+      d->fs_srt_key = bd->fs_srt_key;
+      d->fs_sets_dirty = 0;
+   }
+
    struct mali_graphics_sysvals sv;
    if (d->dirty & (MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_FS_FAU)) {
       mali_gfx_fill_sysvals(cmd, &sv);
       sv.vs.raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_VS_FAU) {
+      mali_v7_stage_sysvals(&sv, p->vs, &cmd->gfx.desc, &t->vs_tab);
       if (!mali_gfx_build_vs_fau(cmd, &sv, &v))
          return false;
       /* The RSD's preload.uniform_count is the shader's FAU word count;
@@ -651,6 +680,8 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       t->raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_FAU) {
+      if (p->fs)
+         mali_v7_stage_sysvals(&sv, p->fs, &cmd->gfx.desc, &t->fs_tab);
       if (!mali_gfx_build_fs_fau(cmd, &sv, &v))
          return false;
       assert(!v || !p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
@@ -797,6 +828,27 @@ dump_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, const st
              r->rt_count, t->fs_rsd, t->fs_code, dd->position, t->fs_vary,
              t->fs_vary ? dd->vary_bufs : 0, t->viewport, t->fs_fau,
              p->fs ? p->fs->fau.total_count : 0, t->tsd, dd->psiz);
+   mesa_logi("  vertex tables: uniform_buffers 0x%" PRIx64 " (%u + %u dynamic), textures 0x%"
+             PRIx64 " (%u), samplers 0x%" PRIx64 " (%u), dynamic ssbos 0x%" PRIx64
+             ", set mask 0x%x, constant data 0x%" PRIx64,
+             t->vs_tab.ubos, p->vs->v7.count[MALI_V7_DESC_TABLE_UBO], p->vs->v7.dyn_ubo_count,
+             t->vs_tab.textures, p->vs->info.texture_count, t->vs_tab.samplers,
+             p->vs->info.sampler_count, t->vs_tab.dyn_ssbos, p->vs->desc.used_set_mask,
+             p->vs->v7.data_mem.gpu_va);
+   if (p->fs)
+      mesa_logi("  fragment tables: uniform_buffers 0x%" PRIx64 " (%u + %u dynamic), textures 0x%"
+                PRIx64 " (%u), samplers 0x%" PRIx64 " (%u), dynamic ssbos 0x%" PRIx64
+                ", set mask 0x%x, constant data 0x%" PRIx64,
+                t->fs_tab.ubos, p->fs->v7.count[MALI_V7_DESC_TABLE_UBO], p->fs->v7.dyn_ubo_count,
+                t->fs_tab.textures, p->fs->info.texture_count, t->fs_tab.samplers,
+                p->fs->info.sampler_count, t->fs_tab.dyn_ssbos, p->fs->desc.used_set_mask,
+                p->fs->v7.data_mem.gpu_va);
+   for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
+      const struct mali_descriptor_set *set = cmd->gfx.desc.sets[i];
+      if (set)
+         mesa_logi("  bound set %u: 0x%" PRIx64 " (%u slots, %u dynamic buffers)", i, set->gpu,
+                   set->layout->desc_count, set->layout->dyn_buf_count);
+   }
    const struct vk_vertex_input_state *vi = d->vi;
    for (unsigned i = 0; i < util_last_bit(vi->bindings_valid); i++) {
       if (vi->bindings_valid & BITFIELD_BIT(i))
@@ -902,7 +954,9 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       cfg.offset_start = dd.raw_vertex_offset;
       cfg.instance_size = instance_size;
       cfg.push_uniforms = t->vs_fau;
-      /* No uniform buffer, texture or sampler tables (mali_shader.c). */
+      cfg.uniform_buffers = t->vs_tab.ubos;
+      cfg.textures = t->vs_tab.textures;
+      cfg.samplers = t->vs_tab.samplers;
    }
 
    if (tiling) {
@@ -957,6 +1011,9 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          cfg.instance_size = instance_size;
          cfg.instance_primitive_size = padded_vertex_count(MAX2(prims_per_instance, 1));
          cfg.push_uniforms = t->fs_fau;
+         cfg.uniform_buffers = t->fs_tab.ubos;
+         cfg.textures = t->fs_tab.textures;
+         cfg.samplers = t->fs_tab.samplers;
          cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
       }
       dcd.opaque[0] |= t->dcd0;

@@ -219,6 +219,18 @@ struct mali_jm_draw_tmpl {
 #define MALI_V7_VARY_BUF_PSIZ 2
 #define MALI_V7_VARY_BUF_COUNT 3
 
+/* The per-type descriptor tables of one stage of a v7 draw or dispatch
+ * (mali_cmd_state.h mali_v7_stage_tables): what the Draw section's
+ * Uniform buffers, Textures and Samplers pointers take, and the dynamic
+ * storage buffer address table the stage's sysvals carry. 0 for a table
+ * the shader does not have. */
+struct mali_v7_stage_tables {
+   uint64_t ubos;        /* Uniform Buffer descriptors, 8 bytes each */
+   uint64_t textures;    /* Texture descriptors */
+   uint64_t samplers;    /* Sampler descriptors (a dummy one for texel fetches) */
+   uint64_t dyn_ssbos;   /* dynamic storage buffer address pairs, 32 bytes each */
+};
+
 struct mali_jm_draw_tmpl {
    /* Per pipeline (MALI_GFX_DIRTY_PIPELINE). */
    uint32_t prim0;          /* Primitive word 0 without index type and provoking vertex */
@@ -233,6 +245,7 @@ struct mali_jm_draw_tmpl {
    bool lines;
    /* Per state group. */
    uint64_t fs_rsd;         /* fragment RSD followed by the Blend descriptors (PIPELINE, BLEND, ZSD) */
+   struct mali_v7_stage_tables vs_tab, fs_tab;   /* descriptor tables (VS_SRT, FS_SRT) */
    uint64_t vs_fau, fs_fau; /* push uniform blocks (VS_FAU, FS_FAU) */
    uint64_t viewport;       /* Viewport descriptor (VIEWPORT) */
    uint64_t tiler, tsd;     /* layer 0's Tiler Context, the pass's Local Storage (PASS) */
