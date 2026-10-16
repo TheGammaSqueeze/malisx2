@@ -36,3 +36,28 @@ executable(
   dependencies : [dep_dl],
   install : false,
 )
+
+# zs_g52: depth and stencil. One pass per depth/stencil format the device
+# offers (D24S8, D32S8, D32, D16): a near and a far triangle under the depth
+# test LESS, then a stencil write and a stencil-tested draw, read back
+# through the colour image. g52_harness.h holds the shared setup.
+executable(
+  'zs_g52',
+  files('zs_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DZS_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)
+
+# blend_g52: three images cleared to grey and drawn with a fixed-function
+# equation and a colour write mask, a blend-shader equation (MIN) and a
+# blend-constant equation, checked within one LSB.
+executable(
+  'blend_g52',
+  files('blend_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DBLEND_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl, dep_m],
+  install : false,
+)

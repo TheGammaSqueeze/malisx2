@@ -8,10 +8,11 @@
  * (MIN/MAX, factor pairs it has no operand for, formats it cannot blend,
  * logic ops, alpha-to-one, inhomogeneous blend constants) run as a small
  * shader the fragment shader's BLEND instruction calls. Built from NIR
- * the way Mesa's pan_blend_create_shader does, compiled through kraid,
- * placed in the device's executable pool and cached per device by key.
- * Built per arch (v9 and v11 blend the same way; the shader is compiled
- * for the device's GPU).
+ * the way Mesa's pan_blend_create_shader does, compiled through kraid (v9,
+ * v11) or Mesa's Bifrost backend (v7), placed in the device's executable
+ * pool and cached per device by key. Built per arch: the three blend the
+ * same way, the shader is compiled for the device's GPU, and the v7 Blend
+ * descriptor carries the return address the shader jumps back to.
  */
 
 #ifndef MALI_BLEND_H

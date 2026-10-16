@@ -877,16 +877,27 @@ mali_gfx_blend(struct mali_cmd_buffer *cmd, uint32_t *count_out)
 
 #else /* PAN_ARCH < 9 */
 
+#include "panfrost/compiler/pan_nir.h"
 #include "util/blend.h"
 
 /* The register file format a fragment shader's colour output has, for the
- * Bifrost fixed-function blender's conversion (pan_blend_type_from_nir). */
+ * Bifrost fixed-function blender's conversion (pan_blend_type_from_nir;
+ * 8-bit types are stored from 16-bit registers). A shader whose outputs
+ * carry no type (untyped_color_outputs, GL's gl_FragColor) stores in the
+ * format's base type at the output's size (pan_fixup_blend_type). */
 static inline enum mali_register_file_format
-mali_gfx_blend_register_format(nir_alu_type type)
+mali_gfx_blend_register_format(nir_alu_type type, enum pipe_format format, bool untyped)
 {
+   if (untyped) {
+      const struct util_format_description *desc = util_format_description(format);
+      type = nir_alu_type_get_base_type(pan_unpacked_type_for_format(desc)) |
+             nir_alu_type_get_type_size(type);
+   }
    switch (type) {
    case nir_type_float16: return MALI_REGISTER_FILE_FORMAT_F16;
+   case nir_type_int8:
    case nir_type_int16: return MALI_REGISTER_FILE_FORMAT_I16;
+   case nir_type_uint8:
    case nir_type_uint16: return MALI_REGISTER_FILE_FORMAT_U16;
    case nir_type_int32: return MALI_REGISTER_FILE_FORMAT_I32;
    case nir_type_uint32: return MALI_REGISTER_FILE_FORMAT_U32;
@@ -945,19 +956,29 @@ mali_gfx_blend_alpha_one_store(const struct mali_blend_eq *eq)
  * blend_emit_descs / emit_blend_desc at PAN_ARCH < 9): `count` Blend
  * descriptors packed into `out`, which the draw puts right behind the
  * fragment Renderer State Descriptor (the v7 Draw has no blend pointer;
- * the hardware reads them from there). Differences from the v9 one:
+ * the hardware reads them from there). `fs_code` is the fragment shader's
+ * code address (the Return Value of a shader-mode descriptor is relative
+ * to it). Differences from the v9 one:
  *
  *  - the fixed-function conversion names the fragment shader's output
  *    register format (the Bifrost blender converts from the register
  *    file), and carries the alpha-zero-nop / alpha-one-store shortcuts;
+ *  - a blend shader is entered by the fragment shader's BLEND (the
+ *    descriptor's PC, low 32 bits, 16-byte aligned) and returns to the
+ *    descriptor's Return Value: the fragment code plus the compiler's
+ *    return offset for that target (info.bifrost.blend[].return_offset),
+ *    or 0 when the BLEND was the shader's last instruction, which ends the
+ *    thread. v9+ passes the return address in a register instead;
  *  - the internal words the shader reads come from the hardware's blend
  *    FAU slots, not the FAU block (mali_shader.c lower_sysvals), so
- *    gfx.draw.blend_descs is filled for the record only;
- *  - blend shaders are not ported (mali_blend.c): a target that needs one
- *    stores the source with the colour mask applied, once logged.
+ *    gfx.draw.blend_descs is filled for the record only.
+ *
+ * As on v9, a target uses a blend shader when the pipeline says so or when
+ * its fixed-function blend constant cannot be the pass's single one; a
+ * shader that fails to compile stores the source, logged once.
  */
 static inline bool
-mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count)
+mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count, uint64_t fs_code)
 {
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    const struct mali_graphics_pipeline *p = d->pipeline;
@@ -966,29 +987,36 @@ mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count)
    const float *consts = cmd->vk.dynamic_graphics_state.cb.blend_constants;
 
    /* The fixed-function constant (all ones: none yet), and which targets
-    * would need a blend shader (panvk blend_needs_shader). */
-   bool wants_shader[MALI_MAX_RTS] = {false};
+    * need a blend shader (panvk blend_needs_shader). */
+   uint64_t shader[MALI_MAX_RTS] = {0};
+   bool opaque_fallback[MALI_MAX_RTS] = {false};
    uint32_t ff_constant = ~0u;
    for (uint32_t i = 0; i < count && i < bk->rt_count; i++) {
       const struct mali_blend_rt_baked *rt = &bk->blend[i];
       const bool have_rt = i < r->desc.rt_count && r->desc.rt[i].image;
       if (!p->fs || rt->mode == MALI_BLEND_RT_OFF || !have_rt)
          continue;
-      wants_shader[i] = rt->mode == MALI_BLEND_RT_SHADER;
+      bool use_shader = rt->mode == MALI_BLEND_RT_SHADER;
       if (rt->mode == MALI_BLEND_RT_FIXED_FUNCTION && rt->constant_mask) {
          const uint32_t c = mali_gfx_pack_blend_constant(r->desc.rt[i].format,
                                                          consts[ffs(rt->constant_mask) - 1]);
          if (!mali_gfx_homogeneous_constant(rt->constant_mask, consts) ||
              (ff_constant != ~0u && c != ff_constant))
-            wants_shader[i] = true;
+            use_shader = true;
          else
             ff_constant = c;
+      }
+      if (use_shader) {
+         shader[i] = mali_gfx_blend_shader_for(cmd, p, i);
+         opaque_fallback[i] = !shader[i];
       }
    }
    if (ff_constant == ~0u)
       ff_constant = 0;
 
    d->blend_shader_mask = 0;
+   for (uint32_t i = 0; i < count; i++)
+      d->blend_shader_mask |= shader[i] ? BITFIELD_BIT(i) : 0;
    memset(d->blend_descs, 0, sizeof(d->blend_descs));
    struct mali_blend_packed off;
    pan_pack(&off, BLEND, cfg) {
@@ -1012,21 +1040,30 @@ mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count)
          *o = off;
          continue;
       }
-      if (wants_shader[i]) {
-         static bool warned;
-         if (!warned) {
-            warned = true;
-            MALI_TODO_V7("blend shaders");
-            mesa_logw("malisx2: a render target needs a blend shader; the colour is stored "
-                      "unblended on the Mali-G52 until they are ported");
-         }
-      }
 
       const enum pipe_format fmt = r->desc.rt[i].format;
-      const bool opaque = wants_shader[i] || rt->mode == MALI_BLEND_RT_OPAQUE;
+      const unsigned loc = rt->shader_location;
+      if (shader[i]) {
+         /* The compiler records where the fragment shader continues after
+          * each target's BLEND; 0 means the BLEND ended the shader. */
+         const uint32_t ret = loc < MALI_MAX_RTS ? p->fs->info.bifrost.blend[loc].return_offset : 0;
+         pan_pack(o, BLEND, cfg) {
+            cfg.srgb = util_format_is_srgb(fmt);
+            cfg.load_destination = rt->load_destination;
+            cfg.round_to_fb_precision = true;
+            cfg.blend_constant = ff_constant;
+            cfg.internal.mode = MALI_BLEND_MODE_SHADER;
+            cfg.internal.shader.pc = (uint32_t)shader[i];
+            cfg.internal.shader.return_value = ret ? (uint32_t)(fs_code + ret) : 0;
+         }
+         if (loc < MALI_MAX_RTS)
+            d->blend_descs[loc] = o->opaque[2] | (uint64_t)o->opaque[3] << 32;
+         continue;
+      }
+
+      const bool opaque = opaque_fallback[i] || rt->mode == MALI_BLEND_RT_OPAQUE;
       const nir_alu_type out_type =
-         rt->shader_location < MALI_MAX_RTS ? p->fs->info.bifrost.blend[rt->shader_location].type
-                                            : nir_type_float32;
+         loc < MALI_MAX_RTS ? p->fs->info.bifrost.blend[loc].type : nir_type_float32;
       pan_pack(o, BLEND, cfg) {
          cfg.srgb = util_format_is_srgb(fmt);
          cfg.load_destination = rt->load_destination && !opaque;
@@ -1046,7 +1083,7 @@ mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count)
          }
          cfg.internal.fixed_function.rt = i;
          cfg.internal.fixed_function.conversion.register_format =
-            mali_gfx_blend_register_format(out_type);
+            mali_gfx_blend_register_format(out_type, fmt, p->fs->info.fs.untyped_color_outputs);
          if (!opaque) {
             cfg.internal.fixed_function.alpha_zero_nop = mali_gfx_blend_alpha_zero_nop(&rt->eq);
             cfg.internal.fixed_function.alpha_one_store = mali_gfx_blend_alpha_one_store(&rt->eq);
@@ -1054,7 +1091,7 @@ mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count)
       }
       /* The equation word: the baked one, or a plain store with the colour
        * mask for a target whose blend shader is missing. */
-      if (wants_shader[i]) {
+      if (opaque_fallback[i]) {
          struct mali_blend_equation_packed replace;
          pan_pack(&replace, BLEND_EQUATION, cfg) {
             cfg.rgb.a = MALI_BLEND_OPERAND_A_SRC;

@@ -558,7 +558,9 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
  * shader's info, the state half (words 4 to 11) baked by the pipeline
  * (mali_pipeline_state.c pack_rsd_state, or the command buffer's repack
  * for a pipeline with dynamic state), then one Blend descriptor per
- * render target of the pass.
+ * render target of the pass. The Blend descriptors come first: whether a
+ * target ended up with a blend shader (the dynamic blend constants decide
+ * some of them) feeds the RSD under multisampling.
  */
 static bool
 build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p,
@@ -570,18 +572,39 @@ build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p
    if (!m.cpu)
       return false;
 
+   if (!mali_gfx_blend_v7(cmd, (uint8_t *)m.cpu + pan_size(RENDERER_STATE), rt_count, t->fs_code))
+      return false;
+
+   /* A blend shader under multisampling runs once per sample and reads the
+    * sample ID and coverage (r61): on Bifrost the driver sets the RSD up
+    * for it (the compiler preloads those registers on its own on v9+ only;
+    * bifrost_compile.c). The bake knows the pipeline's own blend shaders,
+    * the dynamic blend constants can add some, so decide here. */
+   const struct vk_dynamic_graphics_state *st = p->bind.dynamic ? &cmd->vk.dynamic_graphics_state
+                                                                : &p->state;
+   const bool per_sample_blend = cmd->gfx.draw.blend_shader_mask &&
+                                 st->ms.rasterization_samples > 1;
+
    struct mali_renderer_state_packed rsd;
    pan_pack(&rsd, RENDERER_STATE, cfg) {
-      if (p->fs)
+      if (p->fs) {
          mali_v7_rsd_shader(&p->fs->info, t->fs_code, &cfg);
+         if (per_sample_blend)
+            cfg.preload.fragment.sample_mask_id = true;
+      }
    }
    STATIC_ASSERT(sizeof(bk->zsd) == MALI_V7_RSD_STATE_WORDS * sizeof(uint32_t));
    memcpy(&rsd.opaque[MALI_V7_RSD_STATE_WORD_FIRST], bk->zsd, sizeof(bk->zsd));
+   if (per_sample_blend) {
+      struct mali_multisample_misc_packed ms;
+      pan_pack_nodefaults(&ms, MULTISAMPLE_MISC, cfg) {
+         cfg.evaluate_per_sample = true;
+      }
+      rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] |= ms.opaque[0];
+   }
    memcpy(m.cpu, &rsd, sizeof(rsd));
-
-   if (!mali_gfx_blend_v7(cmd, (uint8_t *)m.cpu + pan_size(RENDERER_STATE), rt_count))
-      return false;
    t->fs_rsd = m.gpu;
+   t->fs_rsd_cpu = m.cpu;
    return true;
 }
 
@@ -821,6 +844,23 @@ dump_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, const st
              "vs attribute_count %u, vs varyings %u, fs varyings %u",
              t->prim0, t->prim, r->first_provoking_vertex, t->dcd0, p->vs->info.attribute_count,
              p->vs->info.varyings.formats.count, p->fs ? p->fs->info.varyings.formats.count : 0);
+   /* The RSD state words and the Blend descriptors, as the hardware reads
+    * them (the RSD block is command memory: read back once for the dump). */
+   const uint32_t *rsd = t->fs_rsd_cpu;
+   if (rsd) {
+      mesa_logi("  fs RSD words 4-11: properties 0x%08x, depth units %f factor %f clamp %f, "
+                "multisample_misc 0x%08x, stencil_mask_misc 0x%08x, stencil front 0x%08x back 0x%08x, "
+                "preload 0x%08x",
+                rsd[4], uif(rsd[5]), uif(rsd[6]), uif(rsd[7]), rsd[8], rsd[9], rsd[10], rsd[11],
+                rsd[12]);
+      for (unsigned i = 0; i < r->rt_count; i++) {
+         const uint32_t *bd = rsd + pan_size(RENDERER_STATE) / 4 + i * pan_size(BLEND) / 4;
+         static const char *const modes[4] = {"shader", "opaque", "fixed-function", "off"};
+         mesa_logi("  blend %u: flags 0x%08x equation 0x%08x internal 0x%08x 0x%08x (%s%s)", i,
+                   bd[0], bd[1], bd[2], bd[3], modes[bd[2] & 3],
+                   (d->blend_shader_mask & BITFIELD_BIT(i)) ? ", blend shader" : "");
+      }
+   }
 }
 
 /* ---------------------------------------------------------------------- */

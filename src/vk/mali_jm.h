@@ -233,6 +233,7 @@ struct mali_jm_draw_tmpl {
    bool lines;
    /* Per state group. */
    uint64_t fs_rsd;         /* fragment RSD followed by the Blend descriptors (PIPELINE, BLEND, ZSD) */
+   void *fs_rsd_cpu;        /* its CPU view, for the MALISX2_DUMP_DRAW dump */
    uint64_t vs_fau, fs_fau; /* push uniform blocks (VS_FAU, FS_FAU) */
    uint64_t viewport;       /* Viewport descriptor (VIEWPORT) */
    uint64_t tiler, tsd;     /* layer 0's Tiler Context, the pass's Local Storage (PASS) */

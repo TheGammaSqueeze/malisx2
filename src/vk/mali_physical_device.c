@@ -388,8 +388,10 @@ dual_src_blend_for_arch(uint32_t arch)
    case 11:
       return true;
    case 7:
-      /* TODO v7: panvk_v7 reports dualSrcBlend through Bifrost blend
-       * shaders (panvk_vX_blend.c); off until that path is ported. */
+      /* Off by choice on the Mali-G52: panvk_v7 does it through Bifrost
+       * blend shaders (blend2_pan, the second source in the blend input
+       * registers), which this driver's blend shaders do not emit on v7
+       * yet; nothing of ours asks for it there. */
       return false;
    default:
       return false;
