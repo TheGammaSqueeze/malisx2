@@ -13,7 +13,8 @@
  * pipelines and a submit that waits on a fence and prints the device fault
  * record on a loss.
  *
- * Plain C11, static functions only (each test is one translation unit).
+ * Plain C11, static inline functions only (each test is one translation
+ * unit and uses a part of them).
  * Every failure prints why to stderr with the test's name in front; the
  * caller decides the exit status (2 before a VkDevice exists, 1 after).
  */
@@ -39,7 +40,7 @@
 
 #define G52_WAIT_NS (5ull * 1000 * 1000 * 1000)
 
-static const char *
+static inline const char *
 g52_result_str(VkResult r)
 {
    switch (r) {
@@ -63,7 +64,7 @@ g52_result_str(VkResult r)
    }
 }
 
-static int64_t
+static inline int64_t
 g52_now_ns(void)
 {
    struct timespec ts;
@@ -120,6 +121,10 @@ struct g52_fns {
    PFN_vkCmdBindPipeline CmdBindPipeline;
    PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
    PFN_vkCmdDraw CmdDraw;
+   /* Transfers (optional: NULL when the driver lacks them). */
+   PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+   PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
+   PFN_vkCmdBlitImage CmdBlitImage;
    PFN_vkCreateFence CreateFence;
    PFN_vkDestroyFence DestroyFence;
    PFN_vkResetFences ResetFences;
@@ -141,7 +146,7 @@ struct g52 {
    bool have_fault_ext;
 };
 
-static PFN_vkVoidFunction
+static inline PFN_vkVoidFunction
 g52_load_instance_fn(struct g52 *g, const char *name, bool *ok)
 {
    PFN_vkVoidFunction p = g->f.gipa(g->instance, name);
@@ -152,7 +157,7 @@ g52_load_instance_fn(struct g52 *g, const char *name, bool *ok)
    return p;
 }
 
-static PFN_vkVoidFunction
+static inline PFN_vkVoidFunction
 g52_load_device_fn(struct g52 *g, const char *name, const char *alt, bool required, bool *ok)
 {
    PFN_vkVoidFunction p = g->f.GetDeviceProcAddr(g->device, name);
@@ -166,7 +171,7 @@ g52_load_device_fn(struct g52 *g, const char *name, const char *alt, bool requir
    return p;
 }
 
-static void
+static inline void
 g52_print_fault(struct g52 *g)
 {
    const struct g52_fns *f = &g->f;
@@ -209,7 +214,7 @@ g52_print_fault(struct g52 *g)
 
 /* A memory type for `type_bits`: host-visible (host-coherent preferred)
  * when `host` is set, else the first one offered; -1 when there is none. */
-static int
+static inline int
 g52_pick_memory_type(const struct g52 *g, uint32_t type_bits, bool host, bool *coherent)
 {
    const VkPhysicalDeviceMemoryProperties *mp = &g->mem_props;
@@ -237,7 +242,7 @@ g52_pick_memory_type(const struct g52 *g, uint32_t type_bits, bool host, bool *c
  * creates the instance, device and queue. Returns 0, or the exit status
  * (2) after printing why.
  */
-static int
+static inline int
 g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *default_icd)
 {
    memset(g, 0, sizeof(*g));
@@ -416,6 +421,12 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
       g, "vkCmdEndRendering", "vkCmdEndRenderingKHR", true, &ok);
    f->GetImageSubresourceLayout = (PFN_vkGetImageSubresourceLayout)g52_load_device_fn(
       g, "vkGetImageSubresourceLayout", NULL, false, &ok);
+   f->CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)g52_load_device_fn(
+      g, "vkCmdCopyBufferToImage", NULL, false, &ok);
+   f->CmdCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)g52_load_device_fn(
+      g, "vkCmdCopyImageToBuffer", NULL, false, &ok);
+   f->CmdBlitImage = (PFN_vkCmdBlitImage)g52_load_device_fn(g, "vkCmdBlitImage", NULL, false,
+                                                             &ok);
    if (g->have_fault_ext)
       f->GetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)g52_load_device_fn(
          g, "vkGetDeviceFaultInfoEXT", NULL, false, &ok);
@@ -426,7 +437,7 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
    return 0;
 }
 
-static void
+static inline void
 g52_close(struct g52 *g)
 {
    if (g->device) {
@@ -460,7 +471,7 @@ struct g52_image {
  * (readback targets) are mapped and filled with `sentinel`; the others
  * take the first memory type the image accepts.
  */
-static bool
+static inline bool
 g52_image_create(struct g52 *g, struct g52_image *im, VkFormat format, uint32_t w, uint32_t h,
                  VkImageTiling tiling, VkImageUsageFlags usage, VkImageAspectFlags aspects,
                  bool host, uint8_t sentinel)
@@ -574,7 +585,7 @@ g52_image_refill(struct g52 *g, struct g52_image *im, uint8_t sentinel)
 
 /* Makes the GPU's writes visible to the mapping and returns pixel (x, y)
  * of a linear 4-byte-per-pixel image. */
-static void
+static inline void
 g52_image_sync_for_read(struct g52 *g, struct g52_image *im)
 {
    if (im->coherent)
@@ -587,14 +598,14 @@ g52_image_sync_for_read(struct g52 *g, struct g52_image *im)
    g->f.InvalidateMappedMemoryRanges(g->device, 1, &whole);
 }
 
-static const uint8_t *
+static inline const uint8_t *
 g52_image_pixel(const struct g52_image *im, uint32_t x, uint32_t y)
 {
    return (const uint8_t *)im->map + im->layout.offset + (size_t)y * im->layout.rowPitch +
           (size_t)x * 4;
 }
 
-static void
+static inline void
 g52_image_destroy(struct g52 *g, struct g52_image *im)
 {
    const struct g52_fns *f = &g->f;
@@ -615,7 +626,7 @@ struct g52_buffer {
 };
 
 /* A host-visible buffer holding `data`. */
-static bool
+static inline bool
 g52_buffer_create(struct g52 *g, struct g52_buffer *b, const void *data, size_t size,
                   VkBufferUsageFlags usage)
 {
@@ -674,7 +685,7 @@ g52_buffer_create(struct g52 *g, struct g52_buffer *b, const void *data, size_t 
    return true;
 }
 
-static void
+static inline void
 g52_buffer_destroy(struct g52 *g, struct g52_buffer *b)
 {
    if (b->buffer)
@@ -682,6 +693,132 @@ g52_buffer_destroy(struct g52 *g, struct g52_buffer *b)
    if (b->memory)
       g->f.FreeMemory(g->device, b->memory, NULL);
    memset(b, 0, sizeof(*b));
+}
+
+/*
+ * A host-visible buffer that stays mapped: the source of an upload into an
+ * image (vkCmdCopyBufferToImage) or the target of a readback
+ * (vkCmdCopyImageToBuffer). Filled with `fill` bytes.
+ */
+struct g52_hostbuf {
+   VkBuffer buffer;
+   VkDeviceMemory memory;
+   void *map;
+   VkDeviceSize size;
+   bool coherent;
+};
+
+static inline bool
+g52_hostbuf_create(struct g52 *g, struct g52_hostbuf *b, VkDeviceSize size, uint8_t fill)
+{
+   const struct g52_fns *f = &g->f;
+   memset(b, 0, sizeof(*b));
+   b->size = size;
+   const VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = size,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   VkResult r = f->CreateBuffer(g->device, &bci, NULL, &b->buffer);
+   if (r != VK_SUCCESS) {
+      fprintf(stderr, "%s: vkCreateBuffer (host buffer) failed: %s\n", g->prog, g52_result_str(r));
+      return false;
+   }
+   VkMemoryRequirements reqs;
+   f->GetBufferMemoryRequirements(g->device, b->buffer, &reqs);
+   int type = g52_pick_memory_type(g, reqs.memoryTypeBits, true, &b->coherent);
+   if (type < 0) {
+      fprintf(stderr, "%s: no host-visible memory type for the host buffer\n", g->prog);
+      return false;
+   }
+   const VkMemoryAllocateInfo mai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = reqs.size,
+      .memoryTypeIndex = (uint32_t)type,
+   };
+   r = f->AllocateMemory(g->device, &mai, NULL, &b->memory);
+   if (r == VK_SUCCESS)
+      r = f->BindBufferMemory(g->device, b->buffer, b->memory, 0);
+   if (r == VK_SUCCESS)
+      r = f->MapMemory(g->device, b->memory, 0, VK_WHOLE_SIZE, 0, &b->map);
+   if (r != VK_SUCCESS) {
+      fprintf(stderr, "%s: host buffer memory: %s\n", g->prog, g52_result_str(r));
+      return false;
+   }
+   memset(b->map, fill, (size_t)size);
+   return true;
+}
+
+/* After writing b->map from the CPU, before the GPU reads it. */
+static inline void
+g52_hostbuf_flush(struct g52 *g, struct g52_hostbuf *b)
+{
+   if (b->coherent)
+      return;
+   const VkMappedMemoryRange whole = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = b->memory,
+      .size = VK_WHOLE_SIZE,
+   };
+   g->f.FlushMappedMemoryRanges(g->device, 1, &whole);
+}
+
+/* After the GPU wrote the buffer, before the CPU reads b->map. */
+static inline void
+g52_hostbuf_invalidate(struct g52 *g, struct g52_hostbuf *b)
+{
+   if (b->coherent)
+      return;
+   const VkMappedMemoryRange whole = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = b->memory,
+      .size = VK_WHOLE_SIZE,
+   };
+   g->f.InvalidateMappedMemoryRanges(g->device, 1, &whole);
+}
+
+static inline void
+g52_hostbuf_destroy(struct g52 *g, struct g52_hostbuf *b)
+{
+   if (b->map)
+      g->f.UnmapMemory(g->device, b->memory);
+   if (b->buffer)
+      g->f.DestroyBuffer(g->device, b->buffer, NULL);
+   if (b->memory)
+      g->f.FreeMemory(g->device, b->memory, NULL);
+   memset(b, 0, sizeof(*b));
+}
+
+/* One tightly packed buffer <-> image copy of a whole 2D single-layer
+ * image's aspect (level 0, layer 0), recorded into cmd. */
+static inline void
+g52_cmd_copy_image(struct g52 *g, VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+                   uint32_t w, uint32_t h, VkBuffer buffer, bool to_image)
+{
+   const VkBufferImageCopy r = {
+      .bufferOffset = 0,
+      .imageSubresource = {aspect, 0, 0, 1},
+      .imageExtent = {w, h, 1},
+   };
+   if (to_image)
+      g->f.CmdCopyBufferToImage(cmd, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+   else
+      g->f.CmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &r);
+}
+
+/* A full barrier between transfers, fragment and compute work (the tests
+ * favour certainty over overlap). */
+static inline void
+g52_cmd_full_barrier(struct g52 *g, VkCommandBuffer cmd)
+{
+   const VkMemoryBarrier mb = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+   };
+   g->f.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -695,6 +832,7 @@ struct g52_pipeline_desc {
    VkFormat attrib_format;       /* location 0, binding 0 */
    uint32_t vertex_stride;
    uint32_t width, height;       /* the static viewport and scissor */
+   VkRect2D scissor;             /* the static scissor if its extent is not 0 */
    VkFormat color_format;
    VkFormat depth_format;        /* VK_FORMAT_UNDEFINED without */
    VkFormat stencil_format;
@@ -705,7 +843,7 @@ struct g52_pipeline_desc {
 
 /* One vertex + fragment pipeline for dynamic rendering, triangle list, no
  * culling, no dynamic state, no descriptor sets. Prints the creation time. */
-static VkPipeline
+static inline VkPipeline
 g52_pipeline_create(struct g52 *g, const struct g52_pipeline_desc *d, VkPipelineLayout layout,
                     const char *what)
 {
@@ -767,7 +905,8 @@ g52_pipeline_create(struct g52 *g, const struct g52_pipeline_desc *d, VkPipeline
       .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
    };
    const VkViewport viewport = {0.0f, 0.0f, (float)d->width, (float)d->height, 0.0f, 1.0f};
-   const VkRect2D scissor = {{0, 0}, {d->width, d->height}};
+   const VkRect2D scissor = d->scissor.extent.width && d->scissor.extent.height ?
+                               d->scissor : (VkRect2D){{0, 0}, {d->width, d->height}};
    const VkPipelineViewportStateCreateInfo vp = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
       .viewportCount = 1,
@@ -835,7 +974,7 @@ g52_pipeline_create(struct g52 *g, const struct g52_pipeline_desc *d, VkPipeline
 /* Recording and submission                                                */
 
 /* A layout transition of the whole image as a pipeline barrier. */
-static void
+static inline void
 g52_cmd_transition(struct g52 *g, VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspects,
                    VkImageLayout from, VkImageLayout to, VkPipelineStageFlags src_stage,
                    VkAccessFlags src_access, VkPipelineStageFlags dst_stage,
@@ -857,7 +996,7 @@ g52_cmd_transition(struct g52 *g, VkCommandBuffer cmd, VkImage image, VkImageAsp
 
 /* Submits `cmd` and waits for it. Returns the wait's result (VK_SUCCESS,
  * VK_TIMEOUT, or an error, with the fault record printed on a loss). */
-static VkResult
+static inline VkResult
 g52_submit_wait(struct g52 *g, VkCommandBuffer cmd, const char *what)
 {
    const struct g52_fns *f = &g->f;

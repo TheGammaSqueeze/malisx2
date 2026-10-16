@@ -99,3 +99,29 @@ executable(
   dependencies : [dep_dl],
   install : false,
 )
+
+# blit_g52: vkCmdBlitImage on the v7 blit pass: a 32x32 RGBA8 pattern
+# scaled 2x nearest and linear, mirrored on X and Y, converted to R5G6B5 and
+# back and to sRGB, blitted into a 37x29 rectangle of a prefilled image,
+# and the depth blits (D32, D24S8 depth and stencil), every image optimally
+# tiled and read back through vkCmdCopyImageToBuffer.
+executable(
+  'blit_g52',
+  files('blit_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DBLIT_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl, dep_m],
+  install : false,
+)
+
+# load_g52: loadOp LOAD of colour and depth with a render area of 37x29 at
+# (5, 3) and one triangle drawn: the frame shader preloads and the border
+# loads of partly covered tiles, outside the area untouched.
+executable(
+  'load_g52',
+  files('load_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DLOAD_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)
