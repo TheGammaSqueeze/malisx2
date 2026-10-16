@@ -125,6 +125,7 @@ struct g52_fns {
    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
    PFN_vkCmdBlitImage CmdBlitImage;
+   PFN_vkCmdClearAttachments CmdClearAttachments;
    PFN_vkCreateFence CreateFence;
    PFN_vkDestroyFence DestroyFence;
    PFN_vkResetFences ResetFences;
@@ -427,6 +428,8 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
       g, "vkCmdCopyImageToBuffer", NULL, false, &ok);
    f->CmdBlitImage = (PFN_vkCmdBlitImage)g52_load_device_fn(g, "vkCmdBlitImage", NULL, false,
                                                              &ok);
+   f->CmdClearAttachments = (PFN_vkCmdClearAttachments)g52_load_device_fn(
+      g, "vkCmdClearAttachments", NULL, false, &ok);
    if (g->have_fault_ext)
       f->GetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)g52_load_device_fn(
          g, "vkGetDeviceFaultInfoEXT", NULL, false, &ok);

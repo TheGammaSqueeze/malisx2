@@ -29,7 +29,13 @@
  *   with depth 0.5, x <= 32 the loaded colour and depth; outside the area
  *   both images untouched. A depth preload that did not run reads as all
  *   green (a cleared or farther tile buffer) or no green at all (a nearer
- *   one).
+ *   one);
+ *
+ *   in-pass clear (colour loaded): the full-framebuffer triangle in green,
+ *   then vkCmdClearAttachments to blue over (10, 6) .. (30, 16), which on
+ *   v7 is a Tiler job drawing that rectangle after the triangle. Inside the
+ *   area the rectangle must be blue and the rest green; outside the area
+ *   untouched.
  *
  * Both images are read back through vkCmdCopyImageToBuffer. Colour allows
  * one LSB (dithering) and counts such pixels apart; depth is exact.
@@ -48,7 +54,7 @@
  * Usage: load_g52 [path/to/libvulkan_malisx2.so] [--linear]
  *   The path defaults to $MALISX2_ICD, then to LOAD_G52_DEFAULT_ICD.
  *
- * Exit status: 0 PASS (both cases); 1 FAIL once the device exists; 2 the
+ * Exit status: 0 PASS (all three cases); 1 FAIL once the device exists; 2 the
  * program did not get as far as a VkDevice.
  *
  * Driver log: MESA_LOG=file MESA_LOG_LEVEL=info; MALISX2_DUMP_DRAW=1 dumps
@@ -139,6 +145,20 @@ in_area(int x, int y)
    return x >= AREA_X && x < AREA_X + AREA_W && y >= AREA_Y && y < AREA_Y + AREA_H;
 }
 
+/* The in-pass clear's rectangle, inside the area. */
+#define CLEAR_X 10
+#define CLEAR_Y 6
+#define CLEAR_W 20
+#define CLEAR_H 10
+
+static bool
+in_clear(int x, int y)
+{
+   return x >= CLEAR_X && x < CLEAR_X + CLEAR_W && y >= CLEAR_Y && y < CLEAR_Y + CLEAR_H;
+}
+
+enum load_case { CASE_COLOR, CASE_DEPTH, CASE_CLEAR };
+
 /* The colour prefill and the depth prefill. */
 static void
 pattern(int x, int y, uint8_t out[4])
@@ -212,10 +232,12 @@ cmp_px(const uint8_t *got, const uint8_t *want)
  * prefill), loaded (inside, not drawn: the prefill) and drawn (green).
  */
 static bool
-run_case(bool depth, struct g52_image *color, struct g52_image *zimg, VkPipeline pipe,
+run_case(enum load_case lc, struct g52_image *color, struct g52_image *zimg, VkPipeline pipe,
          struct g52_buffer *vbuf)
 {
-   const char *name = depth ? "depth LOAD" : "colour LOAD";
+   const bool depth = lc == CASE_DEPTH;
+   const char *name = lc == CASE_DEPTH ? "depth LOAD" :
+                      lc == CASE_CLEAR ? "in-pass clear" : "colour LOAD";
    printf("case %s: render area %dx%d at (%d, %d)\n", name, AREA_W, AREA_H, AREA_X, AREA_Y);
 
    struct g52_hostbuf up_c = {0}, up_z = {0}, rb_c = {0}, rb_z = {0};
@@ -281,7 +303,16 @@ run_case(bool depth, struct g52_image *color, struct g52_image *zimg, VkPipeline
    const VkDeviceSize zero = 0;
    g.f.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
    g.f.CmdBindVertexBuffers(cmd, 0, 1, &vbuf->buffer, &zero);
-   g.f.CmdDraw(cmd, 3, 1, depth ? 3 : 0, 0);
+   g.f.CmdDraw(cmd, 3, 1, lc == CASE_COLOR ? 0 : 3, 0);
+   if (lc == CASE_CLEAR) {
+      const VkClearAttachment clear = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .colorAttachment = 0,
+         .clearValue.color.float32 = {0.0f, 0.0f, 1.0f, 1.0f},
+      };
+      const VkClearRect rect = {{{CLEAR_X, CLEAR_Y}, {CLEAR_W, CLEAR_H}}, 0, 1};
+      g.f.CmdClearAttachments(cmd, 1, &clear, 1, &rect);
+   }
    g.f.CmdEndRendering(cmd);
 
    transition(color->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -315,16 +346,26 @@ run_case(bool depth, struct g52_image *color, struct g52_image *zimg, VkPipeline
    struct counts c = {0};
    unsigned n_out = 0, n_loaded = 0, n_drawn = 0, n_sentinel = 0;
    static const uint8_t green[4] = {0, 255, 0, 255};
+   static const uint8_t blue[4] = {0, 0, 255, 255};
+   unsigned n_cleared = 0, cleared_bad = 0;
    for (int y = 0; y < IMG_H; y++) {
       for (int x = 0; x < IMG_W; x++) {
          const uint8_t *got = (const uint8_t *)rb_c.map + (y * IMG_W + x) * 4;
          uint8_t pre[4];
          pattern(x, y, pre);
          n_sentinel += got[0] == 0xa5 && got[1] == 0xa5 && got[2] == 0xa5 && got[3] == 0xa5;
-         /* Drawn: the left half (colour case) or where z 0.5 passes LESS
-          * against the prefill (depth case: x > 32). */
-         const bool drawn = in_area(x, y) && (depth ? x > 32 : x < 32);
-         if (!in_area(x, y)) {
+         /* Drawn: the left half (colour case), where z 0.5 passes LESS
+          * against the prefill (depth case: x > 32), or the whole area but
+          * the cleared rectangle (clear case). */
+         const bool drawn = in_area(x, y) && (lc == CASE_DEPTH ? x > 32 :
+                                              lc == CASE_CLEAR ? !in_clear(x, y) : x < 32);
+         if (lc == CASE_CLEAR && in_clear(x, y)) {
+            n_cleared++;
+            if (cmp_px(got, blue)) {
+               cleared_bad++;
+               show(&c, "cleared", x, y, got, blue);
+            }
+         } else if (!in_area(x, y)) {
             n_out++;
             const int d = cmp_px(got, pre);
             if (d == 2) {
@@ -355,7 +396,12 @@ run_case(bool depth, struct g52_image *color, struct g52_image *zimg, VkPipeline
           "%u drawn (%u wrong), %u still hold the readback sentinel\n",
           n_out, c.outside_bad, c.outside_off1, n_loaded, c.loaded_bad, c.loaded_off1, n_drawn,
           c.drawn_bad, n_sentinel);
-   ok = !c.outside_bad && !c.loaded_bad && !c.drawn_bad;
+   if (lc == CASE_CLEAR)
+      printf("  cleared rectangle: %u pixels (%u wrong)\n", n_cleared, cleared_bad);
+   ok = !c.outside_bad && !c.loaded_bad && !c.drawn_bad && !cleared_bad;
+   if (lc == CASE_CLEAR && cleared_bad == n_cleared)
+      printf("  the rectangle is not blue: the in-pass clear's Tiler job drew nothing, or drew "
+             "before the triangle (mali_jm_cmd_render.c mali_v7_cmd_meta_quads)\n");
    if (c.loaded_bad && c.loaded_bad == n_loaded)
       printf("  every loaded pixel is wrong: the colour preload did not run or read the wrong "
              "image (frame shader DCD, its Texture, mali_cmd_meta_gfx.c meta_fs_dcd)\n");
@@ -513,8 +559,14 @@ main(int argc, char **argv)
    printf("  colour image: 64x64 R8G8B8A8_UNORM %s, depth image: 64x64 D32_SFLOAT optimal\n",
           linear_color ? "linear" : "optimal");
 
-   pass = run_case(false, &color, &zimg, pipe_c, &vbuf);
-   pass &= run_case(true, &color, &zimg, pipe_z, &vbuf);
+   pass = run_case(CASE_COLOR, &color, &zimg, pipe_c, &vbuf);
+   pass &= run_case(CASE_DEPTH, &color, &zimg, pipe_z, &vbuf);
+   if (g.f.CmdClearAttachments) {
+      pass &= run_case(CASE_CLEAR, &color, &zimg, pipe_c, &vbuf);
+   } else {
+      printf("FAIL in-pass clear: the driver lacks vkCmdClearAttachments\n");
+      pass = false;
+   }
 
 done:
    if (pipe_c)
