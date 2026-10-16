@@ -20,6 +20,7 @@
 #include "vk_pipeline_layout.h"
 
 #include "mali_arch.h"
+#include "mali_memory.h"
 
 /* ---------------------------------------------------------------------- */
 /* Binding                                                                 */
@@ -165,6 +166,17 @@ MALI_PER_ARCH(CmdBindIndexBuffer2KHR)(VkCommandBuffer commandBuffer, VkBuffer bu
       d->ib.addr = 0;
       d->ib.size = 0;
    }
+#if PAN_ARCH < 9
+   /* Bifrost runs the vertex shader over the index range of an indexed
+    * draw, which the v7 draw finds by reading the indices on the CPU
+    * (mali_jm_cmd_draw.c): the buffer's CPU view, when its memory has one
+    * (every host-visible type; not an imported dma-buf or the lazily
+    * allocated type). */
+   const struct mali_buffer *mb = buf ? container_of(buf, struct mali_buffer, vk) : NULL;
+   cmd->jm.draw.ib_cpu = (mb && mb->mem && mb->mem->bo.cpu)
+                            ? (const uint8_t *)mb->mem->bo.cpu + mb->mem_offset + offset
+                            : NULL;
+#endif
    d->dirty |= MALI_GFX_DIRTY_INDEX;
 }
 

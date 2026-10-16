@@ -388,6 +388,12 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
    sv->vs.first_vertex = d->first_vertex;
    sv->vs.base_instance = d->base_instance;
    sv->vs.noperspective_varyings = p->bind.noperspective;
+#if PAN_ARCH < 9
+   /* Bifrost (mali_shader.h): the plain draw's value; an indexed draw
+    * overrides it with the smallest index plus the vertex offset
+    * (mali_jm_cmd_draw.c). */
+   sv->vs.raw_vertex_offset = d->first_vertex;
+#endif
    memcpy(sv->fs.blend_descs, d->blend_descs, sizeof(sv->fs.blend_descs));
 
    /* Input attachments: colour targets through the tile buffer with their
@@ -630,14 +636,13 @@ mali_gfx_fs_srt(struct mali_cmd_buffer *cmd)
 #else /* PAN_ARCH < 9 */
 
 /*
- * TODO v7: Bifrost has no resource tables. A draw's vertex stage takes
- * Attribute Buffer and Attribute descriptors (one buffer per vertex
- * binding, one attribute per location, panvk_v7 panvk_vX_cmd_draw.c
- * prepare_vs_attribs / emit_attrib_bufs) and both stages take Varying
- * Buffer and Varying descriptors (prepare_varyings, emit_varying_descs),
- * uniform-buffer tables, texture and sampler tables
- * (panvk_vX_cmd_desc_state.c). Until that is ported the builders return 0,
- * which their callers treat as failure.
+ * Bifrost has no resource tables: the v7 draw (mali_jm_cmd_draw.c) builds
+ * its Attribute Buffer, Attribute and Varying descriptors itself and does
+ * not call these. What is left of the v9 model here is the uniform-buffer,
+ * texture, sampler and image tables a shader with descriptor sets would
+ * need (panvk_v7 panvk_vX_cmd_desc_state.c), which are not ported: such
+ * shaders are refused at compile time (mali_shader.c v7_fixup_info), so
+ * these are never reached on v7.
  */
 static inline uint64_t
 mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
@@ -722,6 +727,8 @@ mali_gfx_blend_shader_for(struct mali_cmd_buffer *cmd, const struct mali_graphic
    assert(!(addr & 15));
    return addr;
 }
+
+#if PAN_ARCH >= 9
 
 /*
  * The Blend descriptors of the current pipeline for the current render
@@ -868,8 +875,210 @@ mali_gfx_blend(struct mali_cmd_buffer *cmd, uint32_t *count_out)
    return m.gpu;
 }
 
+#else /* PAN_ARCH < 9 */
+
+#include "util/blend.h"
+
+/* The register file format a fragment shader's colour output has, for the
+ * Bifrost fixed-function blender's conversion (pan_blend_type_from_nir). */
+static inline enum mali_register_file_format
+mali_gfx_blend_register_format(nir_alu_type type)
+{
+   switch (type) {
+   case nir_type_float16: return MALI_REGISTER_FILE_FORMAT_F16;
+   case nir_type_int16: return MALI_REGISTER_FILE_FORMAT_I16;
+   case nir_type_uint16: return MALI_REGISTER_FILE_FORMAT_U16;
+   case nir_type_int32: return MALI_REGISTER_FILE_FORMAT_I32;
+   case nir_type_uint32: return MALI_REGISTER_FILE_FORMAT_U32;
+   case nir_type_float32:
+   default: return MALI_REGISTER_FILE_FORMAT_F32;
+   }
+}
+
+/* pan_blend.c is_factor_01: is the factor `val` (0 or 1) when the source
+ * alpha is `srca`? The factors carry Gallium's invert bit. */
+static inline bool
+mali_gfx_blend_factor_is(enum pipe_blendfactor f, unsigned val, unsigned srca)
+{
+   switch (f) {
+   case PIPE_BLENDFACTOR_ZERO: return val == 0;
+   case PIPE_BLENDFACTOR_ONE: return val == 1;
+   case PIPE_BLENDFACTOR_SRC_ALPHA: return val == srca;
+   case PIPE_BLENDFACTOR_INV_SRC_ALPHA: return val == 1 - srca;
+   default: return false;
+   }
+}
+
+/* pan_blend_alpha_zero_nop: a source alpha of 0 leaves the destination. */
+static inline bool
+mali_gfx_blend_alpha_zero_nop(const struct mali_blend_eq *eq)
+{
+   if (eq->rgb_func != PIPE_BLEND_ADD && eq->rgb_func != PIPE_BLEND_REVERSE_SUBTRACT)
+      return false;
+   if ((eq->color_mask & 0x8) && !mali_gfx_blend_factor_is(eq->alpha_dst, 1, 0))
+      return false;
+   if (eq->color_mask & 0x7) {
+      if (!mali_gfx_blend_factor_is(eq->rgb_dst, 1, 0))
+         return false;
+      if (!mali_gfx_blend_factor_is(eq->rgb_src, 0, 0))
+         return false;
+   }
+   return true;
+}
+
+/* pan_blend_alpha_one_store: a source alpha of 1 stores the source. */
+static inline bool
+mali_gfx_blend_alpha_one_store(const struct mali_blend_eq *eq)
+{
+   if (eq->rgb_func != PIPE_BLEND_ADD && eq->rgb_func != PIPE_BLEND_SUBTRACT)
+      return false;
+   if (eq->color_mask != 0xf)
+      return false;
+   return mali_gfx_blend_factor_is(eq->rgb_src, 1, 1) &&
+          mali_gfx_blend_factor_is(eq->alpha_src, 1, 1) &&
+          mali_gfx_blend_factor_is(eq->rgb_dst, 0, 1) &&
+          mali_gfx_blend_factor_is(eq->alpha_dst, 0, 1);
+}
+
+/*
+ * The v7 shape of mali_gfx_blend (panvk_v7 panvk_vX_blend.c
+ * blend_emit_descs / emit_blend_desc at PAN_ARCH < 9): `count` Blend
+ * descriptors packed into `out`, which the draw puts right behind the
+ * fragment Renderer State Descriptor (the v7 Draw has no blend pointer;
+ * the hardware reads them from there). Differences from the v9 one:
+ *
+ *  - the fixed-function conversion names the fragment shader's output
+ *    register format (the Bifrost blender converts from the register
+ *    file), and carries the alpha-zero-nop / alpha-one-store shortcuts;
+ *  - the internal words the shader reads come from the hardware's blend
+ *    FAU slots, not the FAU block (mali_shader.c lower_sysvals), so
+ *    gfx.draw.blend_descs is filled for the record only;
+ *  - blend shaders are not ported (mali_blend.c): a target that needs one
+ *    stores the source with the colour mask applied, once logged.
+ */
+static inline bool
+mali_gfx_blend_v7(struct mali_cmd_buffer *cmd, void *out, uint32_t count)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_graphics_pipeline *p = d->pipeline;
+   const struct mali_gfx_baked *bk = &p->baked;
+   const struct mali_render_state *r = &cmd->gfx.render;
+   const float *consts = cmd->vk.dynamic_graphics_state.cb.blend_constants;
+
+   /* The fixed-function constant (all ones: none yet), and which targets
+    * would need a blend shader (panvk blend_needs_shader). */
+   bool wants_shader[MALI_MAX_RTS] = {false};
+   uint32_t ff_constant = ~0u;
+   for (uint32_t i = 0; i < count && i < bk->rt_count; i++) {
+      const struct mali_blend_rt_baked *rt = &bk->blend[i];
+      const bool have_rt = i < r->desc.rt_count && r->desc.rt[i].image;
+      if (!p->fs || rt->mode == MALI_BLEND_RT_OFF || !have_rt)
+         continue;
+      wants_shader[i] = rt->mode == MALI_BLEND_RT_SHADER;
+      if (rt->mode == MALI_BLEND_RT_FIXED_FUNCTION && rt->constant_mask) {
+         const uint32_t c = mali_gfx_pack_blend_constant(r->desc.rt[i].format,
+                                                         consts[ffs(rt->constant_mask) - 1]);
+         if (!mali_gfx_homogeneous_constant(rt->constant_mask, consts) ||
+             (ff_constant != ~0u && c != ff_constant))
+            wants_shader[i] = true;
+         else
+            ff_constant = c;
+      }
+   }
+   if (ff_constant == ~0u)
+      ff_constant = 0;
+
+   d->blend_shader_mask = 0;
+   memset(d->blend_descs, 0, sizeof(d->blend_descs));
+   struct mali_blend_packed off;
+   pan_pack(&off, BLEND, cfg) {
+      cfg.enable = false;
+      cfg.internal.mode = MALI_BLEND_MODE_OFF;
+   }
+   for (unsigned loc = 0; loc < MALI_MAX_RTS; loc++)
+      d->blend_descs[loc] = off.opaque[2] | (uint64_t)off.opaque[3] << 32;
+
+   struct mali_blend_packed descs[MALI_MAX_RTS];
+   assert(count <= MALI_MAX_RTS);
+   for (uint32_t i = 0; i < count; i++) {
+      struct mali_blend_packed *o = &descs[i];
+      const struct mali_blend_rt_baked *rt = i < bk->rt_count ? &bk->blend[i] : NULL;
+      const bool have_rt = i < r->desc.rt_count && r->desc.rt[i].image;
+
+      if (!p->fs || !rt || rt->mode == MALI_BLEND_RT_OFF || !have_rt) {
+         *o = off;
+         continue;
+      }
+      if (wants_shader[i]) {
+         static bool warned;
+         if (!warned) {
+            warned = true;
+            MALI_TODO_V7("blend shaders");
+            mesa_logw("malisx2: a render target needs a blend shader; the colour is stored "
+                      "unblended on the Mali-G52 until they are ported");
+         }
+      }
+
+      const enum pipe_format fmt = r->desc.rt[i].format;
+      const bool opaque = wants_shader[i] || rt->mode == MALI_BLEND_RT_OPAQUE;
+      const nir_alu_type out_type =
+         rt->shader_location < MALI_MAX_RTS ? p->fs->info.bifrost.blend[rt->shader_location].type
+                                            : nir_type_float32;
+      pan_pack(o, BLEND, cfg) {
+         cfg.srgb = util_format_is_srgb(fmt);
+         cfg.load_destination = rt->load_destination && !opaque;
+         cfg.round_to_fb_precision = true;
+         cfg.blend_constant = ff_constant;
+         cfg.internal.mode = opaque ? MALI_BLEND_MODE_OPAQUE : MALI_BLEND_MODE_FIXED_FUNCTION;
+         cfg.internal.fixed_function.num_comps = 4;
+         cfg.internal.fixed_function.conversion.memory_format =
+            GENX(pan_dithered_format_from_pipe_format)(fmt, false);
+         if (cfg.internal.mode == MALI_BLEND_MODE_FIXED_FUNCTION &&
+             (cfg.internal.fixed_function.conversion.memory_format & 0xff) ==
+                MALI_RGB_COMPONENT_ORDER_RGB1) {
+            /* Fixed-function blending does not take RGB1 (panvk). */
+            cfg.internal.fixed_function.conversion.memory_format &= ~0xff;
+            cfg.internal.fixed_function.conversion.memory_format |=
+               MALI_RGB_COMPONENT_ORDER_RGBA;
+         }
+         cfg.internal.fixed_function.rt = i;
+         cfg.internal.fixed_function.conversion.register_format =
+            mali_gfx_blend_register_format(out_type);
+         if (!opaque) {
+            cfg.internal.fixed_function.alpha_zero_nop = mali_gfx_blend_alpha_zero_nop(&rt->eq);
+            cfg.internal.fixed_function.alpha_one_store = mali_gfx_blend_alpha_one_store(&rt->eq);
+         }
+      }
+      /* The equation word: the baked one, or a plain store with the colour
+       * mask for a target whose blend shader is missing. */
+      if (wants_shader[i]) {
+         struct mali_blend_equation_packed replace;
+         pan_pack(&replace, BLEND_EQUATION, cfg) {
+            cfg.rgb.a = MALI_BLEND_OPERAND_A_SRC;
+            cfg.rgb.b = MALI_BLEND_OPERAND_B_SRC;
+            cfg.rgb.c = MALI_BLEND_OPERAND_C_ZERO;
+            cfg.alpha.a = MALI_BLEND_OPERAND_A_SRC;
+            cfg.alpha.b = MALI_BLEND_OPERAND_B_SRC;
+            cfg.alpha.c = MALI_BLEND_OPERAND_C_ZERO;
+            cfg.color_mask = rt->eq.color_mask;
+         }
+         o->opaque[1] = replace.opaque[0];
+      } else {
+         o->opaque[1] = rt->equation;
+      }
+      if (rt->shader_location < MALI_MAX_RTS)
+         d->blend_descs[rt->shader_location] = o->opaque[2] | (uint64_t)o->opaque[3] << 32;
+   }
+   memcpy(out, descs, count * sizeof(descs[0]));
+   return true;
+}
+
+#endif /* PAN_ARCH < 9 */
+
 /* ---------------------------------------------------------------------- */
 /* Graphics: viewport, index type                                          */
+
+#if PAN_ARCH >= 9
 
 /* The packed Scissor (64 bits): the viewport rectangle clipped by the
  * scissor (panvk v11 prepare_vp); the hardware clips to the box. */
@@ -901,7 +1110,6 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
    maxx = maxx > minx ? maxx - 1 : maxx;
    maxy = maxy > miny ? maxy - 1 : maxy;
 
-#if PAN_ARCH >= 9
    struct mali_scissor_packed s;
    pan_pack(&s, SCISSOR, cfg) {
       cfg.scissor_minimum_x = CLAMP(minx, 0, UINT16_MAX);
@@ -910,14 +1118,59 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
       cfg.scissor_maximum_y = CLAMP(maxy, 0, UINT16_MAX);
    }
    return s.opaque[0] | (uint64_t)s.opaque[1] << 32;
-#else
-   /* TODO v7: no Scissor descriptor on Bifrost; the box and the depth
-    * range go into a Viewport descriptor the Draw points at (panvk_v7
-    * panvk_vX_cmd_draw.c prepare_vp). */
-   MALI_TODO_V7("the scissor box");
-   return 0;
-#endif
 }
+
+#else /* PAN_ARCH < 9 */
+
+/*
+ * v7 has no Scissor descriptor and no depth clamps in the Draw: the box and
+ * the depth range are a 32-byte Viewport descriptor the Tiler job's Draw
+ * points at (panvk_v7 jm/panvk_vX_cmd_draw.c panvk_emit_viewport). The box
+ * is the viewport rectangle clipped by the scissor and, as on v9, by the
+ * render area; the depth range is the viewport's (the sysvals carry the
+ * viewport transform, panvk_depth_range without the clamp-range
+ * extension). The float viewport fields are left zero, as panvk and
+ * Mesa's gallium driver leave them. Returns the descriptor's address, 0 on
+ * failure.
+ */
+static inline uint64_t
+mali_gfx_viewport_desc(struct mali_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const VkViewport *vp = &dyn->vp.viewports[0];
+   const VkRect2D *sc = &dyn->vp.scissors[0];
+   const struct mali_render_state *r = &cmd->gfx.render;
+
+   int minx = (int)vp->x;
+   int maxx = (int)(vp->x + vp->width);
+   int miny = (int)MIN2(vp->y, vp->y + vp->height);
+   int maxy = (int)MAX2(vp->y, vp->y + vp->height);
+   minx = MAX2(sc->offset.x, minx);
+   miny = MAX2(sc->offset.y, miny);
+   maxx = MIN2(sc->offset.x + (int)sc->extent.width, maxx);
+   maxy = MIN2(sc->offset.y + (int)sc->extent.height, maxy);
+   minx = MIN2(minx, (int)r->desc.width);
+   miny = MIN2(miny, (int)r->desc.height);
+   maxx = MIN2(maxx, (int)r->desc.width);
+   maxy = MIN2(maxy, (int)r->desc.height);
+   maxx = maxx > minx ? maxx - 1 : maxx;
+   maxy = maxy > miny ? maxy - 1 : maxy;
+
+   struct mali_ptr p = mali_cmd_alloc(cmd, pan_size(VIEWPORT), pan_alignment(VIEWPORT));
+   if (!p.cpu)
+      return 0;
+   pan_cast_and_pack(p.cpu, VIEWPORT, cfg) {
+      cfg.scissor_minimum_x = CLAMP(minx, 0, UINT16_MAX);
+      cfg.scissor_minimum_y = CLAMP(miny, 0, UINT16_MAX);
+      cfg.scissor_maximum_x = CLAMP(maxx, 0, UINT16_MAX);
+      cfg.scissor_maximum_y = CLAMP(maxy, 0, UINT16_MAX);
+      cfg.minimum_z = MIN2(vp->minDepth, vp->maxDepth);
+      cfg.maximum_z = MAX2(vp->minDepth, vp->maxDepth);
+   }
+   return p.gpu;
+}
+
+#endif /* PAN_ARCH < 9 */
 
 static inline enum mali_index_type
 mali_gfx_index_type(uint32_t size)
@@ -1075,9 +1328,11 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
    return true;
 }
 
+#if PAN_ARCH >= 9
 /* MALI_GFX_DIRTY_BLEND: *out = the Blend descriptors' address | their
  * count (v11 BLEND_DESC register, v9 Draw descriptor Blend word). Marks
- * the FS FAU dirty. */
+ * the FS FAU dirty. (v7 packs its Blend descriptors behind the fragment
+ * RSD instead: mali_gfx_blend_v7 from mali_jm_cmd_draw.c.) */
 static inline bool
 mali_gfx_build_blend(struct mali_cmd_buffer *cmd, uint64_t *out)
 {
@@ -1089,6 +1344,7 @@ mali_gfx_build_blend(struct mali_cmd_buffer *cmd, uint64_t *out)
    cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_FS_FAU;
    return true;
 }
+#endif
 
 /* MALI_GFX_DIRTY_VS_FAU / FS_FAU: *out = the FAU word of the stage's
  * block. sv is the draw's sysvals (mali_gfx_fill_sysvals). */

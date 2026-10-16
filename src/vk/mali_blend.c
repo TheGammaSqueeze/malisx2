@@ -64,6 +64,7 @@ struct blend_cache {
    struct hash_table *ht;        /* key -> struct blend_shader */
 };
 
+#if PAN_ARCH >= 9
 static uint32_t
 key_hash(const void *key)
 {
@@ -75,6 +76,7 @@ key_equal(const void *a, const void *b)
 {
    return !memcmp(a, b, sizeof(struct mali_blend_shader_key));
 }
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* NIR                                                                     */
@@ -198,6 +200,7 @@ MALI_PER_ARCH(blend_shader_nir)(const struct mali_blend_shader_key *key)
    return b->shader;
 }
 
+#if PAN_ARCH >= 9
 /* The blend constants are the first four 32-bit FAU words of the fragment
  * shader that calls the blend shader (panvk lower_load_blend_const). */
 static bool
@@ -212,6 +215,7 @@ lower_blend_const(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    nir_def_replace(&intr->def, c);
    return true;
 }
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Compile and cache                                                       */
@@ -260,6 +264,7 @@ MALI_PER_ARCH(blend_shaders_prepare)(struct mali_device *dev, struct mali_graphi
    }
 }
 
+#if PAN_ARCH >= 9
 static VkResult
 compile_blend_shader(struct mali_device *dev, const struct mali_blend_shader_key *key,
                      struct mali_bo_ref *code)
@@ -303,11 +308,23 @@ compile_blend_shader(struct mali_device *dev, const struct mali_blend_shader_key
    util_dynarray_fini(&bin);
    return VK_SUCCESS;
 }
+#endif /* PAN_ARCH >= 9 */
 
 VkResult
 MALI_PER_ARCH(blend_shader_get)(struct mali_device *dev, const struct mali_blend_shader_key *key,
                                 uint64_t *addr)
 {
+#if PAN_ARCH < 9
+   /* TODO v7: Bifrost blend shaders have their own calling convention (the
+    * fragment shader's BLEND jumps to the shader and it returns to the
+    * return address in the Blend descriptor, panvk_v7 panvk_vX_blend.c
+    * emit_blend_desc, fs_info->bifrost.blend[].return_offset), and the
+    * shader above is written for the v9+ convention. The draw stores the
+    * colour unblended for such a target (mali_cmd_state.h
+    * mali_gfx_blend_v7). */
+   MALI_TODO_V7("blend shaders");
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+#else
    VkResult result = VK_SUCCESS;
 
    simple_mtx_lock(&dev->meta_lock);
@@ -344,6 +361,7 @@ MALI_PER_ARCH(blend_shader_get)(struct mali_device *dev, const struct mali_blend
    }
    simple_mtx_unlock(&dev->meta_lock);
    return result;
+#endif /* PAN_ARCH >= 9 */
 }
 
 unsigned

@@ -31,6 +31,9 @@
 #if PAN_ARCH >= 10
 #include "mali_cs.h"
 #endif
+#if PAN_ARCH < 9
+#include "mali_rsd_v7.h"
+#endif
 #include "mali_vk.h"
 
 #include <stdlib.h>
@@ -162,6 +165,19 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_noperspective_varyings_pan:
       val = load_sysval(b, graphics, bit_size, vs.noperspective_varyings);
       break;
+#if PAN_ARCH < 9
+   case nir_intrinsic_load_raw_vertex_offset:
+      /* Bifrost: gl_VertexIndex = raw vertex id + this (pan_nir_lower_vertex_id). */
+      val = load_sysval(b, graphics, bit_size, vs.raw_vertex_offset);
+      break;
+   case nir_intrinsic_load_view_index:
+   case nir_intrinsic_load_layer_id:
+      /* v7 has no frame argument: panvk takes the layer from a sysval. This
+       * driver refuses multiview and draws into layer 0 of a layered pass
+       * only (mali_jm_cmd_draw.c), so the layer a fragment shader sees is 0. */
+      val = nir_imm_zero(b, 1, 32);
+      break;
+#else
    case nir_intrinsic_load_view_index:
       if (!ctx->state || !ctx->state->mv || ctx->state->mv->view_mask == 0) {
          val = nir_imm_zero(b, 1, 32);
@@ -175,12 +191,21 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_layer_id:
       val = nir_extract_u8_imm(b, nir_u2u32(b, nir_load_frame_arg_pan(b)), 0);
       break;
+#endif /* PAN_ARCH >= 9 */
    case nir_intrinsic_load_printf_buffer_address:
       val = load_sysval(b, common, bit_size, printf_buffer_address);
       break;
+#if PAN_ARCH < 9
+   case nir_intrinsic_load_blend_descriptor_pan:
+      /* Bifrost reads the Blend descriptor's internal words from the
+       * hardware's blend FAU slots (BIR_FAU_BLEND_n, filled from the RSD's
+       * blend descriptors): the backend handles the intrinsic itself. */
+      return false;
+#else
    case nir_intrinsic_load_blend_descriptor_pan:
       val = load_sysval(b, graphics, bit_size, fs.blend_descs[nir_intrinsic_base(intr)]);
       break;
+#endif
    case nir_intrinsic_load_input_attachment_target_pan: {
       const struct vk_input_attachment_location_state *ial =
          ctx->state ? ctx->state->ial : NULL;
@@ -1236,6 +1261,61 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
 }
 
 /* ---------------------------------------------------------------------- */
+/* Bifrost: what the Renderer State Descriptor counts, and what is not    */
+/* ported                                                                  */
+
+#if PAN_ARCH < 9
+/*
+ * After the Bifrost compile (panvk_vX_shader.c panvk_compile_nir at
+ * PAN_ARCH < 9): the descriptor counts the RSD carries come from the
+ * driver's tables, not from NIR's num_ubos / textures_used, and the vertex
+ * attribute count is the highest generic location read plus one (holes
+ * included), since the attribute table has one descriptor per location.
+ *
+ * The v7 descriptor tables (uniform buffers, textures, samplers, images,
+ * the dynamic SSBO address table) and the constant data buffer are not
+ * ported yet: a shader that needs any of them is refused here, with the
+ * TODO v7 log line, rather than compiled against the v9 resource handles
+ * the descriptor lowering produced (which Bifrost would read as table
+ * indices and fault on). Push constants, vertex attributes and varyings
+ * are the whole Bifrost resource model this build supports.
+ */
+static VkResult
+v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader *s)
+{
+   const char *missing = NULL;
+   if (s->desc.used_set_mask || s->desc.dyn_bufs.count)
+      missing = "descriptor sets (uniform buffer, texture, sampler and image tables)";
+   else if (s->info.texture_count || s->info.sampler_count)
+      missing = "texture and sampler tables";
+   else if (s->info.images_used)
+      missing = "image attribute tables";
+   else if (nir->constant_data_size)
+      missing = "the constant data buffer";
+   else if (s->info.ubo_count)
+      missing = "uniform buffer tables";
+   if (missing) {
+      MALI_TODO_V7(missing);
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "%s shader needs %s, which the Bifrost (v7) build does not provide yet",
+                       mesa_shader_stage_name(s->stage), missing);
+   }
+
+   s->info.ubo_count = 0;
+   s->info.texture_count = 0;
+   s->info.sampler_count = 0;
+   if (s->stage == MESA_SHADER_VERTEX) {
+      const uint32_t generic =
+         (s->info.attributes_read & VERT_BIT_GENERIC_ALL) >> VERT_ATTRIB_GENERIC0;
+      s->info.attribute_count = util_last_bit(generic);
+      /* bi_should_idvs() honours no_idvs (shader_compile). */
+      assert(!s->info.vs.idvs && !s->info.vs.secondary_enable);
+   }
+   return VK_SUCCESS;
+}
+#endif /* PAN_ARCH < 9 */
+
+/* ---------------------------------------------------------------------- */
 /* Upload                                                                  */
 
 #if PAN_ARCH >= 9
@@ -1409,25 +1489,33 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
 
 #if PAN_ARCH < 9
    /*
-    * v7 has no Shader Program Descriptor: the Renderer State Descriptor of
-    * a draw and the Draw section of a Compute job point at the code
-    * itself, with the stage's properties (register allocation, flush to
-    * zero, helper threads) packed next to the pointer (panvk_v7
-    * panvk_vX_shader.c panvk_per_arch(shader_upload) /
-    * panvk_vX_cmd_draw.c emit_rsd). So on v7 spd[] holds the entry
-    * addresses the RSD builder will take: the main entry, the vertex
-    * entries with and without the point-size write, the varying shader.
-    * Without IDVS the Bifrost compiler reports no secondary entry and a
-    * zero no_psiz_offset, so a vertex shader has one entry.
+    * v7 has no Shader Program Descriptor: a draw's jobs point at Renderer
+    * State Descriptors (panvk_v7 panvk_vX_shader.c panvk_shader_upload at
+    * PAN_ARCH < 9). The vertex shader's RSD depends on the shader alone,
+    * so it is built here, in the pipeline descriptor pool, and spd[] holds
+    * its address in both position slots (no point-size variant: Bifrost
+    * writes the point size through a varying buffer, the Tiler job's
+    * Primitive Size section says whether it is read); there is no varying
+    * shader (no IDVS, mali_shader_compile). A fragment shader's RSD also
+    * carries the depth/stencil, multisample and pixel-kill state and is
+    * followed by the Blend descriptors, so it is built per pipeline and
+    * draw (mali_pipeline_state.c, mali_jm_cmd_draw.c): spd[MALI_SPD_MAIN]
+    * is the code address those take. A compute shader's RSD is the
+    * dispatch's business (TODO v7, mali_jm_cmd_dispatch.c).
     */
    if (s->stage != MESA_SHADER_VERTEX) {
       s->spd[MALI_SPD_MAIN] = s->code.gpu_va;
       return VK_SUCCESS;
    }
-   s->spd[MALI_SPD_POS_POINTS] = s->code.gpu_va;
-   s->spd[MALI_SPD_POS_TRIANGLES] = s->code.gpu_va + s->info.vs.no_psiz_offset;
-   s->spd[MALI_SPD_VARYING] =
-      s->info.vs.secondary_enable ? s->code.gpu_va + s->info.vs.secondary_offset : 0;
+   if (mali_bo_pool_alloc(&dev->desc_pool, pan_size(RENDERER_STATE),
+                          pan_alignment(RENDERER_STATE), &s->spd_mem) != MALI_KBASE_SUCCESS)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   pan_cast_and_pack(s->spd_mem.cpu, RENDERER_STATE, cfg) {
+      mali_v7_rsd_shader(&s->info, s->code.gpu_va, &cfg);
+   }
+   s->spd[MALI_SPD_POS_POINTS] = s->spd_mem.gpu_va;
+   s->spd[MALI_SPD_POS_TRIANGLES] = s->spd_mem.gpu_va;
+   s->spd[MALI_SPD_VARYING] = 0;
    return VK_SUCCESS;
 #else
    const unsigned spd_count = s->stage == MESA_SHADER_VERTEX ? 3 : 1;
@@ -1553,6 +1641,14 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       .view_mask = (state && state->rp && state->mv) ? state->mv->view_mask : 0,
       .robust_modes = robust_modes,
       .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
+#if PAN_ARCH < 9
+      /* Bifrost: one plain vertex shader per Vertex job, no Index-Driven
+       * Vertex Shading pair (the v7 draw path is Vertex + Tiler jobs,
+       * mali_jm_cmd_draw.c; panvk's v7 path is built the same way when
+       * the vertex shader writes gl_PointSize, and IDVS is otherwise its
+       * option, not a requirement). */
+      .no_idvs = true,
+#endif
    };
    struct pan_varying_layout varying_layout;
 
@@ -1681,6 +1777,12 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
 
    if (stage == MESA_SHADER_FRAGMENT)
       s->desc.needs_varying_descs = s->info.bifrost.uses_ld_var;
+
+#if PAN_ARCH < 9
+   result = v7_fixup_info(dev, nir, s);
+   if (result != VK_SUCCESS)
+      goto fail;
+#endif
 
    ralloc_free(nir);
    nir = NULL;

@@ -192,6 +192,7 @@ struct mali_jm_reset {
    uint32_t size;
 };
 
+#if PAN_ARCH >= 9
 /*
  * The draw template (mali_jm_cmd_draw.c): a CPU-side image of the next
  * Malloc Vertex job in cached memory. The draw state's dirty groups
@@ -206,6 +207,40 @@ struct mali_jm_draw_tmpl {
    uint32_t packet_stride;  /* Allocation's vertex packet stride, for the heap estimate */
    bool secondary;          /* the varying shader runs (Primitive "Secondary Shader") */
 };
+#else
+/*
+ * The v7 (Bifrost) draw state (mali_jm_cmd_draw.c): the descriptors a
+ * Vertex + Tiler job pair points at that outlive one draw, kept by the
+ * dirty group that builds them. A draw packs its two jobs from these and
+ * its own counts.
+ */
+#define MALI_V7_VARY_BUF_GENERAL 0
+#define MALI_V7_VARY_BUF_POSITION 1
+#define MALI_V7_VARY_BUF_PSIZ 2
+#define MALI_V7_VARY_BUF_COUNT 3
+
+struct mali_jm_draw_tmpl {
+   /* Per pipeline (MALI_GFX_DIRTY_PIPELINE). */
+   uint32_t prim0;          /* Primitive word 0 without index type and provoking vertex */
+   uint32_t dcd0;           /* Draw word 0: the baked culling / front face / flat bits */
+   uint64_t vs_rsd;         /* the vertex shader's Renderer State Descriptor */
+   uint64_t fs_code;        /* the fragment shader's code address, 0 without one */
+   uint64_t vs_vary;        /* varying Attribute descriptors the vertex shader writes */
+   uint64_t fs_vary;        /* ... and the fragment shader reads */
+   uint32_t vary_stride[MALI_V7_VARY_BUF_COUNT];
+   enum mesa_prim prim;
+   bool writes_psiz;        /* points with a shader-written size */
+   bool lines;
+   /* Per state group. */
+   uint64_t fs_rsd;         /* fragment RSD followed by the Blend descriptors (PIPELINE, BLEND, ZSD) */
+   uint64_t vs_fau, fs_fau; /* push uniform blocks (VS_FAU, FS_FAU) */
+   uint64_t viewport;       /* Viewport descriptor (VIEWPORT) */
+   uint64_t tiler, tsd;     /* layer 0's Tiler Context, the pass's Local Storage (PASS) */
+   int32_t raw_vertex_offset;   /* the value the VS FAU block was built with */
+   /* The bound index buffer's CPU view (mali_cmd_state.c), NULL when none. */
+   const uint8_t *ib_cpu;
+};
+#endif
 
 /* Inside the v9 command buffer: what submit reads, and the open batch. */
 struct mali_jm_cmd {

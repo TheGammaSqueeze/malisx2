@@ -23,3 +23,16 @@ executable(
   dependencies : [dep_dl],
   install : false,
 )
+
+# draw_g52: the same image cleared to black, then one full-screen triangle
+# drawn into it through a vertex + fragment pipeline (a Vertex job and a
+# Tiler job on the Bifrost path), read back and checked for the triangle
+# colour. The SPIR-V is embedded (see the file comment).
+executable(
+  'draw_g52',
+  files('draw_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DDRAW_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)

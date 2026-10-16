@@ -95,6 +95,13 @@ struct mali_graphics_sysvals {
       int32_t first_vertex;
       int32_t base_instance;
       uint32_t noperspective_varyings;
+      /* v7 only (it sits in what was padding, so the other words keep
+       * their offsets): what the Bifrost vertex shader adds to the raw
+       * hardware vertex id to get gl_VertexIndex (pan_nir_lower_vertex_id,
+       * panvk's vs.raw_vertex_offset): firstVertex for a plain draw, the
+       * smallest index plus vertexOffset for an indexed one, the same
+       * value as the Draw descriptor's offset_start. */
+      int32_t raw_vertex_offset;
    } vs;
    struct {
       mali_aligned_u64 blend_descs[MALI_MAX_RTS];
