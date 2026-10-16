@@ -28,7 +28,9 @@
  *   I  D32_SFLOAT 2x nearest (depth (x + 32y + 1) / 2048), exact, read back
  *      through a depth copy;
  *   J  D24_UNORM_S8_UINT 2x nearest, mirrored on Y, depth and stencil in
- *      one region: depth within 1 (24-bit units), stencil exact.
+ *      one region: depth within 1 (24-bit units), stencil exact;
+ *   K  RGBA8 -> R4G4B4A4 1:1 (azahar's RGBA4 surfaces), within one 4-bit
+ *      step.
  *
  * The colour cases allow one LSB per channel (the float round trip through
  * the shader and the blender); neighbouring texels of the pattern differ by
@@ -40,7 +42,7 @@
  *
  * Usage: blit_g52 [path/to/libvulkan_malisx2.so] [--only=X]
  *   The path defaults to $MALISX2_ICD, then to BLIT_G52_DEFAULT_ICD.
- *   --only=X runs case X alone (A..J).
+ *   --only=X runs case X alone (A..K; E and F run together).
  *
  * Exit status: 0 PASS (every case run passed); 1 FAIL once the device
  * exists; 2 the program did not get as far as a VkDevice.
@@ -497,6 +499,63 @@ run_565_cases(struct g52_image *src)
    return pass;
 }
 
+/* K: RGBA8 -> R4G4B4A4_UNORM_PACK16 1:1. */
+static bool
+run_rgba4_case(struct g52_image *src)
+{
+   if (!want_case('K'))
+      return true;
+   printf("case K: RGBA8 -> R4G4B4A4 1:1\n");
+   if (!format_blits(VK_FORMAT_R4G4B4A4_UNORM_PACK16, "R4G4B4A4_UNORM_PACK16")) {
+      printf("SKIP K: the device offers no R4G4B4A4 blits\n");
+      return true;
+   }
+   struct g52_image d;
+   struct g52_hostbuf rb = {0};
+   bool ok = make(&d, VK_FORMAT_R4G4B4A4_UNORM_PACK16, SRC_W, SRC_H, VK_IMAGE_ASPECT_COLOR_BIT) &&
+             g52_hostbuf_create(&g, &rb, SRC_W * SRC_H * 2, 0xa5) && begin();
+   if (ok) {
+      to_layout(d.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+      blit(src->image, d.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, SRC_W, SRC_H, 0, 0, SRC_W, SRC_H,
+           VK_FILTER_NEAREST);
+      to_layout(d.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      g52_cmd_copy_image(&g, cmd, d.image, VK_IMAGE_ASPECT_COLOR_BIT, SRC_W, SRC_H, rb.buffer,
+                         false);
+      ok = end_and_run("RGBA8 -> R4G4B4A4");
+   }
+   bool pass = ok;
+   if (ok) {
+      g52_hostbuf_invalidate(&g, &rb);
+      const uint16_t *v4 = rb.map;
+      struct tally t = {0};
+      for (int y = 0; y < SRC_H; y++) {
+         for (int x = 0; x < SRC_W; x++) {
+            uint8_t s8[4];
+            src_texel(x, y, s8);
+            const uint16_t v = v4[y * SRC_W + x];
+            /* R4G4B4A4_UNORM_PACK16: R in bits 15..12, A in 3..0. */
+            const int got[4] = {v >> 12, (v >> 8) & 15, (v >> 4) & 15, v & 15};
+            int want[4];
+            bool okp = true;
+            for (int c = 0; c < 4; c++) {
+               want[c] = (int)lroundf(s8[c] * 15.0f / 255.0f);
+               okp &= abs(got[c] - want[c]) <= 1;
+            }
+            if (!okp)
+               bad_pixel(&t, "R4G4B4A4", x, y, got, want, 4);
+         }
+      }
+      pass = verdict('K', "RGBA8 -> R4G4B4A4 1:1", &t, SRC_W * SRC_H);
+   } else {
+      printf("FAIL K: not run to the end\n");
+   }
+   g52_hostbuf_destroy(&g, &rb);
+   g52_image_destroy(&g, &d);
+   return pass;
+}
+
 /* I: D32_SFLOAT, 2x nearest. */
 static bool
 run_d32_case(void)
@@ -744,6 +803,7 @@ main(int argc, char **argv)
                           H_Y1, VK_FILTER_NEAREST, expect_h, 1, true);
    pass &= run_d32_case();
    pass &= run_d24s8_case();
+   pass &= run_rgba4_case(&src);
 
    g52_hostbuf_destroy(&g, &up);
    g52_image_destroy(&g, &src);
