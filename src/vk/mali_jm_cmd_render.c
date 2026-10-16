@@ -66,6 +66,8 @@
 
 #include "mali_cmd_state.h"
 
+#include <stdlib.h>
+
 #include "vk_log.h"
 
 #include "mali_measure.h"
@@ -431,6 +433,26 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
          MALI_PER_ARCH(fb_fill_tsd)(cmd, r);
          if (unlikely(r->measure_vt))
             mali_jm_measure_end(cmd, r->measure_vt, &cmd->jm.cur.vtc);
+#if PAN_ARCH < 9
+         /* The v7 draw dump's counterpart for the pass (mali_jm_cmd_draw.c
+          * dump_enabled): the FBD the fragment job runs and the tiler
+          * pointer it carries, which must be the draws' context. */
+         {
+            static int dump = -1;
+            if (dump < 0) {
+               const char *d = getenv("MALISX2_DUMP_DRAW");
+               const char *l = getenv("MESA_LOG_LEVEL");
+               dump = (d && *d && strcmp(d, "0") != 0) || (l && strcmp(l, "debug") == 0);
+            }
+            if (dump)
+               mesa_logi("malisx2 v7 pass %u end: FBD 0x%llx (tagged, %u bytes per layer, %u "
+                         "layers), its tiler pointer 0x%llx (0 when nothing tiled), TSD 0x%llx "
+                         "(tls %u bytes), bounds %u,%u..%u,%u, %u draws, heap slot %d",
+                         cmd->passes, (unsigned long long)fbds, fbd_size, MAX2(r->desc.layer_count, 1),
+                         (unsigned long long)r->tiler, (unsigned long long)r->tsd, r->tls_size,
+                         r->minx, r->miny, r->maxx, r->maxy, r->draws, cmd->jm.cur.heap_slot);
+         }
+#endif
          fragment_jobs(cmd, r, fbds, fbd_size);
          cmd->jm.cur.passes++;
       }

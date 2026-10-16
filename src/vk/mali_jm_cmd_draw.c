@@ -125,6 +125,9 @@
 
 #include "mali_rsd_v7.h"
 
+#include <inttypes.h>
+#include <stdlib.h>
+
 /* ---------------------------------------------------------------------- */
 /* Mesa helpers (pan_encoder.h, MIT, Collabora), not includable here       */
 /* without the kmod layer                                                  */
@@ -620,8 +623,13 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       t->prim = bk->prim;
       t->lines = u_reduced_prim(bk->prim) == MESA_PRIM_LINES;
       t->writes_psiz = bk->prim == MESA_PRIM_POINTS && p->vs->info.vs.writes_point_size;
-      t->vs_rsd = bd->spd[MALI_SPD_POS_TRIANGLES];
+      /* The bind block's three words are the baked position, varying and
+       * fragment entries (mali_pipeline.c fill_bind): on v7 the first is
+       * the vertex RSD (one for points and triangles alike), the second is
+       * 0 (no varying shader), the third the fragment code address. */
+      t->vs_rsd = bd->spd[0];
       t->fs_code = bd->spd[2];
+      assert(t->vs_rsd);
    }
    if (d->dirty & (MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_BLEND | MALI_GFX_DIRTY_ZSD)) {
       if (!build_fs_rsd(cmd, p, bk, t))
@@ -731,6 +739,88 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
    *min_out = min;
    *max_out = max;
    return true;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Debug dump                                                              */
+
+/* MALISX2_DUMP_DRAW=1 or MESA_LOG_LEVEL=debug: every GPU address a v7 draw
+ * hands the hardware, one info-level block per draw, so a translation
+ * fault's address can be matched against them without a second run. */
+static bool
+dump_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *d = getenv("MALISX2_DUMP_DRAW");
+      const char *l = getenv("MESA_LOG_LEVEL");
+      enabled = (d && *d && strcmp(d, "0") != 0) || (l && strcmp(l, "debug") == 0);
+   }
+   return enabled;
+}
+
+static void
+dump_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, const struct draw_data *dd,
+          struct mali_ptr vj, uint16_t vindex, struct mali_ptr tj, uint16_t tindex,
+          uint32_t instance_size)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_render_state *r = &cmd->gfx.render;
+   const struct mali_jm_draw_tmpl *t = &cmd->jm.draw;
+   const struct mali_graphics_pipeline *p = d->pipeline;
+   const struct mali_jm_batch *b = &cmd->jm.cur;
+   struct mali_jm_device *jd = cmd->dev->jm;
+   uint64_t heap_base = 0, heap_size = 0;
+
+   if (b->heap_slot >= 0) {
+      heap_base = jd->heap.bo[b->heap_slot].gpu_va;
+      heap_size = jd->heap.bo[b->heap_slot].size;
+   }
+
+   mesa_logi("malisx2 v7 draw %u: %u vertices (range %u, padded %u) x %u instances, "
+             "%s, offset_start %d, instance_size %u, indices 0x%" PRIx64,
+             cmd->draws, di->count, dd->vertex_range, dd->padded_count, di->instance_count,
+             di->indexed ? "indexed" : "plain", dd->raw_vertex_offset, instance_size, dd->indices);
+   mesa_logi("  vertex job 0x%" PRIx64 " (index %u), tiler job 0x%" PRIx64 " (index %u), "
+             "vtc chain first 0x%" PRIx64 ", %u jobs",
+             vj.gpu, vindex, tj.gpu, tindex, b->vtc.first, b->vtc.jobs);
+   mesa_logi("  vertex Draw: state (VS RSD) 0x%" PRIx64 ", attributes 0x%" PRIx64
+             ", attribute_buffers 0x%" PRIx64 ", varyings 0x%" PRIx64
+             ", varying_buffers 0x%" PRIx64 ", push_uniforms 0x%" PRIx64 " (%u words), "
+             "thread_storage 0x%" PRIx64,
+             t->vs_rsd, dd->attribs, dd->attrib_bufs, t->vs_vary, dd->vary_bufs, t->vs_fau,
+             p->vs->fau.total_count, t->tsd);
+   mesa_logi("  tiler Draw: state (FS RSD + %u blend) 0x%" PRIx64 " (fs code 0x%" PRIx64
+             "), position 0x%" PRIx64 ", varyings 0x%" PRIx64 ", varying_buffers 0x%" PRIx64
+             ", viewport 0x%" PRIx64 ", push_uniforms 0x%" PRIx64 " (%u words), "
+             "thread_storage 0x%" PRIx64 ", psiz 0x%" PRIx64,
+             r->rt_count, t->fs_rsd, t->fs_code, dd->position, t->fs_vary,
+             t->fs_vary ? dd->vary_bufs : 0, t->viewport, t->fs_fau,
+             p->fs ? p->fs->fau.total_count : 0, t->tsd, dd->psiz);
+   const struct vk_vertex_input_state *vi = d->vi;
+   for (unsigned i = 0; i < util_last_bit(vi->bindings_valid); i++) {
+      if (vi->bindings_valid & BITFIELD_BIT(i))
+         mesa_logi("  vertex binding %u: buffer 0x%" PRIx64 " size %" PRIu64 " stride %u "
+                   "(attribute buffer entry %u, pointer aligned down to 0x%" PRIx64 ")",
+                   i, d->vb[i].addr, d->vb[i].size, d->vi_strides[i], 2 * i,
+                   (uint64_t)(d->vb[i].addr & ~63ull));
+   }
+   for (unsigned i = 0; i < MALI_V7_VARY_BUF_COUNT; i++)
+      mesa_logi("  varying buffer %u (%s): stride %u, size %" PRIu64 "%s", i,
+                i == MALI_V7_VARY_BUF_GENERAL ? "general" :
+                i == MALI_V7_VARY_BUF_POSITION ? "position" : "point size",
+                t->vary_stride[i], (uint64_t)dd->padded_count * di->instance_count * t->vary_stride[i],
+                i == MALI_V7_VARY_BUF_POSITION ? "" : ", pointer in the buffer table");
+   mesa_logi("  tiler context 0x%" PRIx64 " (%u layers, fb %ux%u), heap descriptor 0x%" PRIx64
+             ", heap slot %d: base 0x%" PRIx64 " size 0x%" PRIx64 " (bottom = base, top = base + "
+             "0x%llx), TSD 0x%" PRIx64 ", layer 0 context used by this draw 0x%" PRIx64,
+             r->tiler, r->td_count, r->desc.width, r->desc.height, b->heap_desc, b->heap_slot,
+             heap_base, heap_size, (unsigned long long)MIN2(MALI_JM_HEAP_CHUNK, heap_size),
+             r->tsd, t->tiler);
+   mesa_logi("  primitive word 0 0x%08x (prim %u, provoking first %u), draw word 0 bits 0x%04x, "
+             "vs attribute_count %u, vs varyings %u, fs varyings %u",
+             t->prim0, t->prim, r->first_provoking_vertex, t->dcd0, p->vs->info.attribute_count,
+             p->vs->info.varyings.formats.count, p->fs ? p->fs->info.varyings.formats.count : 0);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -871,6 +961,11 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       }
       dcd.opaque[0] |= t->dcd0;
       memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
+
+      if (unlikely(dump_enabled()))
+         dump_draw(cmd, di, &dd, vj, vertex_index, tj, c->index, instance_size);
+   } else if (unlikely(dump_enabled())) {
+      dump_draw(cmd, di, &dd, vj, vertex_index, (struct mali_ptr){0}, 0, instance_size);
    }
 
    /* Heap use: polygon-list entries for the primitives, as the v9 guess. */
