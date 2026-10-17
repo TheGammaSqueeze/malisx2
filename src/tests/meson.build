@@ -125,3 +125,17 @@ executable(
   dependencies : [dep_dl],
   install : false,
 )
+
+# afbc_g52: AFBC colour images on v7, every case run twice in child
+# processes, with MALISX2_V7_AFBC=1 and =0: which images are AFBC, buffer
+# and image copies into and out of them per format, a blended draw and a
+# partial LOAD pass, sampling an AFBC pattern and an AFBC render target,
+# blits AFBC -> linear -> AFBC, and eight AFBC targets in one pass.
+executable(
+  'afbc_g52',
+  files('afbc_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DAFBC_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl, dep_m],
+  install : false,
+)
