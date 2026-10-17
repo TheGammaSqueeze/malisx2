@@ -766,9 +766,11 @@ get_ubo_copy(struct mali_cmd_buffer *cmd)
 
 bool
 mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const struct mali_shader *s,
-                 const struct mali_desc_state *desc, uint64_t fau_va)
+                 const struct mali_desc_state *desc, uint64_t fau_va, uint16_t dep, uint16_t *index)
 {
    const uint32_t n = s->fau.ubo_push_count;
+   if (index)
+      *index = dep;
    if (!n || !fau_va)
       return true;
    const struct mali_shader *copy = get_ubo_copy(cmd);
@@ -813,9 +815,11 @@ mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const str
       return false;
 
    struct mali_ptr job =
-      mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), false, 0);
+      mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), false, dep);
    if (!job.cpu)
       return false;
+   if (index)
+      *index = c->index;
    mali_v7_compute_invocation(pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), local, groups);
    pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
       cfg.job_task_split = mali_v7_compute_task_split(local);

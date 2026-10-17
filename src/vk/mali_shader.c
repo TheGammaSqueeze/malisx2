@@ -589,25 +589,34 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
  * Bifrost: the same idea as v11 (a fragment shader's constant-offset reads
  * of dynamic uniform buffers become FAU reads), with the words copied into
  * the draw's FAU block by a small Compute job in the vtc chain
- * (mali_jm_cmd_draw.c, "Uniform buffer words in FAU"): the job manager has
- * no command-stream loads and stores, and the fragment job that reads the
- * FAU block starts only once the whole vtc atom has run. Each such read is
- * otherwise a LOAD.ubo, a load/store-unit message per warp; azahar's
- * fragment shaders are bound by them (the PICA combiner constants and
- * lighting parameters).
+ * (mali_jm_desc_v7.c mali_v7_ubo_copy): the job manager has no
+ * command-stream loads and stores. The fragment job that reads a fragment
+ * shader's FAU block starts only once the whole vtc atom has run; a
+ * vertex shader's copy job is a dependency of its Vertex job. Each such
+ * read is otherwise a LOAD.ubo, a load/store-unit message per warp;
+ * azahar's shaders are bound by them (the PICA float uniforms of its
+ * vertex shaders, the combiner constants and lighting parameters of its
+ * fragment shaders).
  *
- * Partial: when the words of every load do not fit, the loads are taken in
- * program order while their words fit, and the others stay loads.
+ * Partial: when the words of every load do not fit, the most often read
+ * ranges (counted per load instruction) are taken first while their words
+ * fit, and the other loads stay loads.
  */
 #define V7_UBO_PUSH_FAU_LIMIT 48
-#define V7_UBO_PUSH_MAX_BYTES 2048
+#define V7_UBO_PUSH_MAX_BYTES 4096
 #define V7_UBO_PUSH_WORDS_PER_BUF (V7_UBO_PUSH_MAX_BYTES / 8)
+
+/* A word range some loads read, and how many load instructions read it. */
+struct v7_ubo_push_range {
+   uint16_t first, last;
+   uint32_t uses;
+};
 
 struct v7_ubo_push_ctx {
    struct mali_shader *s;
    uint32_t first_index;   /* UBO table index of dynamic uniform buffer 0 */
-   uint32_t budget;        /* words that may still be pushed */
    BITSET_DECLARE(used, MALI_MAX_DYNAMIC_UNIFORM_BUFFERS * V7_UBO_PUSH_WORDS_PER_BUF);
+   struct util_dynarray ranges;   /* struct v7_ubo_push_range */
    bool lower;
 };
 
@@ -645,14 +654,14 @@ v7_ubo_push_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return false;
 
    if (!ctx->lower) {
-      /* Take the load if its new words fit. */
-      unsigned need = 0;
-      for (unsigned w = first; w <= last; w++)
-         need += !BITSET_TEST(ctx->used, w);
-      if (need <= ctx->budget) {
-         BITSET_SET_RANGE(ctx->used, first, last);
-         ctx->budget -= need;
+      util_dynarray_foreach(&ctx->ranges, struct v7_ubo_push_range, r) {
+         if (r->first == first && r->last == last) {
+            r->uses++;
+            return false;
+         }
       }
+      util_dynarray_append_typed(&ctx->ranges, struct v7_ubo_push_range,
+                                 ((struct v7_ubo_push_range){first, last, 1}));
       return false;
    }
 
@@ -680,22 +689,51 @@ v7_ubo_push_enabled(void)
    return state;
 }
 
+/* More uses first; the earlier range first among equals (stable by the
+ * collection order, which the first/last pair breaks ties of). */
+static int
+v7_ubo_push_range_cmp(const void *a, const void *b)
+{
+   const struct v7_ubo_push_range *x = a, *y = b;
+   if (x->uses != y->uses)
+      return x->uses > y->uses ? -1 : 1;
+   return (int)x->first - (int)y->first;
+}
+
 static void
 lower_ubo_push(nir_shader *nir, struct mali_shader *s)
 {
    s->fau.ubo_push_start = s->fau.total_count;
    s->fau.ubo_push_count = 0;
 
-   if (nir->info.stage != MESA_SHADER_FRAGMENT || !s->v7.dyn_ubo_count ||
-       !v7_ubo_push_enabled() || s->fau.total_count >= V7_UBO_PUSH_FAU_LIMIT)
+   if ((nir->info.stage != MESA_SHADER_FRAGMENT && nir->info.stage != MESA_SHADER_VERTEX) ||
+       !s->v7.dyn_ubo_count || !v7_ubo_push_enabled() ||
+       s->fau.total_count >= V7_UBO_PUSH_FAU_LIMIT)
       return;
 
    struct v7_ubo_push_ctx ctx = {
       .s = s,
       .first_index = s->v7.count[MALI_V7_DESC_TABLE_UBO],
-      .budget = MIN2(MALI_MAX_UBO_PUSH_FAUS, V7_UBO_PUSH_FAU_LIMIT - s->fau.total_count),
    };
+   util_dynarray_init(&ctx.ranges, NULL);
    nir_shader_intrinsics_pass(nir, v7_ubo_push_intr, nir_metadata_all, &ctx);
+
+   /* The most used ranges while their words fit. */
+   unsigned budget = MIN2(MALI_MAX_UBO_PUSH_FAUS, V7_UBO_PUSH_FAU_LIMIT - s->fau.total_count);
+   const unsigned nr = util_dynarray_num_elements(&ctx.ranges, struct v7_ubo_push_range);
+   if (nr)
+      qsort(util_dynarray_begin(&ctx.ranges), nr, sizeof(struct v7_ubo_push_range),
+            v7_ubo_push_range_cmp);
+   util_dynarray_foreach(&ctx.ranges, struct v7_ubo_push_range, r) {
+      unsigned need = 0;
+      for (unsigned w = r->first; w <= r->last; w++)
+         need += !BITSET_TEST(ctx.used, w);
+      if (need <= budget) {
+         BITSET_SET_RANGE(ctx.used, r->first, r->last);
+         budget -= need;
+      }
+   }
+   util_dynarray_fini(&ctx.ranges);
 
    const unsigned n = BITSET_COUNT(ctx.used);
    if (!n)

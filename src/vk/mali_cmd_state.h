@@ -1386,6 +1386,11 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
     * whenever its sets or dynamic offsets change. */
    if ((d->dirty & MALI_GFX_DIRTY_FS_SRT) && p->fs && p->fs->fau.ubo_push_count)
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
+#if PAN_ARCH < 9
+   /* On Bifrost vertex shaders have them too (mali_shader.c). */
+   if ((d->dirty & MALI_GFX_DIRTY_VS_SRT) && p->vs->fau.ubo_push_count)
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+#endif
 
    r->tls_size = MAX2(r->tls_size, bd->tls_size);
    return true;

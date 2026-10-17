@@ -390,9 +390,9 @@ struct draw_data {
     * buffer index the vertex shader's image Attributes start at. */
    bool vs_copy, fs_copy;
    uint32_t vs_img_buf_offset;
-   /* The fragment shader's FAU block was rebuilt and has uniform buffer
-    * words to copy in (mali_v7_ubo_copy). */
-   bool ubo_copy;
+   /* The fragment (vertex) shader's FAU block was rebuilt and has uniform
+    * buffer words to copy in (mali_v7_ubo_copy). */
+   bool ubo_copy, vs_ubo_copy;
 };
 
 /*
@@ -793,6 +793,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
        * the block built here has as many words. */
       assert(!v || (v >> 56) == DIV_ROUND_UP(p->vs->info.fau.count, 2));
       t->vs_fau = v & BITFIELD64_MASK(56);
+      dd->vs_ubo_copy = p->vs->fau.ubo_push_count && t->vs_fau;
       t->raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_FAU) {
@@ -1347,11 +1348,17 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
        !mali_v7_desc_copy(cmd, c, p->vs, &cmd->gfx.desc, &t->vs_tab, dd.vs_img_buf_offset,
                           &vs_copy))
       return;
+   /* The vertex shader's uniform buffer words, which the Vertex job reads
+    * from its FAU block: a job between the descriptor copy and it. */
+   uint16_t vs_dep = vs_copy;
+   if (dd.vs_ubo_copy &&
+       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
+      return;
    if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &cmd->gfx.desc, &t->fs_tab, 0, &fs_copy))
       return;
 
    struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
-                                            pending && !vs_copy && fs_copy, vs_copy);
+                                            pending && !vs_dep && fs_copy, vs_dep);
    if (!vj.cpu)
       return;
    const uint16_t vertex_index = c->index;
@@ -1441,7 +1448,7 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 
       /* Uniform buffer words into the fragment shader's FAU block: read by
        * the fragment job, after the whole vtc atom. */
-      if (dd.ubo_copy && !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau))
+      if (dd.ubo_copy && !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, NULL))
          return;
 
       if (unlikely(dump_enabled()))

@@ -65,7 +65,17 @@
  * set bound again at offset DYN_STRIDE (add = (0.125, 0, 0.0625, 0)), so
  * the bottom half must read 32 and 16 more in red and blue. That covers
  * the uniform buffer words a Bifrost fragment shader takes from FAU and
- * the descriptor tables kept across a rebind with new dynamic offsets:
+ * the descriptor tables kept across a rebind with new dynamic offsets. The
+ * vertex shader likewise reads its uv scale and bias from a dynamic uniform
+ * buffer (binding 3) at offset 1488, k = (1, 1, 1, 1) in both of its
+ * blocks, so a word read wrong moves the texture:
+ *
+ *   binding 3: layout(set = 0, binding = 3) uniform VDyn {
+ *                 vec4 pad[93];
+ *                 vec4 k;
+ *              } vdyn;
+ *              uv = pos * 0.5 * vdyn.k.xy + 0.5 * vdyn.k.zw;
+ *
  *
  *   binding 2: layout(set = 0, binding = 2) uniform Dyn {
  *                 vec4 pad[71];
@@ -125,7 +135,7 @@ static const float clear_rgba[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 /* Shaders (see the file comment)                                          */
 
 static const uint32_t vert_spv[] = {
-   0x07230203, 0x00010300, 0x0008000b, 0x00000022, 0x00000000, 0x00020011,
+   0x07230203, 0x00010300, 0x0008000b, 0x00000030, 0x00000000, 0x00020011,
    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000000,
    0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000012, 0x0000001c,
@@ -137,35 +147,53 @@ static const uint32_t vert_spv[] = {
    0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000000b, 0x00000003,
    0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d,
    0x00000000, 0x00030005, 0x00000012, 0x00736f70, 0x00030005, 0x0000001c,
-   0x00007675, 0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b,
-   0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x0000000b, 0x00000001,
-   0x0000000b, 0x00000001, 0x00050048, 0x0000000b, 0x00000002, 0x0000000b,
-   0x00000003, 0x00050048, 0x0000000b, 0x00000003, 0x0000000b, 0x00000004,
-   0x00040047, 0x00000012, 0x0000001e, 0x00000000, 0x00040047, 0x0000001c,
-   0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
-   0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
-   0x00000006, 0x00000004, 0x00040015, 0x00000008, 0x00000020, 0x00000000,
-   0x0004002b, 0x00000008, 0x00000009, 0x00000001, 0x0004001c, 0x0000000a,
-   0x00000006, 0x00000009, 0x0006001e, 0x0000000b, 0x00000007, 0x00000006,
-   0x0000000a, 0x0000000a, 0x00040020, 0x0000000c, 0x00000003, 0x0000000b,
-   0x0004003b, 0x0000000c, 0x0000000d, 0x00000003, 0x00040015, 0x0000000e,
-   0x00000020, 0x00000001, 0x0004002b, 0x0000000e, 0x0000000f, 0x00000000,
-   0x00040017, 0x00000010, 0x00000006, 0x00000002, 0x00040020, 0x00000011,
-   0x00000001, 0x00000010, 0x0004003b, 0x00000011, 0x00000012, 0x00000001,
-   0x0004002b, 0x00000006, 0x00000014, 0x00000000, 0x0004002b, 0x00000006,
-   0x00000015, 0x3f800000, 0x00040020, 0x00000019, 0x00000003, 0x00000007,
-   0x00040020, 0x0000001b, 0x00000003, 0x00000010, 0x0004003b, 0x0000001b,
-   0x0000001c, 0x00000003, 0x0004002b, 0x00000006, 0x0000001e, 0x3f000000,
-   0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
-   0x00000005, 0x0004003d, 0x00000010, 0x00000013, 0x00000012, 0x00050051,
-   0x00000006, 0x00000016, 0x00000013, 0x00000000, 0x00050051, 0x00000006,
-   0x00000017, 0x00000013, 0x00000001, 0x00070050, 0x00000007, 0x00000018,
-   0x00000016, 0x00000017, 0x00000014, 0x00000015, 0x00050041, 0x00000019,
-   0x0000001a, 0x0000000d, 0x0000000f, 0x0003003e, 0x0000001a, 0x00000018,
-   0x0004003d, 0x00000010, 0x0000001d, 0x00000012, 0x0005008e, 0x00000010,
-   0x0000001f, 0x0000001d, 0x0000001e, 0x00050050, 0x00000010, 0x00000020,
-   0x0000001e, 0x0000001e, 0x00050081, 0x00000010, 0x00000021, 0x0000001f,
-   0x00000020, 0x0003003e, 0x0000001c, 0x00000021, 0x000100fd, 0x00010038,
+   0x00007675, 0x00040005, 0x00000022, 0x6e794456, 0x00000000, 0x00040006,
+   0x00000022, 0x00000000, 0x00646170, 0x00040006, 0x00000022, 0x00000001,
+   0x0000006b, 0x00040005, 0x00000024, 0x6e796476, 0x00000000, 0x00030047,
+   0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000, 0x0000000b,
+   0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x0000000b, 0x00000001,
+   0x00050048, 0x0000000b, 0x00000002, 0x0000000b, 0x00000003, 0x00050048,
+   0x0000000b, 0x00000003, 0x0000000b, 0x00000004, 0x00040047, 0x00000012,
+   0x0000001e, 0x00000000, 0x00040047, 0x0000001c, 0x0000001e, 0x00000000,
+   0x00040047, 0x00000021, 0x00000006, 0x00000010, 0x00030047, 0x00000022,
+   0x00000002, 0x00050048, 0x00000022, 0x00000000, 0x00000023, 0x00000000,
+   0x00050048, 0x00000022, 0x00000001, 0x00000023, 0x000005d0, 0x00040047,
+   0x00000024, 0x00000021, 0x00000003, 0x00040047, 0x00000024, 0x00000022,
+   0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+   0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+   0x00000004, 0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0004002b,
+   0x00000008, 0x00000009, 0x00000001, 0x0004001c, 0x0000000a, 0x00000006,
+   0x00000009, 0x0006001e, 0x0000000b, 0x00000007, 0x00000006, 0x0000000a,
+   0x0000000a, 0x00040020, 0x0000000c, 0x00000003, 0x0000000b, 0x0004003b,
+   0x0000000c, 0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020,
+   0x00000001, 0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040017,
+   0x00000010, 0x00000006, 0x00000002, 0x00040020, 0x00000011, 0x00000001,
+   0x00000010, 0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004002b,
+   0x00000006, 0x00000014, 0x00000000, 0x0004002b, 0x00000006, 0x00000015,
+   0x3f800000, 0x00040020, 0x00000019, 0x00000003, 0x00000007, 0x00040020,
+   0x0000001b, 0x00000003, 0x00000010, 0x0004003b, 0x0000001b, 0x0000001c,
+   0x00000003, 0x0004002b, 0x00000006, 0x0000001e, 0x3f000000, 0x0004002b,
+   0x00000008, 0x00000020, 0x0000005d, 0x0004001c, 0x00000021, 0x00000007,
+   0x00000020, 0x0004001e, 0x00000022, 0x00000021, 0x00000007, 0x00040020,
+   0x00000023, 0x00000002, 0x00000022, 0x0004003b, 0x00000023, 0x00000024,
+   0x00000002, 0x0004002b, 0x0000000e, 0x00000025, 0x00000001, 0x00040020,
+   0x00000026, 0x00000002, 0x00000007, 0x00050036, 0x00000002, 0x00000004,
+   0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000010,
+   0x00000013, 0x00000012, 0x00050051, 0x00000006, 0x00000016, 0x00000013,
+   0x00000000, 0x00050051, 0x00000006, 0x00000017, 0x00000013, 0x00000001,
+   0x00070050, 0x00000007, 0x00000018, 0x00000016, 0x00000017, 0x00000014,
+   0x00000015, 0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f,
+   0x0003003e, 0x0000001a, 0x00000018, 0x0004003d, 0x00000010, 0x0000001d,
+   0x00000012, 0x0005008e, 0x00000010, 0x0000001f, 0x0000001d, 0x0000001e,
+   0x00050041, 0x00000026, 0x00000027, 0x00000024, 0x00000025, 0x0004003d,
+   0x00000007, 0x00000028, 0x00000027, 0x0007004f, 0x00000010, 0x00000029,
+   0x00000028, 0x00000028, 0x00000000, 0x00000001, 0x00050085, 0x00000010,
+   0x0000002a, 0x0000001f, 0x00000029, 0x00050041, 0x00000026, 0x0000002b,
+   0x00000024, 0x00000025, 0x0004003d, 0x00000007, 0x0000002c, 0x0000002b,
+   0x0007004f, 0x00000010, 0x0000002d, 0x0000002c, 0x0000002c, 0x00000002,
+   0x00000003, 0x0005008e, 0x00000010, 0x0000002e, 0x0000002d, 0x0000001e,
+   0x00050081, 0x00000010, 0x0000002f, 0x0000002a, 0x0000002e, 0x0003003e,
+   0x0000001c, 0x0000002f, 0x000100fd, 0x00010038,
 };
 static const uint32_t frag_spv[] = {
    0x07230203, 0x00010300, 0x0008000b, 0x0000002a, 0x00000000, 0x00020011,
@@ -236,6 +264,11 @@ static const float vertices[24] = {
 #define DYN_ADD_OFFSET 1136
 #define DYN_BLOCK_SIZE (DYN_ADD_OFFSET + 16)
 static const float dyn_add[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.125f, 0.0f, 0.0625f, 0.0f}};
+/* The vertex shader's dynamic uniform buffer: vdyn.k at VDYN_K_OFFSET of
+ * each of its two blocks. */
+#define VDYN_K_OFFSET 1488
+#define VDYN_BLOCK_SIZE (VDYN_K_OFFSET + 16)
+static const float vdyn_k[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
 /* ---------------------------------------------------------------------- */
 /* Helpers                                                                 */
@@ -1049,10 +1082,20 @@ main(int argc, char **argv)
    for (unsigned h = 0; h < 2; h++)
       memcpy((uint8_t *)dynbuf.map + h * DYN_STRIDE + DYN_ADD_OFFSET, dyn_add[h], 16);
    host_buffer_flush(&f, device, &dynbuf);
+   struct host_buffer vdynbuf;
+   if (!host_buffer_create(&f, device, &mem_props, 2 * DYN_STRIDE,
+                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "vertex dynamic uniform buffer",
+                           &vdynbuf))
+      return 1;
+   for (unsigned i = 0; i < 2 * DYN_STRIDE / 4; i++)
+      ((float *)vdynbuf.map)[i] = 0.75f;
+   for (unsigned h = 0; h < 2; h++)
+      memcpy((uint8_t *)vdynbuf.map + h * DYN_STRIDE + VDYN_K_OFFSET, vdyn_k, 16);
+   host_buffer_flush(&f, device, &vdynbuf);
 
    /* The descriptor set: binding 0 the combined image sampler, binding 1
     * the uniform buffer, both fragment. */
-   const VkDescriptorSetLayoutBinding bindings[3] = {
+   const VkDescriptorSetLayoutBinding bindings[4] = {
       {
          .binding = 0,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1071,10 +1114,16 @@ main(int argc, char **argv)
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
       },
+      {
+         .binding = 3,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+      },
    };
    const VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 3,
+      .bindingCount = 4,
       .pBindings = bindings,
    };
    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
@@ -1086,7 +1135,7 @@ main(int argc, char **argv)
    const VkDescriptorPoolSize pool_sizes[3] = {
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2},
    };
    const VkDescriptorPoolCreateInfo dpci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1127,7 +1176,12 @@ main(int argc, char **argv)
       .offset = 0,
       .range = DYN_BLOCK_SIZE,
    };
-   const VkWriteDescriptorSet writes[3] = {
+   const VkDescriptorBufferInfo vddbi = {
+      .buffer = vdynbuf.buffer,
+      .offset = 0,
+      .range = VDYN_BLOCK_SIZE,
+   };
+   const VkWriteDescriptorSet writes[4] = {
       {
          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
          .dstSet = set,
@@ -1152,10 +1206,18 @@ main(int argc, char **argv)
          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
          .pBufferInfo = &ddbi,
       },
+      {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = set,
+         .dstBinding = 3,
+         .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+         .pBufferInfo = &vddbi,
+      },
    };
-   f.UpdateDescriptorSets(device, 3, writes, 0, NULL);
+   f.UpdateDescriptorSets(device, 4, writes, 0, NULL);
    printf("  descriptor set written (combined image sampler, uniform buffer, dynamic uniform "
-          "buffer)\n");
+          "buffer, vertex dynamic uniform buffer)\n");
 
    /* ------------------------------------------------------------------- */
    /* The target                                                           */
@@ -1439,9 +1501,11 @@ main(int argc, char **argv)
    const VkDeviceSize vb_offset = 0;
    f.CmdBindVertexBuffers(cmd, 0, 1, &vbuf.buffer, &vb_offset);
    for (uint32_t h = 0; h < 2; h++) {
-      const uint32_t dyn_offset = h * DYN_STRIDE;
-      f.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 1,
-                              &dyn_offset);
+      /* Binding order: the fragment shader's buffer, then the vertex
+       * shader's, which moves the other way. */
+      const uint32_t dyn_offsets[2] = {h * DYN_STRIDE, (1 - h) * DYN_STRIDE};
+      f.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 2,
+                              dyn_offsets);
       f.CmdDraw(cmd, 6, 1, 6 * h, 0);
    }
    f.CmdEndRendering(cmd);
@@ -1567,6 +1631,7 @@ main(int argc, char **argv)
    host_buffer_destroy(&f, device, &vbuf);
    host_buffer_destroy(&f, device, &ubo);
    host_buffer_destroy(&f, device, &dynbuf);
+   host_buffer_destroy(&f, device, &vdynbuf);
    host_buffer_destroy(&f, device, &staging);
    f.DestroyImageView(device, tview, NULL);
    f.DestroyImage(device, tex, NULL);
