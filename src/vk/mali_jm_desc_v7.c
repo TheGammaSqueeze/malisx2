@@ -158,6 +158,104 @@ table_entry_size(unsigned t)
    return t == MALI_V7_DESC_TABLE_UBO ? pan_size(UNIFORM_BUFFER) : MALI_DESCRIPTOR_SIZE;
 }
 
+/* The dynamic uniform buffers' entries, offsets applied
+ * (panvk_cmd_fill_dyn_ubos), packed into dst. One bound to nothing (or to
+ * the null buffer, whose sink address does not fit the descriptor) reads
+ * as one zero entry. */
+static void
+pack_dyn_ubos(const struct mali_shader *s, const struct mali_desc_state *desc, void *dst)
+{
+   const uint32_t dyn_ubo_count = s->v7.dyn_ubo_count;
+   const uint32_t *dyn_ubo_map = s->desc.dyn_bufs.map;
+   /* Packed in cached memory and copied out once: command memory is
+    * uncached. */
+   struct mali_uniform_buffer_packed dyn[MALI_MAX_DYNAMIC_UNIFORM_BUFFERS];
+   assert(dyn_ubo_count <= ARRAY_SIZE(dyn));
+   for (uint32_t i = 0; i < dyn_ubo_count; i++) {
+      uint64_t addr = 0, range = 0;
+      if (!dyn_buf(desc, dyn_ubo_map[i], &addr, &range) || (addr >> 56))
+         addr = range = 0;
+      pan_pack(&dyn[i], UNIFORM_BUFFER, cfg) {
+         cfg.pointer = addr;
+         /* 16-byte entries, at least one (the packer encodes the count
+          * minus one), at most the 12-bit field: 64 KiB, the
+          * maxUniformBufferRange of this arch. */
+         cfg.entries = CLAMP(DIV_ROUND_UP(range, 16), 1, 1u << 12);
+      }
+   }
+   memcpy(dst, dyn, dyn_ubo_count * sizeof(dyn[0]));
+}
+
+/* The dynamic storage buffer table: address and size, offset applied
+ * (cmd_prepare_dyn_ssbos). 0 on failure. */
+static uint64_t
+build_dyn_ssbos(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                const struct mali_desc_state *desc)
+{
+   const uint32_t dyn_ubo_count = s->v7.dyn_ubo_count;
+   const uint32_t dyn_ssbo_count = s->desc.dyn_bufs.count - dyn_ubo_count;
+   const uint32_t *dyn_ssbo_map = s->desc.dyn_bufs.map + dyn_ubo_count;
+   struct mali_ptr p =
+      mali_cmd_alloc(cmd, (uint64_t)dyn_ssbo_count * sizeof(struct ssbo_addr), 64);
+   if (!p.cpu)
+      return 0;
+   struct ssbo_addr entries[MALI_MAX_DYNAMIC_STORAGE_BUFFERS];
+   assert(dyn_ssbo_count <= ARRAY_SIZE(entries));
+   memset(entries, 0, sizeof(entries));
+   for (uint32_t i = 0; i < dyn_ssbo_count; i++) {
+      uint64_t addr = 0, range = 0;
+      entries[i].base_addr = NULL_BUFFER_ADDR;
+      if (dyn_buf(desc, dyn_ssbo_map[i], &addr, &range) && range) {
+         entries[i].base_addr = addr;
+         entries[i].size = (uint32_t)MIN2(align64(range, 4), UINT32_MAX & ~3ull);
+      }
+   }
+   memcpy(p.cpu, entries, dyn_ssbo_count * sizeof(entries[0]));
+   return p.gpu;
+}
+
+static bool cpu_copy_mode(void);
+
+bool
+mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                     const struct mali_desc_state *desc, bool img,
+                     struct mali_v7_desc_tables *t)
+{
+   const struct mali_v7_shader_desc *v7 = &s->v7;
+   if (t->shader != s || v7->count[MALI_V7_DESC_TABLE_UBO] ||
+       (!img && v7->count[MALI_V7_DESC_TABLE_IMG]) || cpu_copy_mode())
+      return false;
+   for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
+      const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
+      if (t->sets[i] != (set ? set->gpu : 0) ||
+          t->set_desc_counts[i] != (set ? set->layout->desc_count : 0))
+         return false;
+   }
+
+   const uint32_t dyn_ubo_count = v7->dyn_ubo_count;
+   const uint32_t dyn_ssbo_count = s->desc.dyn_bufs.count - dyn_ubo_count;
+   uint64_t ubo = t->tables[MALI_V7_DESC_TABLE_UBO];
+   void *ubo_cpu = t->tables_cpu[MALI_V7_DESC_TABLE_UBO];
+   if (dyn_ubo_count) {
+      struct mali_ptr p = mali_cmd_alloc(cmd, (uint64_t)dyn_ubo_count * pan_size(UNIFORM_BUFFER), 64);
+      if (!p.cpu)
+         return false;
+      pack_dyn_ubos(s, desc, p.cpu);
+      ubo = p.gpu;
+      ubo_cpu = p.cpu;
+   }
+   uint64_t dyn_ssbos = t->dyn_ssbos;
+   if (dyn_ssbo_count) {
+      dyn_ssbos = build_dyn_ssbos(cmd, s, desc);
+      if (!dyn_ssbos)
+         return false;
+   }
+   t->tables[MALI_V7_DESC_TABLE_UBO] = ubo;
+   t->tables_cpu[MALI_V7_DESC_TABLE_UBO] = ubo_cpu;
+   t->dyn_ssbos = dyn_ssbos;
+   return true;
+}
+
 bool
 mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                      const struct mali_desc_state *desc, bool img,
@@ -168,8 +266,6 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
     * dynamic storage buffers (mali_nir_lower_descriptors_v7.c). */
    const uint32_t dyn_ubo_count = v7->dyn_ubo_count;
    const uint32_t dyn_ssbo_count = s->desc.dyn_bufs.count - dyn_ubo_count;
-   const uint32_t *dyn_ubo_map = s->desc.dyn_bufs.map;
-   const uint32_t *dyn_ssbo_map = s->desc.dyn_bufs.map + dyn_ubo_count;
 
    memset(out, 0, sizeof(*out));
    out->shader = s;
@@ -200,28 +296,9 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       out->tables[t] = p.gpu;
       out->tables_cpu[t] = p.cpu;
 
-      if (t == MALI_V7_DESC_TABLE_UBO && dyn_ubo_count) {
-         /* The dynamic uniform buffers behind the regular ones, with their
-          * offsets applied (panvk_cmd_fill_dyn_ubos). Packed in cached
-          * memory and copied out once: command memory is uncached. One
-          * bound to nothing (or to the null buffer, whose sink address
-          * does not fit the descriptor) reads as one zero entry. */
-         struct mali_uniform_buffer_packed dyn[MALI_MAX_DYNAMIC_UNIFORM_BUFFERS];
-         assert(dyn_ubo_count <= ARRAY_SIZE(dyn));
-         for (uint32_t i = 0; i < dyn_ubo_count; i++) {
-            uint64_t addr = 0, range = 0;
-            if (!dyn_buf(desc, dyn_ubo_map[i], &addr, &range) || (addr >> 56))
-               addr = range = 0;
-            pan_pack(&dyn[i], UNIFORM_BUFFER, cfg) {
-               cfg.pointer = addr;
-               /* 16-byte entries, at least one (the packer encodes the
-                * count minus one), at most the 12-bit field: 64 KiB, the
-                * maxUniformBufferRange of this arch. */
-               cfg.entries = CLAMP(DIV_ROUND_UP(range, 16), 1, 1u << 12);
-            }
-         }
-         memcpy((uint8_t *)p.cpu + (uint64_t)regular * entry, dyn, dyn_ubo_count * sizeof(dyn[0]));
-      }
+      /* The dynamic uniform buffers behind the regular ones. */
+      if (t == MALI_V7_DESC_TABLE_UBO && dyn_ubo_count)
+         pack_dyn_ubos(s, desc, (uint8_t *)p.cpu + (uint64_t)regular * entry);
 
       if (t == MALI_V7_DESC_TABLE_IMG) {
          memset((uint8_t *)p.cpu + (uint64_t)count * entry, 0, tail);
@@ -249,26 +326,11 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       out->tables[MALI_V7_DESC_TABLE_SAMPLER] = p.gpu;
    }
 
-   /* The dynamic storage buffers: address and size, offset applied
-    * (cmd_prepare_dyn_ssbos). */
+   /* The dynamic storage buffers. */
    if (dyn_ssbo_count) {
-      struct mali_ptr p =
-         mali_cmd_alloc(cmd, (uint64_t)dyn_ssbo_count * sizeof(struct ssbo_addr), 64);
-      if (!p.cpu)
+      out->dyn_ssbos = build_dyn_ssbos(cmd, s, desc);
+      if (!out->dyn_ssbos)
          return false;
-      struct ssbo_addr entries[MALI_MAX_DYNAMIC_STORAGE_BUFFERS];
-      assert(dyn_ssbo_count <= ARRAY_SIZE(entries));
-      memset(entries, 0, sizeof(entries));
-      for (uint32_t i = 0; i < dyn_ssbo_count; i++) {
-         uint64_t addr = 0, range = 0;
-         entries[i].base_addr = NULL_BUFFER_ADDR;
-         if (dyn_buf(desc, dyn_ssbo_map[i], &addr, &range) && range) {
-            entries[i].base_addr = addr;
-            entries[i].size = (uint32_t)MIN2(align64(range, 4), UINT32_MAX & ~3ull);
-         }
-      }
-      memcpy(p.cpu, entries, dyn_ssbo_count * sizeof(entries[0]));
-      out->dyn_ssbos = p.gpu;
    }
    return true;
 }

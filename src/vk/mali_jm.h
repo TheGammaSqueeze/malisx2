@@ -575,6 +575,25 @@ bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader 
                           struct mali_v7_desc_tables *out);
 
 /*
+ * The tables in *t again for the same shader and the same bound sets,
+ * only with new dynamic offsets (a vkCmdBindDescriptorSets that rebinds
+ * the sets with other offsets, azahar's every draw): the dynamic uniform
+ * buffer entries and the dynamic storage buffer table are packed anew,
+ * the copied tables are kept, so the draw needs no copy job. Sound
+ * because a set bound in a command buffer cannot change while that
+ * command buffer is recording (no update-after-bind is exposed) and a
+ * push descriptor set gets new memory with every push. False when the
+ * tables must be rebuilt (another shader or set, regular uniform buffers,
+ * whose entries share the table with the dynamic ones and come from the
+ * copy, a vertex shader with images, or the CPU copy mode); then *t is
+ * unchanged. False with the command buffer's error set on an allocation
+ * failure.
+ */
+bool mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                          const struct mali_desc_state *desc, bool img,
+                          struct mali_v7_desc_tables *t);
+
+/*
  * The table entries copied from the sets (the shader's copy map): by a
  * Compute job on chain c running the copy shader, one invocation per
  * entry (panvk_v7 meta_get_copy_desc_job). *index: that job's index, the

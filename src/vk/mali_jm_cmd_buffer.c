@@ -790,6 +790,13 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    memset(&cmd->gfx, 0, sizeof(cmd->gfx));
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
    cmd->dispatches = cmd->draws = cmd->passes = 0;
+#if PAN_ARCH < 9
+   /* The draw's descriptor tables were in the command memory released
+    * above: a draw after the reset must not keep them
+    * (mali_v7_desc_refresh). */
+   memset(&cmd->jm.draw.vs_tab, 0, sizeof(cmd->jm.draw.vs_tab));
+   memset(&cmd->jm.draw.fs_tab, 0, sizeof(cmd->jm.draw.fs_tab));
+#endif
 }
 
 static VkResult

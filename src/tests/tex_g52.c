@@ -58,6 +58,21 @@
  *                 color = texture(tex, uv) * params.scale + params.bias;
  *              }
  *
+ * The fragment shader also reads a dynamic uniform buffer (binding 2) at
+ * offset 1136, past the first kilobyte, the way azahar's fragment shaders
+ * read their PICA constants: the image is drawn as two rectangles, the top
+ * half with dynamic offset 0 (add = 0) and the bottom half with the same
+ * set bound again at offset DYN_STRIDE (add = (0.125, 0, 0.0625, 0)), so
+ * the bottom half must read 32 and 16 more in red and blue. That covers
+ * the uniform buffer words a Bifrost fragment shader takes from FAU and
+ * the descriptor tables kept across a rebind with new dynamic offsets:
+ *
+ *   binding 2: layout(set = 0, binding = 2) uniform Dyn {
+ *                 vec4 pad[71];
+ *                 vec4 add;
+ *              } dyn;
+ *              color = texture(tex, uv) * params.scale + params.bias + dyn.add;
+ *
  * No Vulkan loader: the driver library is dlopen'ed (see clear_g52.c).
  *
  * Usage: tex_g52 [path/to/libvulkan_malisx2.so] [--tiled] [--upload=copy|host|auto]
@@ -153,7 +168,7 @@ static const uint32_t vert_spv[] = {
    0x00000020, 0x0003003e, 0x0000001c, 0x00000021, 0x000100fd, 0x00010038,
 };
 static const uint32_t frag_spv[] = {
-   0x07230203, 0x00010300, 0x0008000b, 0x00000021, 0x00000000, 0x00020011,
+   0x07230203, 0x00010300, 0x0008000b, 0x0000002a, 0x00000000, 0x00020011,
    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
    0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00000011, 0x00030010,
@@ -163,39 +178,64 @@ static const uint32_t frag_spv[] = {
    0x00007675, 0x00040005, 0x00000014, 0x61726150, 0x0000736d, 0x00050006,
    0x00000014, 0x00000000, 0x6c616373, 0x00000065, 0x00050006, 0x00000014,
    0x00000001, 0x73616962, 0x00000000, 0x00040005, 0x00000016, 0x61726170,
-   0x0000736d, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047,
-   0x0000000d, 0x00000021, 0x00000000, 0x00040047, 0x0000000d, 0x00000022,
-   0x00000000, 0x00040047, 0x00000011, 0x0000001e, 0x00000000, 0x00030047,
-   0x00000014, 0x00000002, 0x00050048, 0x00000014, 0x00000000, 0x00000023,
-   0x00000000, 0x00050048, 0x00000014, 0x00000001, 0x00000023, 0x00000010,
-   0x00040047, 0x00000016, 0x00000021, 0x00000001, 0x00040047, 0x00000016,
-   0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
-   0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
-   0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007,
-   0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00090019, 0x0000000a,
-   0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
-   0x00000000, 0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c,
-   0x00000000, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000000,
-   0x00040017, 0x0000000f, 0x00000006, 0x00000002, 0x00040020, 0x00000010,
-   0x00000001, 0x0000000f, 0x0004003b, 0x00000010, 0x00000011, 0x00000001,
-   0x0004001e, 0x00000014, 0x00000007, 0x00000007, 0x00040020, 0x00000015,
-   0x00000002, 0x00000014, 0x0004003b, 0x00000015, 0x00000016, 0x00000002,
-   0x00040015, 0x00000017, 0x00000020, 0x00000001, 0x0004002b, 0x00000017,
-   0x00000018, 0x00000000, 0x00040020, 0x00000019, 0x00000002, 0x00000007,
-   0x0004002b, 0x00000017, 0x0000001d, 0x00000001, 0x00050036, 0x00000002,
-   0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d,
-   0x0000000b, 0x0000000e, 0x0000000d, 0x0004003d, 0x0000000f, 0x00000012,
-   0x00000011, 0x00050057, 0x00000007, 0x00000013, 0x0000000e, 0x00000012,
-   0x00050041, 0x00000019, 0x0000001a, 0x00000016, 0x00000018, 0x0004003d,
-   0x00000007, 0x0000001b, 0x0000001a, 0x00050085, 0x00000007, 0x0000001c,
-   0x00000013, 0x0000001b, 0x00050041, 0x00000019, 0x0000001e, 0x00000016,
-   0x0000001d, 0x0004003d, 0x00000007, 0x0000001f, 0x0000001e, 0x00050081,
-   0x00000007, 0x00000020, 0x0000001c, 0x0000001f, 0x0003003e, 0x00000009,
-   0x00000020, 0x000100fd, 0x00010038,
+   0x0000736d, 0x00030005, 0x00000024, 0x006e7944, 0x00040006, 0x00000024,
+   0x00000000, 0x00646170, 0x00040006, 0x00000024, 0x00000001, 0x00646461,
+   0x00030005, 0x00000026, 0x006e7964, 0x00040047, 0x00000009, 0x0000001e,
+   0x00000000, 0x00040047, 0x0000000d, 0x00000021, 0x00000000, 0x00040047,
+   0x0000000d, 0x00000022, 0x00000000, 0x00040047, 0x00000011, 0x0000001e,
+   0x00000000, 0x00030047, 0x00000014, 0x00000002, 0x00050048, 0x00000014,
+   0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000014, 0x00000001,
+   0x00000023, 0x00000010, 0x00040047, 0x00000016, 0x00000021, 0x00000001,
+   0x00040047, 0x00000016, 0x00000022, 0x00000000, 0x00040047, 0x00000023,
+   0x00000006, 0x00000010, 0x00030047, 0x00000024, 0x00000002, 0x00050048,
+   0x00000024, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000024,
+   0x00000001, 0x00000023, 0x00000470, 0x00040047, 0x00000026, 0x00000021,
+   0x00000002, 0x00040047, 0x00000026, 0x00000022, 0x00000000, 0x00020013,
+   0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+   0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020,
+   0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009,
+   0x00000003, 0x00090019, 0x0000000a, 0x00000006, 0x00000001, 0x00000000,
+   0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x0000000b,
+   0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x0004003b,
+   0x0000000c, 0x0000000d, 0x00000000, 0x00040017, 0x0000000f, 0x00000006,
+   0x00000002, 0x00040020, 0x00000010, 0x00000001, 0x0000000f, 0x0004003b,
+   0x00000010, 0x00000011, 0x00000001, 0x0004001e, 0x00000014, 0x00000007,
+   0x00000007, 0x00040020, 0x00000015, 0x00000002, 0x00000014, 0x0004003b,
+   0x00000015, 0x00000016, 0x00000002, 0x00040015, 0x00000017, 0x00000020,
+   0x00000001, 0x0004002b, 0x00000017, 0x00000018, 0x00000000, 0x00040020,
+   0x00000019, 0x00000002, 0x00000007, 0x0004002b, 0x00000017, 0x0000001d,
+   0x00000001, 0x00040015, 0x00000021, 0x00000020, 0x00000000, 0x0004002b,
+   0x00000021, 0x00000022, 0x00000047, 0x0004001c, 0x00000023, 0x00000007,
+   0x00000022, 0x0004001e, 0x00000024, 0x00000023, 0x00000007, 0x00040020,
+   0x00000025, 0x00000002, 0x00000024, 0x0004003b, 0x00000025, 0x00000026,
+   0x00000002, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+   0x000200f8, 0x00000005, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d,
+   0x0004003d, 0x0000000f, 0x00000012, 0x00000011, 0x00050057, 0x00000007,
+   0x00000013, 0x0000000e, 0x00000012, 0x00050041, 0x00000019, 0x0000001a,
+   0x00000016, 0x00000018, 0x0004003d, 0x00000007, 0x0000001b, 0x0000001a,
+   0x00050085, 0x00000007, 0x0000001c, 0x00000013, 0x0000001b, 0x00050041,
+   0x00000019, 0x0000001e, 0x00000016, 0x0000001d, 0x0004003d, 0x00000007,
+   0x0000001f, 0x0000001e, 0x00050081, 0x00000007, 0x00000020, 0x0000001c,
+   0x0000001f, 0x00050041, 0x00000019, 0x00000027, 0x00000026, 0x0000001d,
+   0x0004003d, 0x00000007, 0x00000028, 0x00000027, 0x00050081, 0x00000007,
+   0x00000029, 0x00000020, 0x00000028, 0x0003003e, 0x00000009, 0x00000029,
+   0x000100fd, 0x00010038,
 };
 
-/* A triangle covering clip space: (-1,-1), (3,-1), (-1,3). */
-static const float vertices[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+/* Two rectangles of two triangles each: the top half of clip space (drawn
+ * with dynamic offset 0), then the bottom half (dynamic offset
+ * DYN_STRIDE). */
+static const float vertices[24] = {
+   -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 0.0f,  -1.0f, -1.0f, 1.0f, 0.0f, -1.0f, 0.0f,
+   -1.0f, 0.0f,  1.0f, 0.0f,  1.0f, 1.0f,  -1.0f, 0.0f,  1.0f, 1.0f, -1.0f, 1.0f,
+};
+
+/* The dynamic uniform buffer: two blocks DYN_STRIDE apart, each with its
+ * vec4 add at DYN_ADD_OFFSET (the std140 offset of dyn.add). */
+#define DYN_STRIDE 2048
+#define DYN_ADD_OFFSET 1136
+#define DYN_BLOCK_SIZE (DYN_ADD_OFFSET + 16)
+static const float dyn_add[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.125f, 0.0f, 0.0625f, 0.0f}};
 
 /* ---------------------------------------------------------------------- */
 /* Helpers                                                                 */
@@ -209,12 +249,13 @@ texel(unsigned x, unsigned y, uint8_t out[4])
    out[3] = 255;
 }
 
-/* What a pixel showing texel t must read: t * scale + bias, rounded. */
+/* What a pixel showing texel t in half `half` (0 top, 1 bottom) must read:
+ * t * scale + bias + that half's add, rounded. */
 static void
-expected_pixel(const uint8_t t[4], uint8_t out[4])
+expected_pixel(const uint8_t t[4], unsigned half, uint8_t out[4])
 {
    for (unsigned c = 0; c < 4; c++) {
-      const float v = (t[c] / 255.0f) * params[c] + params[4 + c];
+      const float v = (t[c] / 255.0f) * params[c] + params[4 + c] + dyn_add[half][c];
       out[c] = (uint8_t)(v * 255.0f + 0.5f);
    }
 }
@@ -997,9 +1038,21 @@ main(int argc, char **argv)
    memcpy(ubo.map, params, sizeof(params));
    host_buffer_flush(&f, device, &ubo);
 
+   /* The dynamic uniform buffer: dyn.add of each half at DYN_ADD_OFFSET of
+    * its block, the padding filled with a value that would show. */
+   struct host_buffer dynbuf;
+   if (!host_buffer_create(&f, device, &mem_props, 2 * DYN_STRIDE,
+                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "dynamic uniform buffer", &dynbuf))
+      return 1;
+   for (unsigned i = 0; i < 2 * DYN_STRIDE / 4; i++)
+      ((float *)dynbuf.map)[i] = 0.75f;
+   for (unsigned h = 0; h < 2; h++)
+      memcpy((uint8_t *)dynbuf.map + h * DYN_STRIDE + DYN_ADD_OFFSET, dyn_add[h], 16);
+   host_buffer_flush(&f, device, &dynbuf);
+
    /* The descriptor set: binding 0 the combined image sampler, binding 1
     * the uniform buffer, both fragment. */
-   const VkDescriptorSetLayoutBinding bindings[2] = {
+   const VkDescriptorSetLayoutBinding bindings[3] = {
       {
          .binding = 0,
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1012,10 +1065,16 @@ main(int argc, char **argv)
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
       },
+      {
+         .binding = 2,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      },
    };
    const VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 2,
+      .bindingCount = 3,
       .pBindings = bindings,
    };
    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
@@ -1024,14 +1083,15 @@ main(int argc, char **argv)
       fprintf(stderr, "tex_g52: vkCreateDescriptorSetLayout failed: %s\n", result_str(r));
       return 1;
    }
-   const VkDescriptorPoolSize pool_sizes[2] = {
+   const VkDescriptorPoolSize pool_sizes[3] = {
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
    };
    const VkDescriptorPoolCreateInfo dpci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .maxSets = 1,
-      .poolSizeCount = 2,
+      .poolSizeCount = 3,
       .pPoolSizes = pool_sizes,
    };
    VkDescriptorPool dpool = VK_NULL_HANDLE;
@@ -1062,7 +1122,12 @@ main(int argc, char **argv)
       .offset = 0,
       .range = sizeof(params),
    };
-   const VkWriteDescriptorSet writes[2] = {
+   const VkDescriptorBufferInfo ddbi = {
+      .buffer = dynbuf.buffer,
+      .offset = 0,
+      .range = DYN_BLOCK_SIZE,
+   };
+   const VkWriteDescriptorSet writes[3] = {
       {
          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
          .dstSet = set,
@@ -1079,9 +1144,18 @@ main(int argc, char **argv)
          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
          .pBufferInfo = &dbi,
       },
+      {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = set,
+         .dstBinding = 2,
+         .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+         .pBufferInfo = &ddbi,
+      },
    };
-   f.UpdateDescriptorSets(device, 2, writes, 0, NULL);
-   printf("  descriptor set written (combined image sampler, uniform buffer)\n");
+   f.UpdateDescriptorSets(device, 3, writes, 0, NULL);
+   printf("  descriptor set written (combined image sampler, uniform buffer, dynamic uniform "
+          "buffer)\n");
 
    /* ------------------------------------------------------------------- */
    /* The target                                                           */
@@ -1166,7 +1240,7 @@ main(int argc, char **argv)
       return 1;
    }
 
-   /* The vertex buffer: three vec2. */
+   /* The vertex buffer: twelve vec2. */
    struct host_buffer vbuf;
    if (!host_buffer_create(&f, device, &mem_props, sizeof(vertices),
                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, "vertex buffer", &vbuf))
@@ -1362,10 +1436,14 @@ main(int argc, char **argv)
    };
    f.CmdBeginRendering(cmd, &ri);
    f.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-   f.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, NULL);
    const VkDeviceSize vb_offset = 0;
    f.CmdBindVertexBuffers(cmd, 0, 1, &vbuf.buffer, &vb_offset);
-   f.CmdDraw(cmd, 3, 1, 0, 0);
+   for (uint32_t h = 0; h < 2; h++) {
+      const uint32_t dyn_offset = h * DYN_STRIDE;
+      f.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 1,
+                              &dyn_offset);
+      f.CmdDraw(cmd, 6, 1, 6 * h, 0);
+   }
    f.CmdEndRendering(cmd);
 
    VkImageMemoryBarrier to_host = {
@@ -1389,7 +1467,8 @@ main(int argc, char **argv)
               result_str(r));
       return 1;
    }
-   printf("  command buffer recorded (clear, one textured draw of 3 vertices)\n");
+   printf("  command buffer recorded (clear, two textured draws of 6 vertices, the set bound "
+          "at dynamic offsets 0 and %u)\n", DYN_STRIDE);
 
    int st = submit_and_wait(&f, device, queue, fence, cmd, "draw");
    if (st)
@@ -1413,7 +1492,7 @@ main(int argc, char **argv)
          const uint8_t *px = row + (size_t)x * 4;
          uint8_t t[4], want[4];
          texel(x / BLOCK, y / BLOCK, t);
-         expected_pixel(t, want);
+         expected_pixel(t, y >= IMG_H / 2, want);
          bool okpx = true;
          for (unsigned c = 0; c < 4; c++) {
             const int d = (int)px[c] - (int)want[c];
@@ -1449,7 +1528,7 @@ main(int argc, char **argv)
                              (size_t)(bx * BLOCK + BLOCK / 2) * 4;
          uint8_t t[4], want[4];
          texel(bx, by, t);
-         expected_pixel(t, want);
+         expected_pixel(t, by * BLOCK >= IMG_H / 2, want);
          n += snprintf(line + n, sizeof(line) - n, "  %3u %3u %3u %3u (want %3u %3u %3u %3u)%s",
                        px[0], px[1], px[2], px[3], want[0], want[1], want[2], want[3],
                        block_bad[by][bx] ? "!" : " ");
@@ -1487,6 +1566,7 @@ main(int argc, char **argv)
    f.DestroySampler(device, sampler, NULL);
    host_buffer_destroy(&f, device, &vbuf);
    host_buffer_destroy(&f, device, &ubo);
+   host_buffer_destroy(&f, device, &dynbuf);
    host_buffer_destroy(&f, device, &staging);
    f.DestroyImageView(device, tview, NULL);
    f.DestroyImage(device, tex, NULL);

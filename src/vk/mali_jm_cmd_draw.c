@@ -666,6 +666,18 @@ build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p
 /* ---------------------------------------------------------------------- */
 /* Draw state                                                              */
 
+/* MALISX2_V7_DESC_REUSE=0 or debug.malisx2.v7_desc_reuse=0 (read once):
+ * rebuild and copy a stage's descriptor tables whenever its sets are bound
+ * again, even when only the dynamic offsets changed (mali_v7_desc_refresh). */
+static bool
+desc_reuse_off(void)
+{
+   static int off = -1;
+   if (off < 0)
+      off = !mali_v7_debug_switch("MALISX2_V7_DESC_REUSE", "debug.malisx2.v7_desc_reuse", true);
+   return off;
+}
+
 /*
  * The draw's state (mali_cmd_state.h, "A draw's state"), v7 shape: the
  * shared step 1, then each dirty group's descriptors into the template.
@@ -731,9 +743,14 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    if (t->fs_tab.shader != p->fs)
       d->dirty |= MALI_GFX_DIRTY_FS_SRT;
    if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
-      if (!mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
-         return false;
-      dd->vs_copy = true;
+      /* The same sets with other dynamic offsets keep the copied tables. */
+      if (desc_reuse_off() ||
+          !mali_v7_desc_refresh(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab)) {
+         if (vk_command_buffer_has_error(&cmd->vk) ||
+             !mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
+            return false;
+         dd->vs_copy = true;
+      }
       d->vs_srt_key = bd->vs_srt_key;
       d->vs_sets_dirty = 0;
       if (p->vs->v7.needs_set_addrs)
@@ -741,9 +758,13 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
       if (p->fs) {
-         if (!mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
-            return false;
-         dd->fs_copy = true;
+         if (desc_reuse_off() ||
+             !mali_v7_desc_refresh(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab)) {
+            if (vk_command_buffer_has_error(&cmd->vk) ||
+                !mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
+               return false;
+            dd->fs_copy = true;
+         }
          if (p->fs->v7.needs_set_addrs)
             d->dirty |= MALI_GFX_DIRTY_FS_FAU;
       } else {
