@@ -746,9 +746,11 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    if (t->fs_tab.shader != p->fs)
       d->dirty |= MALI_GFX_DIRTY_FS_SRT;
    if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
-      /* The same sets with other dynamic offsets keep the copied tables. */
+      /* The same sets with other dynamic offsets keep the copied tables;
+       * with the same offsets too, the tables and the FAU block stay. */
+      bool same = false;
       if (desc_reuse_off() ||
-          !mali_v7_desc_refresh(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab)) {
+          !mali_v7_desc_refresh(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab, &same)) {
          if (vk_command_buffer_has_error(&cmd->vk) ||
              !mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
             return false;
@@ -756,19 +758,22 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       }
       d->vs_srt_key = bd->vs_srt_key;
       d->vs_sets_dirty = 0;
-      if (p->vs->v7.needs_set_addrs)
+      /* The set addresses and the uniform buffer words in FAU follow the
+       * tables (mali_gfx_update_dirty leaves the second to this). */
+      if (!same && (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count))
          d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
       if (p->fs) {
+         bool same = false;
          if (desc_reuse_off() ||
-             !mali_v7_desc_refresh(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab)) {
+             !mali_v7_desc_refresh(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab, &same)) {
             if (vk_command_buffer_has_error(&cmd->vk) ||
                 !mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
                return false;
             dd->fs_copy = true;
          }
-         if (p->fs->v7.needs_set_addrs)
+         if (!same && (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count))
             d->dirty |= MALI_GFX_DIRTY_FS_FAU;
       } else {
          memset(&t->fs_tab, 0, sizeof(t->fs_tab));
@@ -1274,6 +1279,21 @@ drawstats_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, uin
 /* ---------------------------------------------------------------------- */
 /* The jobs                                                                */
 
+/* MALISX2_V7_TILER_DEFER or debug.malisx2.v7_tiler_defer (read once): how
+ * many draws later a draw's Tiler job goes into the chain, 2 by default
+ * (Kirby Planet Robobot's 322-draw pass: vertex/tiler 7.6 ms linked right
+ * behind, 4.4 one draw later, 3.9 two, 3.9 three); 0 links it right behind
+ * its own Vertex job, as before. */
+static unsigned
+tiler_defer(void)
+{
+   static int depth = -1;
+   if (depth < 0)
+      depth = mali_v7_debug_int("MALISX2_V7_TILER_DEFER", "debug.malisx2.v7_tiler_defer", 2, 0,
+                                MALI_V7_TILER_DEFER_MAX);
+   return depth;
+}
+
 static void
 draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 {
@@ -1341,27 +1361,45 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
     * fragment job, which follows the whole vtc atom. A barrier pending on
     * the chain goes to the first of these jobs; when that is the fragment
     * copy, the Vertex job, which does not depend on it, carries the
-    * barrier too. */
+    * barrier too.
+    *
+    * An earlier draw's Tiler job goes into the chain behind this draw's
+    * Vertex job (tiler_defer, struct mali_jm_cmd::pend_tiler): the job
+    * manager starts the jobs of a chain in order and a job waits for its
+    * dependencies, so a Tiler job right behind its own Vertex job held
+    * the next draw's copy and Vertex jobs until the vertex shader was done;
+    * linked a draw or two later, later draws' vertex shading overlaps it.
+    * The Tiler jobs stay in draw order among themselves (Dependency 2). A
+    * pending barrier links them first: the barrier orders this draw's jobs
+    * after them. */
    const bool pending = c->pending != 0;
+   const unsigned depth = tiler_defer();
+   const bool defer = depth && !pending;
+   if (!defer)
+      mali_v7_link_tilers(cmd, 0);
+   cmd->jm.tiler_defer = defer;
    uint16_t vs_copy = 0, fs_copy = 0;
    if (dd.vs_copy &&
        !mali_v7_desc_copy(cmd, c, p->vs, &cmd->gfx.desc, &t->vs_tab, dd.vs_img_buf_offset,
                           &vs_copy))
-      return;
+      goto fail;
    /* The vertex shader's uniform buffer words, which the Vertex job reads
     * from its FAU block: a job between the descriptor copy and it. */
    uint16_t vs_dep = vs_copy;
    if (dd.vs_ubo_copy &&
        !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
-      return;
+      goto fail;
    if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &cmd->gfx.desc, &t->fs_tab, 0, &fs_copy))
-      return;
-
+      goto fail;
    struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
                                             pending && !vs_dep && fs_copy, vs_dep);
+   cmd->jm.tiler_defer = false;
    if (!vj.cpu)
       return;
    const uint16_t vertex_index = c->index;
+   /* The Tiler job of the draw depth draws back, behind this Vertex job. */
+   if (defer)
+      mali_v7_link_tilers(cmd, depth - 1);
 
    /* The Vertex job (panvk_draw_prepare_vertex_job, panvk_emit_vertex_dcd). */
    memcpy(pan_section_ptr(vj.cpu, COMPUTE_JOB, INVOCATION), &invocation, sizeof(invocation));
@@ -1384,8 +1422,15 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
 
    if (tiling) {
-      struct mali_ptr tj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_TILER, pan_size(TILER_JOB),
-                                               false, vertex_index);
+      /* Uniform buffer words into the fragment shader's FAU block: read
+       * by the fragment job, after the whole vtc atom. */
+      if (dd.ubo_copy && !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, NULL))
+         return;
+
+      /* Written now, its header and link when it goes into the chain
+       * (mali_v7_link_tilers: behind a later draw's Vertex job or in front
+       * of any other job, at the latest when the batch closes). */
+      struct mali_ptr tj = mali_cmd_alloc(cmd, pan_size(TILER_JOB), 128);
       if (!tj.cpu)
          return;
 
@@ -1446,14 +1491,16 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       dcd.opaque[0] |= t->dcd0;
       memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
 
-      /* Uniform buffer words into the fragment shader's FAU block: read by
-       * the fragment job, after the whole vtc atom. */
-      if (dd.ubo_copy && !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, NULL))
-         return;
+      assert(cmd->jm.pend_tilers < MALI_V7_TILER_DEFER_MAX);
+      cmd->jm.pend_tiler[cmd->jm.pend_tilers] = tj;
+      cmd->jm.pend_tiler_dep1[cmd->jm.pend_tilers] = vertex_index;
+      cmd->jm.pend_tilers++;
+      if (!defer)
+         mali_v7_link_tilers(cmd, 0);
 
       if (unlikely(dump_enabled()))
-         dump_draw(cmd, di, &dd, vj, vertex_index, tj, c->index, instance_size, vs_copy,
-                   fs_copy);
+         dump_draw(cmd, di, &dd, vj, vertex_index, tj, defer ? 0 : c->index, instance_size,
+                   vs_copy, fs_copy);
       drawstats_draw(cmd, di, dd.vertex_range * di->instance_count, vs_copy != 0, fs_copy != 0,
                      dd.ubo_copy);
    } else if (unlikely(dump_enabled())) {
@@ -1466,6 +1513,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    cmd->jm.cur.draws++;
    r->draws++;
    cmd->draws++;
+   return;
+
+fail:
+   cmd->jm.tiler_defer = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL

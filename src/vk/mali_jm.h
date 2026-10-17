@@ -245,6 +245,9 @@ struct mali_v7_desc_tables {
    void *img_attribs_cpu;
    /* The shader the tables were built for (their layout is its own). */
    const struct mali_shader *shader;
+   /* The bound dynamic offsets they were built with, one per entry of the
+    * shader's dynamic buffer map (mali_v7_desc_refresh). */
+   uint32_t dyn_offsets[MALI_MAX_DYNAMIC_BUFFERS];
 };
 
 struct mali_jm_draw_tmpl {
@@ -270,6 +273,11 @@ struct mali_jm_draw_tmpl {
    /* The bound index buffer's CPU view (mali_cmd_state.c), NULL when none. */
    const uint8_t *ib_cpu;
 };
+#endif
+
+#if PAN_ARCH < 9
+/* The most draws a Tiler job may wait behind (debug.malisx2.v7_tiler_defer). */
+#define MALI_V7_TILER_DEFER_MAX 4
 #endif
 
 /* Inside the v9 command buffer: what submit reads, and the open batch. */
@@ -301,6 +309,22 @@ struct mali_jm_cmd {
    /* Timing regions (measurement/timing_jm.c); NULL unless
     * MALISX2_MEASURE's "timing" mode is on. */
    struct mali_measure_cmd *measure;
+#if PAN_ARCH < 9
+   /* The last draws' Tiler jobs, written but not yet linked into the open
+    * batch's vtc chain (mali_jm_cmd_draw.c, mali_v7_link_tilers): one goes
+    * in behind the Vertex job of the draw a set number of draws later, all
+    * of them in front of any other job, at the latest when the batch
+    * closes. dep1 is each one's Vertex job. While tiler_defer is set (a
+    * draw adding its own copy and Vertex jobs), mali_jm_cmd_add_job leaves
+    * them pending. */
+   struct mali_ptr pend_tiler[MALI_V7_TILER_DEFER_MAX];
+   uint16_t pend_tiler_dep1[MALI_V7_TILER_DEFER_MAX];
+   uint8_t pend_tilers;          /* pending, oldest first */
+   bool tiler_defer;
+   /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
+    * copy_tsd), 0 until the first one. */
+   uint64_t copy_tsd;
+#endif
 };
 
 /*
@@ -472,6 +496,12 @@ mali_jm_chain_link(struct mali_jm_chain *c, struct mali_ptr job, uint16_t index,
       c->tiler_dep = index;
 }
 
+#if PAN_ARCH < 9
+/* Links the pending Tiler jobs (struct mali_jm_cmd::pend_tiler), oldest
+ * first, into the open batch's vtc chain until at most keep are left. */
+void mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep);
+#endif
+
 /* A Write Value job on chain c (timestamps, availability, tests). */
 bool mali_jm_cmd_write_value(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                              enum mali_write_value_type type, uint64_t addr, uint64_t value,
@@ -597,7 +627,17 @@ bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader 
  */
 bool mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                           const struct mali_desc_state *desc, bool img,
-                          struct mali_v7_desc_tables *t);
+                          struct mali_v7_desc_tables *t, bool *unchanged);
+
+/*
+ * MALISX2_V7_UBO_KEEP=0 or debug.malisx2.v7_ubo_keep=0 (read once): with
+ * it on (the default), mali_v7_desc_refresh keeps a stage's tables as they
+ * are when the sets and the dynamic offsets the stage reads did not change
+ * (*unchanged), and the draw then keeps the stage's FAU block too, with
+ * its uniform buffer words, instead of building both again for every
+ * rebind of the same sets (azahar rebinds them at every draw).
+ */
+bool mali_v7_ubo_keep(void);
 
 /*
  * The table entries copied from the sets (the shader's copy map): by a

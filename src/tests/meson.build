@@ -153,3 +153,18 @@ executable(
   dependencies : [dep_dl],
   install : false,
 )
+
+# dyn_g52: 62 draws in one pass recorded the way an emulator does: dynamic
+# stencil reference set before every draw, two dynamic uniform buffers (one
+# per stage) rebound before every draw with new offsets for one stage, the
+# same offsets or through a second set, two pipeline objects of one state,
+# overlapping draws whose order decides the result; submitted twice with
+# new uniform contents for the second run.
+executable(
+  'dyn_g52',
+  files('dyn_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DDYN_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)

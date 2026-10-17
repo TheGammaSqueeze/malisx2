@@ -1250,6 +1250,40 @@ struct mali_draw_info {
    bool indexed;
 };
 
+#if PAN_ARCH < 9
+/* MALISX2_V7_DYN_LAZY=0 or debug.malisx2.v7_dyn_lazy=0 (read once): repack
+ * a pipeline's dynamic-state words at every draw, as before, instead of
+ * only when a state they are baked from changed. */
+static inline bool
+mali_v7_dyn_lazy(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = mali_v7_debug_switch("MALISX2_V7_DYN_LAZY", "debug.malisx2.v7_dyn_lazy", true);
+   return on;
+}
+
+/* A dirty dynamic state that the pipeline bake (gfx_pack_state) may read:
+ * any but the viewports and scissors, the blend constants and the vertex
+ * input, which have groups of their own (the draw reads them, the bake
+ * does not). */
+static inline bool
+mali_v7_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
+{
+   BITSET_DECLARE(d, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
+   memcpy(d, dyn->dirty, sizeof(d));
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_VIEWPORT_COUNT);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_VIEWPORTS);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_SCISSOR_COUNT);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_SCISSORS);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI_BINDINGS_VALID);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
+   return !BITSET_IS_EMPTY(d);
+}
+#endif
+
 /* Dynamic states this driver reads at draw time, per dirty group. */
 static inline void
 mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
@@ -1277,9 +1311,16 @@ mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP))
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
    if (d->pipeline && d->pipeline->bind.dynamic) {
-      /* Words baked from state the pipeline left dynamic: repack. */
-      d->dirty |= MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_ZSD | MALI_GFX_DIRTY_BLEND |
-                  MALI_GFX_DIRTY_FS_FAU;
+      /* Words baked from state the pipeline left dynamic: repack. On
+       * Bifrost only when a state the bake reads changed (vkCmdSet* and
+       * the pipeline bind mark a state dirty only when its value changes;
+       * a new pipeline, a new pass and meta operations mark these groups
+       * themselves). */
+#if PAN_ARCH < 9
+      if (!mali_v7_dyn_lazy() || mali_v7_dyn_bake_dirty(dyn))
+#endif
+         d->dirty |= MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_ZSD | MALI_GFX_DIRTY_BLEND |
+                     MALI_GFX_DIRTY_FS_FAU;
    }
    vk_dynamic_graphics_state_clear_dirty(dyn);
 }
@@ -1382,14 +1423,16 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
       d->dirty |= MALI_GFX_DIRTY_VS_SRT;
    if (d->fs_sets_dirty & bd->fs_sets)
       d->dirty |= MALI_GFX_DIRTY_FS_SRT;
+#if PAN_ARCH < 9
+   /* Bifrost: the draw marks a stage's FAU block for its uniform-buffer
+    * words when the stage's tables or its dynamic offsets changed
+    * (mali_jm_cmd_draw.c prepare_draw; vertex shaders have them too,
+    * mali_shader.c). */
+#else
    /* A fragment shader with uniform-buffer words in FAU needs them again
     * whenever its sets or dynamic offsets change. */
    if ((d->dirty & MALI_GFX_DIRTY_FS_SRT) && p->fs && p->fs->fau.ubo_push_count)
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
-#if PAN_ARCH < 9
-   /* On Bifrost vertex shaders have them too (mali_shader.c). */
-   if ((d->dirty & MALI_GFX_DIRTY_VS_SRT) && p->vs->fau.ubo_push_count)
-      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
 #endif
 
    r->tls_size = MAX2(r->tls_size, bd->tls_size);

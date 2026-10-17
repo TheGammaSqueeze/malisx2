@@ -110,6 +110,10 @@ bool mali_v7_census(void);
  * read it once. */
 bool mali_v7_debug_switch(const char *env, const char *prop, bool def);
 
+/* The same for a number: `def` unless the value is an integer from min to
+ * max. */
+int mali_v7_debug_int(const char *env, const char *prop, int def, int min, int max);
+
 #define MALI_TODO_V7(what)                                                     \
    do {                                                                        \
       static bool mali_todo_v7_said_;                                          \

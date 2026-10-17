@@ -55,6 +55,24 @@ mali_v7_debug_switch(const char *env, const char *prop, bool def)
    return def;
 }
 
+int
+mali_v7_debug_int(const char *env, const char *prop, int def, int min, int max)
+{
+   const char *s = getenv(env);
+#ifdef __ANDROID__
+   char value[PROP_VALUE_MAX] = "";
+   if (!(s && *s) && __system_property_get(prop, value) > 0 && value[0])
+      s = value;
+#else
+   (void)prop;
+#endif
+   if (!s || !*s)
+      return def;
+   char *end = NULL;
+   const long v = strtol(s, &end, 10);
+   return end != s && !*end && v >= min && v <= max ? (int)v : def;
+}
+
 bool
 mali_v7_census(void)
 {

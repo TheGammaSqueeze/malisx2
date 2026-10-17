@@ -217,11 +217,42 @@ build_dyn_ssbos(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
 static bool cpu_copy_mode(void);
 
 bool
+mali_v7_ubo_keep(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = mali_v7_debug_switch("MALISX2_V7_UBO_KEEP", "debug.malisx2.v7_ubo_keep", true);
+   return on;
+}
+
+/* The bound dynamic offset a dynamic buffer map entry names (0 when its
+ * set is not bound or has no such buffer, as dyn_buf skips it). */
+static inline uint32_t
+dyn_offset(const struct mali_desc_state *desc, uint32_t handle)
+{
+   const uint32_t set = MALI_COPY_DESC_HANDLE_SET(handle);
+   const uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(handle);
+   const struct mali_descriptor_set *s = desc && set < MALI_MAX_SETS ? desc->sets[set] : NULL;
+   if (!s || idx >= s->layout->dyn_buf_count)
+      return 0;
+   return desc->dyn_offsets[set][idx];
+}
+
+static inline void
+save_dyn_offsets(const struct mali_shader *s, const struct mali_desc_state *desc,
+                 struct mali_v7_desc_tables *t)
+{
+   for (uint32_t i = 0; i < s->desc.dyn_bufs.count; i++)
+      t->dyn_offsets[i] = dyn_offset(desc, s->desc.dyn_bufs.map[i]);
+}
+
+bool
 mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                      const struct mali_desc_state *desc, bool img,
-                     struct mali_v7_desc_tables *t)
+                     struct mali_v7_desc_tables *t, bool *unchanged)
 {
    const struct mali_v7_shader_desc *v7 = &s->v7;
+   *unchanged = false;
    if (t->shader != s || v7->count[MALI_V7_DESC_TABLE_UBO] ||
        (!img && v7->count[MALI_V7_DESC_TABLE_IMG]) || cpu_copy_mode())
       return false;
@@ -230,6 +261,17 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       if (t->sets[i] != (set ? set->gpu : 0) ||
           t->set_desc_counts[i] != (set ? set->layout->desc_count : 0))
          return false;
+   }
+
+   /* The same sets and the same offsets: the tables stand as they are. */
+   if (mali_v7_ubo_keep()) {
+      bool same = true;
+      for (uint32_t i = 0; i < s->desc.dyn_bufs.count && same; i++)
+         same = t->dyn_offsets[i] == dyn_offset(desc, s->desc.dyn_bufs.map[i]);
+      if (same) {
+         *unchanged = true;
+         return true;
+      }
    }
 
    const uint32_t dyn_ubo_count = v7->dyn_ubo_count;
@@ -253,6 +295,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    t->tables[MALI_V7_DESC_TABLE_UBO] = ubo;
    t->tables_cpu[MALI_V7_DESC_TABLE_UBO] = ubo_cpu;
    t->dyn_ssbos = dyn_ssbos;
+   save_dyn_offsets(s, desc, t);
    return true;
 }
 
@@ -332,6 +375,7 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       if (!out->dyn_ssbos)
          return false;
    }
+   save_dyn_offsets(s, desc, out);
    return true;
 }
 
@@ -664,8 +708,13 @@ get_desc_copy(struct mali_cmd_buffer *cmd)
    struct mali_device *dev = cmd->dev;
    struct mali_jm_device *jd = dev->jm;
 
+   /* Set once, under the lock, and kept until the device goes: a draw
+    * that finds it there needs no lock (each draw asked for it). */
+   struct mali_shader *s = __atomic_load_n(&jd->v7_desc_copy, __ATOMIC_ACQUIRE);
+   if (likely(s))
+      return s;
    simple_mtx_lock(&dev->meta_lock);
-   struct mali_shader *s = jd->v7_desc_copy;
+   s = jd->v7_desc_copy;
    if (!s) {
       nir_shader *nir = build_desc_copy_nir(dev);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
@@ -684,7 +733,7 @@ get_desc_copy(struct mali_cmd_buffer *cmd)
       _mesa_blake3_final(&h, key);
       if (MALI_PER_ARCH(shader_compile)(dev, &info, key, &s) != VK_SUCCESS)
          s = NULL;
-      jd->v7_desc_copy = s;
+      __atomic_store_n(&jd->v7_desc_copy, s, __ATOMIC_RELEASE);
    }
    simple_mtx_unlock(&dev->meta_lock);
 
@@ -730,14 +779,36 @@ build_ubo_copy_nir(struct mali_device *dev)
    return b.shader;
 }
 
+/* The Local Storage descriptor of a copy job: the same for every copy job
+ * of the command buffer when the copy shader has no thread or workgroup
+ * storage (it has neither), so made once per command buffer. */
+static uint64_t
+copy_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *copy, const uint32_t groups[3])
+{
+   if (copy->info.tls_size || copy->info.wls_size) {
+      const struct mali_thread_props tp = mali_thread_props(cmd->dev);
+      return mali_compute_tsd(cmd, copy, &tp, groups);
+   }
+   if (!cmd->jm.copy_tsd) {
+      const struct mali_thread_props tp = mali_thread_props(cmd->dev);
+      cmd->jm.copy_tsd = mali_compute_tsd(cmd, copy, &tp, groups);
+   }
+   return cmd->jm.copy_tsd;
+}
+
 static const struct mali_shader *
 get_ubo_copy(struct mali_cmd_buffer *cmd)
 {
    struct mali_device *dev = cmd->dev;
    struct mali_jm_device *jd = dev->jm;
 
+   /* Set once, under the lock, and kept until the device goes: a draw
+    * that finds it there needs no lock (each draw asked for it). */
+   struct mali_shader *s = __atomic_load_n(&jd->v7_ubo_copy, __ATOMIC_ACQUIRE);
+   if (likely(s))
+      return s;
    simple_mtx_lock(&dev->meta_lock);
-   struct mali_shader *s = jd->v7_ubo_copy;
+   s = jd->v7_ubo_copy;
    if (!s) {
       nir_shader *nir = build_ubo_copy_nir(dev);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
@@ -755,7 +826,7 @@ get_ubo_copy(struct mali_cmd_buffer *cmd)
       _mesa_blake3_final(&h, key);
       if (MALI_PER_ARCH(shader_compile)(dev, &info, key, &s) != VK_SUCCESS)
          s = NULL;
-      jd->v7_ubo_copy = s;
+      __atomic_store_n(&jd->v7_ubo_copy, s, __ATOMIC_RELEASE);
    }
    simple_mtx_unlock(&dev->meta_lock);
 
@@ -808,9 +879,8 @@ mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const str
    const uint32_t base[3] = {0, 0, 0};
    const uint32_t groups[3] = {2 * n, 1, 1};
    const uint32_t local[3] = {1, 1, 1};
-   const struct mali_thread_props tp = mali_thread_props(cmd->dev);
    const uint64_t fau = mali_v7_compute_fau(cmd, copy, NULL, &info, sizeof(info), base, groups);
-   const uint64_t tsd = mali_compute_tsd(cmd, copy, &tp, groups);
+   const uint64_t tsd = copy_tsd(cmd, copy, groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (copy->fau.total_count && !fau))
       return false;
 
@@ -977,9 +1047,8 @@ mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    const uint32_t base[3] = {0, 0, 0};
    const uint32_t groups[3] = {copy_count, 1, 1};
    const uint32_t local[3] = {1, 1, 1};
-   const struct mali_thread_props tp = mali_thread_props(cmd->dev);
    const uint64_t fau = mali_v7_compute_fau(cmd, copy, NULL, &info, sizeof(info), base, groups);
-   const uint64_t tsd = mali_compute_tsd(cmd, copy, &tp, groups);
+   const uint64_t tsd = copy_tsd(cmd, copy, groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (copy->fau.total_count && !fau))
       return false;
 

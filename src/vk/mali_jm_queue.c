@@ -833,6 +833,12 @@ chain_req(const struct mali_jm_chain *c)
  * build so that nothing but device loss can stop it half way (the queue
  * state it updates, q->carry included, would not match the atoms that
  * reached the kernel). */
+#if PAN_ARCH < 9
+/* Set by submit_log while its trigger file exists: build_submit logs why
+ * each vtc atom waits for fragment work (measurement only). */
+static bool v7_deplog_on;
+#endif
+
 static VkResult
 build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_ref *batch_frag)
 {
@@ -920,6 +926,16 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
                if (req && newer(req, q->xvtc_frag) == req)
                   q->xvtc_frag = 0;
             }
+#if PAN_ARCH < 9
+            if (unlikely(v7_deplog_on))
+               mesa_logi("malisx2 v7 deps: cmd %u batch %u vtc waits for frag %llu: semaphore %llu, "
+                         "barrier %d carry 0x%x, heap slot %d last frag %llu, newest frag %llu",
+                         c, k, (unsigned long long)mali_jm_ref_serial(req),
+                         (unsigned long long)mali_jm_ref_serial(frag_req), bt->vtc_after_frag,
+                         q->carry, bt->heap_slot,
+                         (unsigned long long)(bt->heap_slot >= 0 ? mali_jm_ref_serial(q->heap_last_frag[bt->heap_slot]) : 0),
+                         (unsigned long long)mali_jm_ref_serial(q->last[MALI_JM_SLOT_FRAG]));
+#endif
             vtc = mali_jm_build_atom(dev, MALI_JM_ATOM_VTC, MALI_JM_SLOT_VTC,
                                      MALI_JM_REQ_VTC | chain_req(&bt->vtc), bt->vtc.first,
                                      NULL, ud, q->last[MALI_JM_SLOT_VTC], req, &result);
@@ -945,6 +961,12 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
                return result;
             q->carry &= ~MALI_JM_REQ_FRAG_AFTER_VTC;
          }
+#if PAN_ARCH < 9
+         if (unlikely(v7_deplog_on))
+            mesa_logi("malisx2 v7 deps: cmd %u batch %u vtc atom %llu frag atom %llu", c, k,
+                      (unsigned long long)mali_jm_ref_serial(vtc),
+                      (unsigned long long)mali_jm_ref_serial(frag));
+#endif
          if (frag && bt->heap_slot >= 0 && bt->heap_slot < MALI_JM_HEAP_SLOTS_MAX)
             q->heap_last_frag[bt->heap_slot] = frag;
          if (frag && bt->frag_xfer)
@@ -1002,8 +1024,10 @@ submit_log(uint64_t seqno, uint64_t seq, const struct vk_queue_submit *submit, u
    }
    if (!state)
       return;
+   v7_deplog_on = false;
    if (state == 2 ? access(trigger, F_OK) != 0 : seqno < first || seqno >= first + count)
       return;
+   v7_deplog_on = true;
    mesa_logi("malisx2 v7 submit %llu (seq now %llu) at %lld ns: lock wait %lld us, call %lld us, "
              "%u command buffers, %u waits, %u signals, %u atoms in flight",
              (unsigned long long)seqno, (unsigned long long)seq, (long long)t0,

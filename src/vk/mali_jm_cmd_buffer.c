@@ -329,10 +329,39 @@ chain_has_room(struct mali_cmd_buffer *cmd, const struct mali_jm_chain *c)
    return false;
 }
 
+#if PAN_ARCH < 9
+void
+mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep)
+{
+   struct mali_jm_cmd *jm = &cmd->jm;
+   if (jm->pend_tilers <= keep)
+      return;
+   assert(jm->open);
+   struct mali_jm_chain *c = &jm->cur.vtc;
+   const unsigned n = jm->pend_tilers - keep;
+   for (unsigned i = 0; i < n; i++) {
+      if (!chain_has_room(cmd, c))
+         break;
+      link_job(cmd, c, jm->pend_tiler[i], MALI_JOB_TYPE_TILER, false, jm->pend_tiler_dep1[i]);
+   }
+   for (unsigned i = 0; i < keep; i++) {
+      jm->pend_tiler[i] = jm->pend_tiler[n + i];
+      jm->pend_tiler_dep1[i] = jm->pend_tiler_dep1[n + i];
+   }
+   jm->pend_tilers = keep;
+}
+#endif
+
 struct mali_ptr
 mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                     enum mali_job_type type, unsigned size, bool barrier, uint16_t dep1)
 {
+#if PAN_ARCH < 9
+   /* Any job but a draw's own copy and Vertex jobs goes in behind the
+    * last draw's Tiler job. */
+   if (unlikely(cmd->jm.pend_tilers) && !cmd->jm.tiler_defer)
+      mali_v7_link_tilers(cmd, 0);
+#endif
    if (!chain_has_room(cmd, c))
       return (struct mali_ptr){0};
 
@@ -427,6 +456,9 @@ mali_jm_cmd_batch_close(struct mali_cmd_buffer *cmd)
 {
    if (!cmd->jm.open)
       return;
+#if PAN_ARCH < 9
+   mali_v7_link_tilers(cmd, 0);
+#endif
    cmd->jm.open = false;
    struct mali_jm_batch *b = &cmd->jm.cur;
    if (!b->vtc.jobs && !batch_has_frag_jobs(cmd)) {
@@ -854,6 +886,11 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->jm.resets);
    util_dynarray_clear(&cmd->jm.reset_data);
    cmd->jm.open = false;
+#if PAN_ARCH < 9
+   cmd->jm.pend_tilers = 0;
+   cmd->jm.tiler_defer = false;
+   cmd->jm.copy_tsd = 0;
+#endif
    cmd->jm.req = cmd->jm.end_req = 0;
    cmd->jm.resubmit = false;
    cmd->jm.submitted = false;
