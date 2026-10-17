@@ -610,6 +610,18 @@ bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                        const struct mali_v7_desc_tables *t, uint32_t attrib_buf_idx_offset,
                        uint16_t *index);
 
+/*
+ * A fragment shader's uniform buffer words in FAU (mali_shader.c
+ * lower_ubo_push): a Compute job on chain c that copies them from the bound
+ * dynamic uniform buffers into the draw's FAU block at fau_va (the block's
+ * address, without the count in the top byte). Nothing to do for a shader
+ * without such words. False on failure, with the command buffer's error
+ * set.
+ */
+bool mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                      const struct mali_shader *s, const struct mali_desc_state *desc,
+                      uint64_t fau_va);
+
 /* The desc.sets system values of one stage (graphics v7_desc.sets, compute
  * v7_desc.sets): the addresses of the bound sets the shader reads, and at
  * MALI_V7_DESC_TABLE_DYN_SSBOS its dynamic storage buffer table. */
@@ -788,6 +800,8 @@ struct mali_jm_device {
    /* The descriptor copy shader (mali_jm_desc_v7.c), compiled on first
     * use under mali_device::meta_lock, unreferenced at device_finish. */
    struct mali_shader *v7_desc_copy;
+   /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
+   struct mali_shader *v7_ubo_copy;
 #endif
 
    /* Set for the duration of one vkQueueSubmit when MALISX2_MEASURE's

@@ -687,6 +687,20 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       srca |= m->srcAccessMask;
       dsta |= m->dstAccessMask;
    }
+#if PAN_ARCH < 9
+   /* Buffer and global dependencies only (an image barrier's access scope
+    * is the image): fragment shaders read their pushed uniform buffer
+    * words from FAU, filled by a copy job on the vtc chain
+    * (mali_v7_ubo_copy), so a dependency into fragment shading's uniform
+    * reads is one into that job too. */
+   const VkPipelineStageFlags2 buf_dst = vk_expand_dst_stage_flags2(dst);
+   const VkAccessFlags2 buf_dsta = vk_filter_dst_access_flags2(buf_dst, dsta);
+   const bool ubo_dep = (buf_dst & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) &&
+                        (buf_dsta & (VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT |
+                                     VK_ACCESS_2_MEMORY_READ_BIT));
+   const VkPipelineStageFlags2 buf_src = src;
+   const VkAccessFlags2 buf_srca = srca;
+#endif
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
       src |= m->srcStageMask;
@@ -711,6 +725,11 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       return;
    }
    mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
+#if PAN_ARCH < 9
+   if (ubo_dep)
+      mali_jm_cmd_barrier(cmd, buf_src, buf_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+                          VK_ACCESS_2_UNIFORM_READ_BIT);
+#endif
 }
 
 /* ---------------------------------------------------------------------- */

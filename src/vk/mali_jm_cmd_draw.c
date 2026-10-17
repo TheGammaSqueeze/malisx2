@@ -390,6 +390,9 @@ struct draw_data {
     * buffer index the vertex shader's image Attributes start at. */
    bool vs_copy, fs_copy;
    uint32_t vs_img_buf_offset;
+   /* The fragment shader's FAU block was rebuilt and has uniform buffer
+    * words to copy in (mali_v7_ubo_copy). */
+   bool ubo_copy;
 };
 
 /*
@@ -801,6 +804,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          return false;
       assert(!v || !p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
       t->fs_fau = v & BITFIELD64_MASK(56);
+      dd->ubo_copy = p->fs && p->fs->fau.ubo_push_count && t->fs_fau;
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
       t->viewport = mali_gfx_viewport_desc(cmd);
@@ -1112,7 +1116,7 @@ struct drawstats {
    uint32_t bs, bs_const, ff, opaque, off, dest_read;
    uint32_t update_late, kill_late, update_weak, kill_weak, fpk, fpk_killed;
    uint32_t r64, discard, zwrite_shader, ztest, zwrite, stest, per_sample;
-   uint32_t vs_copies, fs_copies;
+   uint32_t vs_copies, fs_copies, ubo_copies;
    uint32_t fs_count, fs_overflow;
    struct drawstats_fs fs[DRAWSTATS_MAX_FS];
 };
@@ -1158,11 +1162,11 @@ drawstats_flush(struct drawstats *s, uint32_t threshold)
              "(constant forced %u) fixed-function %u opaque %u off %u, dest read %u | zs update "
              "late %u weak %u, pixel kill late %u weak %u, fpk %u, fpk killable %u | fs 64 regs %u, "
              "can discard %u, shader depth %u, per sample %u | depth test %u write %u, stencil "
-             "test %u | descriptor copy jobs vs %u fs %u | %u fragment shaders%s",
+             "test %u | copy jobs: descriptors vs %u fs %u, uniform words %u | %u fragment shaders%s",
              s->w, s->h, s->draws, s->verts, s->shaded, s->bs, s->bs_const, s->ff, s->opaque, s->off,
              s->dest_read, s->update_late, s->update_weak, s->kill_late, s->kill_weak, s->fpk,
              s->fpk_killed, s->r64, s->discard, s->zwrite_shader, s->per_sample, s->ztest,
-             s->zwrite, s->stest, s->vs_copies, s->fs_copies, s->fs_count,
+             s->zwrite, s->stest, s->vs_copies, s->fs_copies, s->ubo_copies, s->fs_count,
              s->fs_overflow ? " (more not listed)" : "");
    qsort(s->fs, s->fs_count, sizeof(s->fs[0]), drawstats_fs_cmp);
    for (uint32_t i = 0; i < s->fs_count; i++) {
@@ -1173,13 +1177,13 @@ drawstats_flush(struct drawstats *s, uint32_t threshold)
       mesa_logi("malisx2 v7 drawstats:   fs %016" PRIx64 " draws %u verts %u | regs %u threads "
                 "%u instrs %u tuples %u clauses %u cycles %.2f arith %.2f t %.2f ldst %.2f v "
                 "%.2f spills %u fills %u preloads %u code %u | discard %u depth %u fpk %u "
-                "msg preload %u%u | fau %u",
+                "msg preload %u%u | fau %u, uniform words pushed %u",
                 key, s->fs[i].draws, s->fs[i].verts, fs->info.work_reg_count, b->threads,
                 b->instrs, b->tuples, b->clauses, b->cycles, b->arith, b->t, b->ldst, b->v,
                 b->spills, b->fills, b->preloads, fs->bin_size, fs->info.fs.can_discard,
                 fs->info.fs.writes_depth, fs->info.fs.can_fpk,
                 fs->info.bifrost.messages[0].enabled, fs->info.bifrost.messages[1].enabled,
-                fs->fau.total_count);
+                fs->fau.total_count, fs->fau.ubo_push_count);
    }
 }
 
@@ -1187,7 +1191,7 @@ drawstats_flush(struct drawstats *s, uint32_t threshold)
  * are written). */
 static void
 drawstats_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, uint32_t shaded,
-               bool vs_copy, bool fs_copy)
+               bool vs_copy, bool fs_copy, bool ubo_copy)
 {
    static __thread struct drawstats s;
    const uint32_t threshold = drawstats_threshold();
@@ -1211,6 +1215,7 @@ drawstats_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, uin
    s.shaded += shaded;
    s.vs_copies += vs_copy;
    s.fs_copies += fs_copy;
+   s.ubo_copies += ubo_copy;
 
    if (t->fs_rsd_cpu) {
       pan_unpack((const struct mali_renderer_state_packed *)t->fs_rsd_cpu, RENDERER_STATE, rsd);
@@ -1434,10 +1439,16 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       dcd.opaque[0] |= t->dcd0;
       memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
 
+      /* Uniform buffer words into the fragment shader's FAU block: read by
+       * the fragment job, after the whole vtc atom. */
+      if (dd.ubo_copy && !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau))
+         return;
+
       if (unlikely(dump_enabled()))
          dump_draw(cmd, di, &dd, vj, vertex_index, tj, c->index, instance_size, vs_copy,
                    fs_copy);
-      drawstats_draw(cmd, di, dd.vertex_range * di->instance_count, vs_copy != 0, fs_copy != 0);
+      drawstats_draw(cmd, di, dd.vertex_range * di->instance_count, vs_copy != 0, fs_copy != 0,
+                     dd.ubo_copy);
    } else if (unlikely(dump_enabled())) {
       dump_draw(cmd, di, &dd, vj, vertex_index, (struct mali_ptr){0}, 0, instance_size,
                 vs_copy, fs_copy);

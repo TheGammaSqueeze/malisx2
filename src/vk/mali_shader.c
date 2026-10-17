@@ -583,6 +583,137 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
             nir_metadata_control_flow, &ctx);
    s->fau.total_count += n;
 }
+#elif PAN_ARCH < 9
+
+/*
+ * Bifrost: the same idea as v11 (a fragment shader's constant-offset reads
+ * of dynamic uniform buffers become FAU reads), with the words copied into
+ * the draw's FAU block by a small Compute job in the vtc chain
+ * (mali_jm_cmd_draw.c, "Uniform buffer words in FAU"): the job manager has
+ * no command-stream loads and stores, and the fragment job that reads the
+ * FAU block starts only once the whole vtc atom has run. Each such read is
+ * otherwise a LOAD.ubo, a load/store-unit message per warp; azahar's
+ * fragment shaders are bound by them (the PICA combiner constants and
+ * lighting parameters).
+ *
+ * Partial: when the words of every load do not fit, the loads are taken in
+ * program order while their words fit, and the others stay loads.
+ */
+#define V7_UBO_PUSH_FAU_LIMIT 48
+#define V7_UBO_PUSH_MAX_BYTES 2048
+#define V7_UBO_PUSH_WORDS_PER_BUF (V7_UBO_PUSH_MAX_BYTES / 8)
+
+struct v7_ubo_push_ctx {
+   struct mali_shader *s;
+   uint32_t first_index;   /* UBO table index of dynamic uniform buffer 0 */
+   uint32_t budget;        /* words that may still be pushed */
+   BITSET_DECLARE(used, MALI_MAX_DYNAMIC_UNIFORM_BUFFERS * V7_UBO_PUSH_WORDS_PER_BUF);
+   bool lower;
+};
+
+/* The dynamic uniform buffer and the word range a load reads, or false when
+ * it cannot be pushed (a non-constant index or offset, another buffer, an
+ * offset past V7_UBO_PUSH_MAX_BYTES). */
+static bool
+v7_ubo_push_load(const struct v7_ubo_push_ctx *ctx, nir_intrinsic_instr *intr,
+                 unsigned *first, unsigned *last, uint32_t *offset)
+{
+   if (intr->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(intr->src[0]) ||
+       !nir_src_is_const(intr->src[1]) || intr->def.bit_size < 32)
+      return false;
+   const uint32_t index = nir_src_as_uint(intr->src[0]);
+   if (index < ctx->first_index || index - ctx->first_index >= ctx->s->v7.dyn_ubo_count ||
+       index - ctx->first_index >= MALI_MAX_DYNAMIC_UNIFORM_BUFFERS)
+      return false;
+   const uint32_t dyn = index - ctx->first_index;
+   *offset = nir_src_as_uint(intr->src[1]);
+   const uint32_t bytes = intr->def.num_components * (intr->def.bit_size / 8);
+   if (*offset % 4 || *offset + bytes > V7_UBO_PUSH_MAX_BYTES)
+      return false;
+   *first = dyn * V7_UBO_PUSH_WORDS_PER_BUF + *offset / 8;
+   *last = dyn * V7_UBO_PUSH_WORDS_PER_BUF + (*offset + bytes - 1) / 8;
+   return true;
+}
+
+static bool
+v7_ubo_push_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct v7_ubo_push_ctx *ctx = data;
+   unsigned first, last;
+   uint32_t offset;
+   if (!v7_ubo_push_load(ctx, intr, &first, &last, &offset))
+      return false;
+
+   if (!ctx->lower) {
+      /* Take the load if its new words fit. */
+      unsigned need = 0;
+      for (unsigned w = first; w <= last; w++)
+         need += !BITSET_TEST(ctx->used, w);
+      if (need <= ctx->budget) {
+         BITSET_SET_RANGE(ctx->used, first, last);
+         ctx->budget -= need;
+      }
+      return false;
+   }
+
+   for (unsigned w = first; w <= last; w++) {
+      if (!BITSET_TEST(ctx->used, w))
+         return false;
+   }
+   /* The pushed words are in (buffer, offset) order, so the words of one
+    * load are adjacent in FAU. */
+   const unsigned fau_word = ctx->s->fau.ubo_push_start + BITSET_PREFIX_SUM(ctx->used, first);
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *val = nir_load_push_constant(
+      b, intr->def.num_components, intr->def.bit_size,
+      nir_imm_int(b, fau_word * MALI_FAU_WORD_SIZE + offset % 8));
+   nir_def_replace(&intr->def, val);
+   return true;
+}
+
+static bool
+v7_ubo_push_enabled(void)
+{
+   static int state = -1;
+   if (state < 0)
+      state = mali_v7_debug_switch("MALISX2_V7_UBO_PUSH", "debug.malisx2.v7_ubo_push", true);
+   return state;
+}
+
+static void
+lower_ubo_push(nir_shader *nir, struct mali_shader *s)
+{
+   s->fau.ubo_push_start = s->fau.total_count;
+   s->fau.ubo_push_count = 0;
+
+   if (nir->info.stage != MESA_SHADER_FRAGMENT || !s->v7.dyn_ubo_count ||
+       !v7_ubo_push_enabled() || s->fau.total_count >= V7_UBO_PUSH_FAU_LIMIT)
+      return;
+
+   struct v7_ubo_push_ctx ctx = {
+      .s = s,
+      .first_index = s->v7.count[MALI_V7_DESC_TABLE_UBO],
+      .budget = MIN2(MALI_MAX_UBO_PUSH_FAUS, V7_UBO_PUSH_FAU_LIMIT - s->fau.total_count),
+   };
+   nir_shader_intrinsics_pass(nir, v7_ubo_push_intr, nir_metadata_all, &ctx);
+
+   const unsigned n = BITSET_COUNT(ctx.used);
+   if (!n)
+      return;
+   assert(n <= MALI_MAX_UBO_PUSH_FAUS);
+   unsigned w;
+   BITSET_FOREACH_SET(w, ctx.used, MALI_MAX_DYNAMIC_UNIFORM_BUFFERS * V7_UBO_PUSH_WORDS_PER_BUF) {
+      s->fau.ubo_push[s->fau.ubo_push_count++] = (struct mali_ubo_push_word){
+         .dyn = w / V7_UBO_PUSH_WORDS_PER_BUF,
+         .offset = (w % V7_UBO_PUSH_WORDS_PER_BUF) * 8,
+      };
+   }
+
+   ctx.lower = true;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_ubo_push_intr,
+            nir_metadata_control_flow, &ctx);
+   s->fau.total_count += n;
+}
 #else
 /* v9: nothing is pushed. The words are copied per draw with command-stream
  * loads and stores on v11, and the job manager has no such instructions;

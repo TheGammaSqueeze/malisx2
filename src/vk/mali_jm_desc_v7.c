@@ -693,12 +693,149 @@ get_desc_copy(struct mali_cmd_buffer *cmd)
    return s;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Uniform buffer words in FAU                                             */
+
+/*
+ * The copy job of a fragment shader whose dynamic uniform buffer reads
+ * became FAU reads (mali_shader.c lower_ubo_push, fau.ubo_push): one
+ * invocation per 32-bit half of a pushed word, dst[i] = *table[i], where
+ * table[i] is the address of that half in the bound buffer, offset
+ * applied, or of a zero word for a half past the binding's range. The
+ * fragment job reads the FAU block after the whole vtc atom, so the job
+ * needs no dependency and nothing waits for it.
+ */
+struct ubo_copy_info {
+   uint64_t table;
+   uint64_t dst;
+};
+
+static nir_shader *
+build_ubo_copy_nir(struct mali_device *dev)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE), "%s",
+      "mali_v7_ubo_copy");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *table = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, offsetof(struct ubo_copy_info, table)));
+   nir_def *dst = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, offsetof(struct ubo_copy_info, dst)));
+   nir_def *src = nir_load_global(&b, 1, 64, nir_iadd(&b, table, nir_u2u64(&b, nir_imul_imm(&b, id, 8))),
+                                  .align_mul = 8);
+   nir_def *v = nir_load_global(&b, 1, 32, src, .align_mul = 4);
+   nir_store_global(&b, v, nir_iadd(&b, dst, nir_u2u64(&b, nir_imul_imm(&b, id, 4))), .align_mul = 4);
+   return b.shader;
+}
+
+static const struct mali_shader *
+get_ubo_copy(struct mali_cmd_buffer *cmd)
+{
+   struct mali_device *dev = cmd->dev;
+   struct mali_jm_device *jd = dev->jm;
+
+   simple_mtx_lock(&dev->meta_lock);
+   struct mali_shader *s = jd->v7_ubo_copy;
+   if (!s) {
+      nir_shader *nir = build_ubo_copy_nir(dev);
+      MALI_PER_ARCH(shader_preprocess)(dev, nir);
+      const struct vk_pipeline_robustness_state rs = {
+         .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+         .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+         .vertex_inputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+         .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+      };
+      const struct mali_shader_compile_info info = {.nir = nir, .rs = &rs};
+      blake3_hash key;
+      struct mesa_blake3 h;
+      _mesa_blake3_init(&h);
+      _mesa_blake3_update(&h, "mali-v7-ubo-copy", 16);
+      _mesa_blake3_final(&h, key);
+      if (MALI_PER_ARCH(shader_compile)(dev, &info, key, &s) != VK_SUCCESS)
+         s = NULL;
+      jd->v7_ubo_copy = s;
+   }
+   simple_mtx_unlock(&dev->meta_lock);
+
+   if (!s)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   return s;
+}
+
+bool
+mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const struct mali_shader *s,
+                 const struct mali_desc_state *desc, uint64_t fau_va)
+{
+   const uint32_t n = s->fau.ubo_push_count;
+   if (!n || !fau_va)
+      return true;
+   const struct mali_shader *copy = get_ubo_copy(cmd);
+   if (!copy || !copy->spd[MALI_SPD_MAIN])
+      return false;
+
+   /* 2n source addresses, then the zero word they fall back to. */
+   struct mali_ptr p = mali_cmd_alloc(cmd, (2 * n + 1) * sizeof(uint64_t), 16);
+   if (!p.cpu)
+      return false;
+   const uint64_t zero = p.gpu + 2 * n * sizeof(uint64_t);
+   uint64_t table[2 * MALI_MAX_UBO_PUSH_FAUS + 1];
+   uint32_t dyn_cached = UINT32_MAX;
+   uint64_t addr = 0, range = 0;
+   for (uint32_t i = 0; i < n; i++) {
+      const struct mali_ubo_push_word *w = &s->fau.ubo_push[i];
+      if (w->dyn != dyn_cached) {
+         dyn_cached = w->dyn;
+         if (w->dyn >= s->v7.dyn_ubo_count ||
+             !dyn_buf(desc, s->desc.dyn_bufs.map[w->dyn], &addr, &range) || (addr >> 56))
+            addr = range = 0;
+      }
+      for (unsigned h = 0; h < 2; h++) {
+         const uint64_t off = w->offset + 4 * h;
+         table[2 * i + h] = addr && off + 4 <= range ? addr + off : zero;
+      }
+   }
+   table[2 * n] = 0;
+   memcpy(p.cpu, table, (2 * n + 1) * sizeof(uint64_t));
+
+   const struct ubo_copy_info info = {
+      .table = p.gpu,
+      .dst = fau_va + (uint64_t)s->fau.ubo_push_start * MALI_FAU_WORD_SIZE,
+   };
+   const uint32_t base[3] = {0, 0, 0};
+   const uint32_t groups[3] = {2 * n, 1, 1};
+   const uint32_t local[3] = {1, 1, 1};
+   const struct mali_thread_props tp = mali_thread_props(cmd->dev);
+   const uint64_t fau = mali_v7_compute_fau(cmd, copy, NULL, &info, sizeof(info), base, groups);
+   const uint64_t tsd = mali_compute_tsd(cmd, copy, &tp, groups);
+   if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (copy->fau.total_count && !fau))
+      return false;
+
+   struct mali_ptr job =
+      mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), false, 0);
+   if (!job.cpu)
+      return false;
+   mali_v7_compute_invocation(pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), local, groups);
+   pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = mali_v7_compute_task_split(local);
+   }
+   pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = copy->spd[MALI_SPD_MAIN];
+      cfg.push_uniforms = fau;
+      cfg.thread_storage = tsd;
+   }
+   return true;
+}
+
 void
 mali_v7_desc_finish(struct mali_device *dev)
 {
    struct mali_jm_device *jd = dev->jm;
    MALI_PER_ARCH(shader_unref)(dev, jd->v7_desc_copy);
    jd->v7_desc_copy = NULL;
+   MALI_PER_ARCH(shader_unref)(dev, jd->v7_ubo_copy);
+   jd->v7_ubo_copy = NULL;
 }
 
 /* ---------------------------------------------------------------------- */
