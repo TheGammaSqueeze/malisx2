@@ -139,3 +139,17 @@ executable(
   dependencies : [dep_dl, dep_m],
   install : false,
 )
+
+# idx_g52: indexed draws whose vertices sit at both ends of the vertex
+# buffer (a wrong vertex range drops them), with the index buffer rewritten
+# in place between submits, several draws and binds of one buffer in one
+# command buffer, a vertex offset and 32-bit indices, once per host-visible
+# memory type (cached non-coherent included).
+executable(
+  'idx_g52',
+  files('idx_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DIDX_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl],
+  install : false,
+)
