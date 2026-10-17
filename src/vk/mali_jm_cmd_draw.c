@@ -804,6 +804,71 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
 /* Indexed draws: the vertex range                                         */
 
 /*
+ * Min and max of n 16- or 32-bit indices, restart indices (all ones) left
+ * out of the max when restart is on: the min needs no exclusion, a restart
+ * index being the largest value, so a draw of nothing but restart indices
+ * comes out with min > max. Index buffers are usually in write-combined
+ * memory (azahar's stream buffer), where the CPU reads each load from
+ * DRAM: one 2-byte load per index reads 10 MB/s on the RG DS, eight
+ * 16-byte loads in a row (paired into LDP by the compiler, all in flight
+ * before the first is used) about 175 MB/s.
+ */
+#if defined(__aarch64__)
+static void
+scan_u16(const uint16_t *idx, uint32_t n, bool restart, uint32_t *min_out, uint32_t *max_out)
+{
+   uint16x8_t vmin = vdupq_n_u16(UINT16_MAX), vmax = vdupq_n_u16(0);
+   const uint16x8_t all = vdupq_n_u16(UINT16_MAX);
+   uint32_t i = 0;
+   for (; i + 64 <= n; i += 64) {
+      uint16x8_t v[8];
+      for (unsigned k = 0; k < 8; k++)
+         v[k] = vld1q_u16(idx + i + 8 * k);
+      for (unsigned k = 0; k < 8; k++) {
+         vmin = vminq_u16(vmin, v[k]);
+         /* A restart index counts as 0 for the max. */
+         vmax = vmaxq_u16(vmax, restart ? vbicq_u16(v[k], vceqq_u16(v[k], all)) : v[k]);
+      }
+   }
+   uint32_t min = vminvq_u16(vmin), max = vmaxvq_u16(vmax);
+   for (; i < n; i++) {
+      const uint32_t v = idx[i];
+      min = MIN2(min, v);
+      if (!restart || v != UINT16_MAX)
+         max = MAX2(max, v);
+   }
+   *min_out = min;
+   *max_out = max;
+}
+
+static void
+scan_u32(const uint32_t *idx, uint32_t n, bool restart, uint32_t *min_out, uint32_t *max_out)
+{
+   uint32x4_t vmin = vdupq_n_u32(UINT32_MAX), vmax = vdupq_n_u32(0);
+   const uint32x4_t all = vdupq_n_u32(UINT32_MAX);
+   uint32_t i = 0;
+   for (; i + 32 <= n; i += 32) {
+      uint32x4_t v[8];
+      for (unsigned k = 0; k < 8; k++)
+         v[k] = vld1q_u32(idx + i + 4 * k);
+      for (unsigned k = 0; k < 8; k++) {
+         vmin = vminq_u32(vmin, v[k]);
+         vmax = vmaxq_u32(vmax, restart ? vbicq_u32(v[k], vceqq_u32(v[k], all)) : v[k]);
+      }
+   }
+   uint32_t min = vminvq_u32(vmin), max = vmaxvq_u32(vmax);
+   for (; i < n; i++) {
+      const uint32_t v = idx[i];
+      min = MIN2(min, v);
+      if (!restart || v != UINT32_MAX)
+         max = MAX2(max, v);
+   }
+   *min_out = min;
+   *max_out = max;
+}
+#endif
+
+/*
  * The smallest and largest index of the draw, read from the index
  * buffer's CPU view (restart indices skipped when primitive restart is
  * on). False when there is no CPU view, or no index is in bounds; *empty
@@ -853,8 +918,14 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
    } while (0)
    switch (size) {
    case 1: SCAN(uint8_t, 0xff); break;
+#if defined(__aarch64__)
+   /* Index buffer offsets are a multiple of the index size. */
+   case 2: scan_u16((const uint16_t *)base, count, restart, &min, &max); break;
+   default: scan_u32((const uint32_t *)base, count, restart, &min, &max); break;
+#else
    case 2: SCAN(uint16_t, 0xffff); break;
    default: SCAN(uint32_t, 0xffffffffu); break;
+#endif
    }
 #undef SCAN
    if (min > max) {
@@ -1016,10 +1087,11 @@ struct drawstats {
    const struct mali_cmd_buffer *cmd;
    uint32_t pass;
    uint32_t w, h;
-   uint32_t draws, verts;
+   uint32_t draws, verts, shaded;
    uint32_t bs, bs_const, ff, opaque, off, dest_read;
    uint32_t update_late, kill_late, update_weak, kill_weak, fpk, fpk_killed;
    uint32_t r64, discard, zwrite_shader, ztest, zwrite, stest, per_sample;
+   uint32_t vs_copies, fs_copies;
    uint32_t fs_count, fs_overflow;
    struct drawstats_fs fs[DRAWSTATS_MAX_FS];
 };
@@ -1061,15 +1133,16 @@ drawstats_flush(struct drawstats *s, uint32_t threshold)
    const uint32_t n = logged++;
    if (n >= 4 && n % 200)
       return;
-   mesa_logi("malisx2 v7 drawstats: pass %ux%u, %u draws, %u vertices | blend shader %u "
+   mesa_logi("malisx2 v7 drawstats: pass %ux%u, %u draws, %u vertices (%u shaded) | blend shader %u "
              "(constant forced %u) fixed-function %u opaque %u off %u, dest read %u | zs update "
              "late %u weak %u, pixel kill late %u weak %u, fpk %u, fpk killable %u | fs 64 regs %u, "
              "can discard %u, shader depth %u, per sample %u | depth test %u write %u, stencil "
-             "test %u | %u fragment shaders%s",
-             s->w, s->h, s->draws, s->verts, s->bs, s->bs_const, s->ff, s->opaque, s->off,
+             "test %u | descriptor copy jobs vs %u fs %u | %u fragment shaders%s",
+             s->w, s->h, s->draws, s->verts, s->shaded, s->bs, s->bs_const, s->ff, s->opaque, s->off,
              s->dest_read, s->update_late, s->update_weak, s->kill_late, s->kill_weak, s->fpk,
              s->fpk_killed, s->r64, s->discard, s->zwrite_shader, s->per_sample, s->ztest,
-             s->zwrite, s->stest, s->fs_count, s->fs_overflow ? " (more not listed)" : "");
+             s->zwrite, s->stest, s->vs_copies, s->fs_copies, s->fs_count,
+             s->fs_overflow ? " (more not listed)" : "");
    qsort(s->fs, s->fs_count, sizeof(s->fs[0]), drawstats_fs_cmp);
    for (uint32_t i = 0; i < s->fs_count; i++) {
       const struct mali_shader *fs = s->fs[i].fs;
@@ -1079,19 +1152,21 @@ drawstats_flush(struct drawstats *s, uint32_t threshold)
       mesa_logi("malisx2 v7 drawstats:   fs %016" PRIx64 " draws %u verts %u | regs %u threads "
                 "%u instrs %u tuples %u clauses %u cycles %.2f arith %.2f t %.2f ldst %.2f v "
                 "%.2f spills %u fills %u preloads %u code %u | discard %u depth %u fpk %u "
-                "msg preload %u%u",
+                "msg preload %u%u | fau %u",
                 key, s->fs[i].draws, s->fs[i].verts, fs->info.work_reg_count, b->threads,
                 b->instrs, b->tuples, b->clauses, b->cycles, b->arith, b->t, b->ldst, b->v,
                 b->spills, b->fills, b->preloads, fs->bin_size, fs->info.fs.can_discard,
                 fs->info.fs.writes_depth, fs->info.fs.can_fpk,
-                fs->info.bifrost.messages[0].enabled, fs->info.bifrost.messages[1].enabled);
+                fs->info.bifrost.messages[0].enabled, fs->info.bifrost.messages[1].enabled,
+                fs->fau.total_count);
    }
 }
 
 /* One tiled draw of the current pass (after its RSD and Blend descriptors
  * are written). */
 static void
-drawstats_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+drawstats_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, uint32_t shaded,
+               bool vs_copy, bool fs_copy)
 {
    static __thread struct drawstats s;
    const uint32_t threshold = drawstats_threshold();
@@ -1112,6 +1187,9 @@ drawstats_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
    s.draws++;
    s.verts += di->count * di->instance_count;
+   s.shaded += shaded;
+   s.vs_copies += vs_copy;
+   s.fs_copies += fs_copy;
 
    if (t->fs_rsd_cpu) {
       pan_unpack((const struct mali_renderer_state_packed *)t->fs_rsd_cpu, RENDERER_STATE, rsd);
@@ -1338,7 +1416,7 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       if (unlikely(dump_enabled()))
          dump_draw(cmd, di, &dd, vj, vertex_index, tj, c->index, instance_size, vs_copy,
                    fs_copy);
-      drawstats_draw(cmd, di);
+      drawstats_draw(cmd, di, dd.vertex_range * di->instance_count, vs_copy != 0, fs_copy != 0);
    } else if (unlikely(dump_enabled())) {
       dump_draw(cmd, di, &dd, vj, vertex_index, (struct mali_ptr){0}, 0, instance_size,
                 vs_copy, fs_copy);
