@@ -136,6 +136,9 @@
 
 #include <inttypes.h>
 #include <stdlib.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Mesa helpers (pan_encoder.h, MIT, Collabora), not includable here       */
@@ -986,6 +989,181 @@ dump_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, const st
 }
 
 /* ---------------------------------------------------------------------- */
+/* Draw statistics                                                         */
+
+/*
+ * MALISX2_V7_DRAWSTATS=N or debug.malisx2.v7_drawstats=N (read once per
+ * process): for render passes with at least N draws, one summary line of
+ * what the fragment side of the pass will run (blend modes, early or late
+ * depth/stencil and pixel kill, forward pixel kill, register class of the
+ * fragment shaders) and one line per distinct fragment shader with its
+ * compiler statistics, so the fragment cost of a pass can be attributed.
+ * Logged for the first passes and then every 200th one. Off by default;
+ * measurement only.
+ */
+#define DRAWSTATS_MAX_FS 48
+
+struct drawstats_fs {
+   uint64_t code;
+   const struct mali_shader *fs;
+   uint32_t draws, verts;
+};
+
+struct drawstats {
+   const struct mali_cmd_buffer *cmd;
+   uint32_t pass;
+   uint32_t w, h;
+   uint32_t draws, verts;
+   uint32_t bs, bs_const, ff, opaque, off, dest_read;
+   uint32_t update_late, kill_late, update_weak, kill_weak, fpk, fpk_killed;
+   uint32_t r64, discard, zwrite_shader, ztest, zwrite, stest, per_sample;
+   uint32_t fs_count, fs_overflow;
+   struct drawstats_fs fs[DRAWSTATS_MAX_FS];
+};
+
+static uint32_t
+drawstats_threshold(void)
+{
+   static int value = -1;
+   int v = __atomic_load_n(&value, __ATOMIC_RELAXED);
+   if (v < 0) {
+      const char *s = getenv("MALISX2_V7_DRAWSTATS");
+      v = s && *s ? atoi(s) : 0;
+#ifdef __ANDROID__
+      if (!(s && *s)) {
+         char prop[PROP_VALUE_MAX] = "";
+         if (__system_property_get("debug.malisx2.v7_drawstats", prop) > 0 && prop[0])
+            v = atoi(prop);
+      }
+#endif
+      v = MAX2(v, 0);
+      __atomic_store_n(&value, v, __ATOMIC_RELAXED);
+   }
+   return v;
+}
+
+static int
+drawstats_fs_cmp(const void *a, const void *b)
+{
+   const struct drawstats_fs *x = a, *y = b;
+   return (int)y->draws - (int)x->draws;
+}
+
+static void
+drawstats_flush(struct drawstats *s, uint32_t threshold)
+{
+   static uint32_t logged;
+   if (!s->cmd || s->draws < threshold)
+      return;
+   const uint32_t n = logged++;
+   if (n >= 4 && n % 200)
+      return;
+   mesa_logi("malisx2 v7 drawstats: pass %ux%u, %u draws, %u vertices | blend shader %u "
+             "(constant forced %u) fixed-function %u opaque %u off %u, dest read %u | zs update "
+             "late %u weak %u, pixel kill late %u weak %u, fpk %u, fpk killable %u | fs 64 regs %u, "
+             "can discard %u, shader depth %u, per sample %u | depth test %u write %u, stencil "
+             "test %u | %u fragment shaders%s",
+             s->w, s->h, s->draws, s->verts, s->bs, s->bs_const, s->ff, s->opaque, s->off,
+             s->dest_read, s->update_late, s->update_weak, s->kill_late, s->kill_weak, s->fpk,
+             s->fpk_killed, s->r64, s->discard, s->zwrite_shader, s->per_sample, s->ztest,
+             s->zwrite, s->stest, s->fs_count, s->fs_overflow ? " (more not listed)" : "");
+   qsort(s->fs, s->fs_count, sizeof(s->fs[0]), drawstats_fs_cmp);
+   for (uint32_t i = 0; i < s->fs_count; i++) {
+      const struct mali_shader *fs = s->fs[i].fs;
+      const struct bifrost_stats *b = &fs->info.stats.bifrost;
+      uint64_t key;
+      memcpy(&key, fs->key, sizeof(key));
+      mesa_logi("malisx2 v7 drawstats:   fs %016" PRIx64 " draws %u verts %u | regs %u threads "
+                "%u instrs %u tuples %u clauses %u cycles %.2f arith %.2f t %.2f ldst %.2f v "
+                "%.2f spills %u fills %u preloads %u code %u | discard %u depth %u fpk %u "
+                "msg preload %u%u",
+                key, s->fs[i].draws, s->fs[i].verts, fs->info.work_reg_count, b->threads,
+                b->instrs, b->tuples, b->clauses, b->cycles, b->arith, b->t, b->ldst, b->v,
+                b->spills, b->fills, b->preloads, fs->bin_size, fs->info.fs.can_discard,
+                fs->info.fs.writes_depth, fs->info.fs.can_fpk,
+                fs->info.bifrost.messages[0].enabled, fs->info.bifrost.messages[1].enabled);
+   }
+}
+
+/* One tiled draw of the current pass (after its RSD and Blend descriptors
+ * are written). */
+static void
+drawstats_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+{
+   static __thread struct drawstats s;
+   const uint32_t threshold = drawstats_threshold();
+   if (!threshold)
+      return;
+   const struct mali_render_state *r = &cmd->gfx.render;
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_jm_draw_tmpl *t = &cmd->jm.draw;
+   const struct mali_graphics_pipeline *p = d->pipeline;
+
+   if (s.cmd != cmd || s.pass != cmd->passes || r->draws == 0) {
+      drawstats_flush(&s, threshold);
+      memset(&s, 0, sizeof(s));
+      s.cmd = cmd;
+      s.pass = cmd->passes;
+      s.w = r->desc.width;
+      s.h = r->desc.height;
+   }
+   s.draws++;
+   s.verts += di->count * di->instance_count;
+
+   if (t->fs_rsd_cpu) {
+      pan_unpack((const struct mali_renderer_state_packed *)t->fs_rsd_cpu, RENDERER_STATE, rsd);
+      s.update_late += rsd.properties.zs_update_operation == MALI_PIXEL_KILL_FORCE_LATE;
+      s.update_weak += rsd.properties.zs_update_operation == MALI_PIXEL_KILL_WEAK_EARLY;
+      s.kill_late += rsd.properties.pixel_kill_operation == MALI_PIXEL_KILL_FORCE_LATE;
+      s.kill_weak += rsd.properties.pixel_kill_operation == MALI_PIXEL_KILL_WEAK_EARLY;
+      s.fpk += rsd.properties.allow_forward_pixel_to_kill;
+      s.fpk_killed += rsd.properties.allow_forward_pixel_to_be_killed;
+      s.r64 += rsd.properties.shader_register_allocation ==
+               MALI_SHADER_REGISTER_ALLOCATION_64_PER_THREAD;
+      s.ztest += rsd.multisample_misc.depth_function != MALI_FUNC_ALWAYS;
+      s.zwrite += rsd.multisample_misc.depth_write_mask;
+      s.stest += rsd.stencil_mask_misc.stencil_enable;
+      s.per_sample += rsd.multisample_misc.evaluate_per_sample;
+
+      const uint8_t *blend = (const uint8_t *)t->fs_rsd_cpu + pan_size(RENDERER_STATE);
+      if (r->rt_count) {
+         pan_unpack((const struct mali_blend_packed *)blend, BLEND, bd);
+         const struct mali_blend_rt_baked *rt = p->baked.rt_count ? &p->baked.blend[0] : NULL;
+         switch (bd.internal.mode) {
+         case MALI_BLEND_MODE_SHADER:
+            s.bs++;
+            s.bs_const += rt && rt->mode == MALI_BLEND_RT_FIXED_FUNCTION;
+            break;
+         case MALI_BLEND_MODE_FIXED_FUNCTION: s.ff++; break;
+         case MALI_BLEND_MODE_OPAQUE: s.opaque++; break;
+         default: s.off++; break;
+         }
+         s.dest_read += bd.load_destination;
+      }
+   }
+
+   const struct mali_shader *fs = p->fs;
+   if (!fs)
+      return;
+   s.discard += fs->info.fs.can_discard;
+   s.zwrite_shader += fs->info.fs.writes_depth || fs->info.fs.writes_stencil;
+   uint32_t i;
+   for (i = 0; i < s.fs_count; i++) {
+      if (s.fs[i].fs == fs)
+         break;
+   }
+   if (i == s.fs_count) {
+      if (s.fs_count == DRAWSTATS_MAX_FS) {
+         s.fs_overflow++;
+         return;
+      }
+      s.fs[s.fs_count++] = (struct drawstats_fs){.code = t->fs_code, .fs = fs};
+   }
+   s.fs[i].draws++;
+   s.fs[i].verts += di->count * di->instance_count;
+}
+
+/* ---------------------------------------------------------------------- */
 /* The jobs                                                                */
 
 static void
@@ -1157,6 +1335,7 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       if (unlikely(dump_enabled()))
          dump_draw(cmd, di, &dd, vj, vertex_index, tj, c->index, instance_size, vs_copy,
                    fs_copy);
+      drawstats_draw(cmd, di);
    } else if (unlikely(dump_enabled())) {
       dump_draw(cmd, di, &dd, vj, vertex_index, (struct mali_ptr){0}, 0, instance_size,
                 vs_copy, fs_copy);

@@ -272,9 +272,22 @@ stage_dump(const struct stage *st, const struct mali_shader *s)
    snprintf(path, sizeof(path), "%s/index.txt", dir);
    f = fopen(path, "a");
    if (f) {
+#if PAN_ARCH < 9
+      /* Bifrost: the compiler's statistics too (threads 1 = the 64
+       * register class, half the threads per core). */
+      const struct bifrost_stats *b = &s->info.stats.bifrost;
+      fprintf(f, "%016" PRIx64 " %s bytes=%u regs=%u fau=%u entry=%s threads=%u instrs=%u "
+              "tuples=%u clauses=%u cycles=%.2f arith=%.2f t=%.2f ldst=%.2f v=%.2f "
+              "spills=%u fills=%u preloads=%u discard=%u\n",
+              key, sname, s->bin_size, s->info.work_reg_count, s->fau.total_count,
+              st->info->pName, b->threads, b->instrs, b->tuples, b->clauses, b->cycles,
+              b->arith, b->t, b->ldst, b->v, b->spills, b->fills, b->preloads,
+              s->stage == MESA_SHADER_FRAGMENT ? s->info.fs.can_discard : 0);
+#else
       fprintf(f, "%016" PRIx64 " %s bytes=%u regs=%u fau=%u entry=%s\n", key, sname,
               s->bin_size, s->info.work_reg_count, s->fau.total_count,
               st->info->pName);
+#endif
       fclose(f);
    }
    simple_mtx_unlock(&lock);

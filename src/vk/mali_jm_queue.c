@@ -82,6 +82,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <unistd.h>
 
 #include "util/log.h"
@@ -961,6 +964,54 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
    return VK_SUCCESS;
 }
 
+#if PAN_ARCH < 9
+/*
+ * MALISX2_V7_SUBMITLOG=first,count or debug.malisx2.v7_submitlog (read once
+ * per process): one line per vkQueueSubmit numbered first .. first+count-1
+ * (the timing CSV's submit numbers), or with "trigger:PATH" one line per
+ * submit while the file PATH exists, with its CLOCK_MONOTONIC entry time
+ * (the CSV's begin_ns clock), how long it waited for the device lock and
+ * how long the whole call took, so the CPU side of a frame can be laid
+ * over the GPU timeline. Measurement only.
+ */
+static void
+submit_log(uint64_t seqno, uint64_t seq, const struct vk_queue_submit *submit, uint32_t in_flight,
+           int64_t t0, int64_t t1, int64_t t2)
+{
+   static int state = -1;
+   static uint64_t first, count;
+   static char trigger[96];
+   if (state < 0) {
+      char value[96] = "";
+      const char *s = getenv("MALISX2_V7_SUBMITLOG");
+      if (s && *s)
+         snprintf(value, sizeof(value), "%s", s);
+#ifdef __ANDROID__
+      else if (__system_property_get("debug.malisx2.v7_submitlog", value) <= 0)
+         value[0] = 0;
+#endif
+      unsigned long long f = 0, c = 0;
+      if (!strncmp(value, "trigger:", 8) && value[8]) {
+         snprintf(trigger, sizeof(trigger), "%s", value + 8);
+         state = 2;
+      } else {
+         state = value[0] && sscanf(value, "%llu,%llu", &f, &c) == 2 && c ? 1 : 0;
+      }
+      first = f;
+      count = c;
+   }
+   if (!state)
+      return;
+   if (state == 2 ? access(trigger, F_OK) != 0 : seqno < first || seqno >= first + count)
+      return;
+   mesa_logi("malisx2 v7 submit %llu (seq now %llu) at %lld ns: lock wait %lld us, call %lld us, "
+             "%u command buffers, %u waits, %u signals, %u atoms in flight",
+             (unsigned long long)seqno, (unsigned long long)seq, (long long)t0,
+             (long long)(t1 - t0) / 1000, (long long)(t2 - t0) / 1000,
+             submit->command_buffer_count, submit->wait_count, submit->signal_count, in_flight);
+}
+#endif
+
 /*
  * Command buffers that ran before and may run again (recorded without
  * ONE_TIME_SUBMIT): wait until their last run has completed, which only a
@@ -1012,7 +1063,13 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
    if (vk_queue_submit_has_bind(submit))
       return vk_errorf(vkq, VK_ERROR_FEATURE_NOT_PRESENT, "sparse binding is not supported");
 
+#if PAN_ARCH < 9
+   const int64_t submit_t0 = os_time_get_nano();
+#endif
    pthread_mutex_lock(&dev->lock);
+#if PAN_ARCH < 9
+   const int64_t submit_t1 = os_time_get_nano();
+#endif
    /* Free atom numbers and notice faults first. */
    const char *msg = MALI_PER_ARCH(queue_wait)(dev);
    if (msg || dev->lost) {
@@ -1117,9 +1174,16 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
    const bool fault = jd->fault && !dev->lost;
    if (fault)
       snprintf(copy, sizeof(copy), "%s", jd->fault_msg);
+#if PAN_ARCH < 9
+   const uint64_t logged_seq = q->seq;
+   const uint32_t in_flight = jd->in_flight;
+#endif
    pthread_mutex_unlock(&dev->lock);
    if (fault)
       report_fault(dev, copy);
+#if PAN_ARCH < 9
+   submit_log(seqno, logged_seq, submit, in_flight, submit_t0, submit_t1, os_time_get_nano());
+#endif
    return result;
 }
 
