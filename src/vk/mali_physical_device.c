@@ -421,6 +421,10 @@ get_features(struct vk_features *f, uint32_t arch)
       .drawIndirectFirstInstance = false,
       .depthClamp = true,
       .depthBiasClamp = true,
+      /* Bifrost: clip distances are varyings the fragment shader tests
+       * and discards on (mali_shader.c, "Clip distances"), as Mesa's
+       * gallium driver does with nir_lower_clip_fs. */
+      .shaderClipDistance = arch == 7,
       .fillModeNonSolid = false,
       .depthBounds = false,
       .wideLines = false,
@@ -695,9 +699,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics = pdev->timestamp_hz != 0,
       .timestampPeriod = ts_period,
-      .maxClipDistances = 0,
+      .maxClipDistances = v7 ? MALI_V7_MAX_CLIP_DISTANCES : 0,
       .maxCullDistances = 0,
-      .maxCombinedClipAndCullDistances = 0,
+      .maxCombinedClipAndCullDistances = v7 ? MALI_V7_MAX_CLIP_DISTANCES : 0,
       .discreteQueuePriorities = 2,
       .pointSizeRange = { 1.0f, 1024.0f },
       .lineWidthRange = { 1.0f, 1.0f },

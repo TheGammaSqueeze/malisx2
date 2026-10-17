@@ -25,6 +25,25 @@
  *              layout(location = 0) out vec4 color;
  *              void main() { color = vec4(0.5, 0.25, 1.0, 1.0); }
  *
+ * A second case, when the device reports shaderClipDistance, draws the
+ * same triangle with a vertex shader that also writes three clip
+ * distances (the left half and the bottom quarter of the image are
+ * clipped; the third distance is always 1.0):
+ *
+ *   clip.vert: #version 450
+ *              layout(location = 0) in vec2 pos;
+ *              out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[3]; };
+ *              void main() {
+ *                 gl_Position = vec4(pos, 0.0, 1.0);
+ *                 gl_ClipDistance[0] = pos.x;
+ *                 gl_ClipDistance[1] = pos.y + 0.5;
+ *                 gl_ClipDistance[2] = 1.0;
+ *              }
+ *
+ * and checks that exactly the pixels whose centre has x > 0 and y > -0.5
+ * in normalized device coordinates hold the triangle colour, the others
+ * the clear colour.
+ *
  * The pipeline uses dynamic rendering, no descriptor sets, no push
  * constants, no depth/stencil, no blending (an opaque store), no dynamic
  * state (viewport and scissor are the whole image), no culling. The
@@ -118,6 +137,52 @@ static const uint32_t vert_spv[] = {
    0x0000000f, 0x0003003e, 0x0000001a, 0x00000018, 0x000100fd, 0x00010038,
 };
 
+static const uint32_t vert_clip_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x0000002a, 0x00000000, 0x00020011,
+   0x00000001, 0x00020011, 0x00000020, 0x0006000b, 0x00000001, 0x4c534c47,
+   0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+   0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d,
+   0x00000012, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+   0x6e69616d, 0x00000000, 0x00060005, 0x0000000b, 0x505f6c67, 0x65567265,
+   0x78657472, 0x00000000, 0x00060006, 0x0000000b, 0x00000000, 0x505f6c67,
+   0x7469736f, 0x006e6f69, 0x00070006, 0x0000000b, 0x00000001, 0x435f6c67,
+   0x4470696c, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d, 0x00000000,
+   0x00030005, 0x00000012, 0x00736f70, 0x00030047, 0x0000000b, 0x00000002,
+   0x00050048, 0x0000000b, 0x00000000, 0x0000000b, 0x00000000, 0x00050048,
+   0x0000000b, 0x00000001, 0x0000000b, 0x00000003, 0x00040047, 0x00000012,
+   0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+   0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
+   0x00000006, 0x00000004, 0x00040015, 0x00000008, 0x00000020, 0x00000000,
+   0x0004002b, 0x00000008, 0x00000009, 0x00000003, 0x0004001c, 0x0000000a,
+   0x00000006, 0x00000009, 0x0004001e, 0x0000000b, 0x00000007, 0x0000000a,
+   0x00040020, 0x0000000c, 0x00000003, 0x0000000b, 0x0004003b, 0x0000000c,
+   0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020, 0x00000001,
+   0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040017, 0x00000010,
+   0x00000006, 0x00000002, 0x00040020, 0x00000011, 0x00000001, 0x00000010,
+   0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004002b, 0x00000006,
+   0x00000014, 0x00000000, 0x0004002b, 0x00000006, 0x00000015, 0x3f800000,
+   0x00040020, 0x00000019, 0x00000003, 0x00000007, 0x0004002b, 0x0000000e,
+   0x0000001b, 0x00000001, 0x0004002b, 0x00000008, 0x0000001c, 0x00000000,
+   0x00040020, 0x0000001d, 0x00000001, 0x00000006, 0x00040020, 0x00000020,
+   0x00000003, 0x00000006, 0x0004002b, 0x00000008, 0x00000022, 0x00000001,
+   0x0004002b, 0x00000006, 0x00000025, 0x3f000000, 0x0004002b, 0x0000000e,
+   0x00000028, 0x00000002, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+   0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000010, 0x00000013,
+   0x00000012, 0x00050051, 0x00000006, 0x00000016, 0x00000013, 0x00000000,
+   0x00050051, 0x00000006, 0x00000017, 0x00000013, 0x00000001, 0x00070050,
+   0x00000007, 0x00000018, 0x00000016, 0x00000017, 0x00000014, 0x00000015,
+   0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f, 0x0003003e,
+   0x0000001a, 0x00000018, 0x00050041, 0x0000001d, 0x0000001e, 0x00000012,
+   0x0000001c, 0x0004003d, 0x00000006, 0x0000001f, 0x0000001e, 0x00060041,
+   0x00000020, 0x00000021, 0x0000000d, 0x0000001b, 0x0000000f, 0x0003003e,
+   0x00000021, 0x0000001f, 0x00050041, 0x0000001d, 0x00000023, 0x00000012,
+   0x00000022, 0x0004003d, 0x00000006, 0x00000024, 0x00000023, 0x00050081,
+   0x00000006, 0x00000026, 0x00000024, 0x00000025, 0x00060041, 0x00000020,
+   0x00000027, 0x0000000d, 0x0000001b, 0x0000001b, 0x0003003e, 0x00000027,
+   0x00000026, 0x00060041, 0x00000020, 0x00000029, 0x0000000d, 0x0000001b,
+   0x00000028, 0x0003003e, 0x00000029, 0x00000015, 0x000100fd, 0x00010038,
+};
+
 static const uint32_t frag_spv[] = {
    0x07230203, 0x00010300, 0x0008000b, 0x0000000e, 0x00000000, 0x00020011,
    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
@@ -182,6 +247,7 @@ struct fns {
    PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
    PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
+   PFN_vkGetPhysicalDeviceFeatures GetPhysicalDeviceFeatures;
    PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
    PFN_vkCreateDevice CreateDevice;
    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
@@ -372,6 +438,7 @@ main(int argc, char **argv)
    INST(EnumeratePhysicalDevices);
    INST(GetPhysicalDeviceProperties2);
    INST(GetPhysicalDeviceMemoryProperties);
+   INST(GetPhysicalDeviceFeatures);
    INST(EnumerateDeviceExtensionProperties);
    INST(CreateDevice);
    INST(GetDeviceProcAddr);
@@ -438,11 +505,17 @@ main(int argc, char **argv)
       .deviceFault = VK_TRUE,
    };
    const char *dev_exts[] = {VK_EXT_DEVICE_FAULT_EXTENSION_NAME};
+   VkPhysicalDeviceFeatures supported;
+   memset(&supported, 0, sizeof(supported));
+   f.GetPhysicalDeviceFeatures(pdev, &supported);
+   const bool have_clip = supported.shaderClipDistance;
+   const VkPhysicalDeviceFeatures enabled = {.shaderClipDistance = have_clip};
    const VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = have_fault_ext ? &fault_feat : NULL,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
+      .pEnabledFeatures = &enabled,
       .enabledExtensionCount = have_fault_ext ? 1 : 0,
       .ppEnabledExtensionNames = dev_exts,
    };
@@ -648,11 +721,15 @@ main(int argc, char **argv)
    f.UnmapMemory(device, bmemory);
    printf("  vertex buffer: %zu bytes, memory type %d\n", sizeof(vertices), btype);
 
+   int status = 0;
+   for (unsigned clip = 0; clip < (have_clip ? 2u : 1u); clip++) {
+   printf("  case %u: %s\n", clip, clip ? "three clip distances" : "the plain triangle");
+
    /* Shaders and the pipeline. */
    const VkShaderModuleCreateInfo vsmci = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-      .codeSize = sizeof(vert_spv),
-      .pCode = vert_spv,
+      .codeSize = clip ? sizeof(vert_clip_spv) : sizeof(vert_spv),
+      .pCode = clip ? vert_clip_spv : vert_spv,
    };
    const VkShaderModuleCreateInfo fsmci = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -914,13 +991,21 @@ main(int argc, char **argv)
    uint32_t bad = 0, untouched = 0, black = 0;
    int first_x = -1, first_y = -1;
    uint8_t first_got[4] = {0};
+   static const uint8_t clear_bytes[4] = {0, 0, 0, 255};
+   uint32_t expect_drawn = 0;
    for (uint32_t y = 0; y < IMG_H; y++) {
       const uint8_t *row = base + (size_t)y * layout.rowPitch;
       for (uint32_t x = 0; x < IMG_W; x++) {
          const uint8_t *px = row + (size_t)x * 4;
+         /* Clip case: the pixel centre's NDC x > 0 and y > -0.5. */
+         const float ndc_x = (x + 0.5f) * 2.0f / IMG_W - 1.0f;
+         const float ndc_y = (y + 0.5f) * 2.0f / IMG_H - 1.0f;
+         const bool drawn = !clip || (ndc_x > 0.0f && ndc_y > -0.5f);
+         const uint8_t *want = drawn ? expect_rgba : clear_bytes;
+         expect_drawn += drawn;
          bool okpx = true;
          for (unsigned c = 0; c < 4; c++) {
-            const int d = (int)px[c] - (int)expect_rgba[c];
+            const int d = (int)px[c] - (int)want[c];
             if (d < -1 || d > 1)
                okpx = false;
          }
@@ -946,28 +1031,32 @@ main(int argc, char **argv)
           base[(IMG_H - 1) * layout.rowPitch + (IMG_W - 1) * 4 + 3], expect_rgba[0],
           expect_rgba[1], expect_rgba[2], expect_rgba[3]);
 
-   int status;
    if (bad == 0) {
-      printf("PASS: all %u pixels are the triangle colour (%.2f, %.2f, %.2f, %.2f)\n",
-             IMG_W * IMG_H, tri_rgba[0], tri_rgba[1], tri_rgba[2], tri_rgba[3]);
-      status = 0;
+      printf("  case %u ok: %u pixels the triangle colour (%.2f, %.2f, %.2f, %.2f), %u the "
+             "clear colour\n",
+             clip, expect_drawn, tri_rgba[0], tri_rgba[1], tri_rgba[2], tri_rgba[3],
+             IMG_W * IMG_H - expect_drawn);
    } else {
-      printf("FAIL: %u of %u pixels wrong (%u still black from the clear, %u still hold the "
-             "0x%02x sentinel); first at (%d,%d) = %u %u %u %u, expected %u %u %u %u\n",
-             bad, IMG_W * IMG_H, black, untouched, SENTINEL, first_x, first_y, first_got[0],
-             first_got[1], first_got[2], first_got[3], expect_rgba[0], expect_rgba[1],
-             expect_rgba[2], expect_rgba[3]);
+      printf("FAIL: case %u: %u of %u pixels wrong (%u black from the clear, %u still hold the "
+             "0x%02x sentinel); first at (%d,%d) = %u %u %u %u\n",
+             clip, bad, IMG_W * IMG_H, black, untouched, SENTINEL, first_x, first_y,
+             first_got[0], first_got[1], first_got[2], first_got[3]);
       status = 1;
    }
 
    f.DeviceWaitIdle(device);
-   f.UnmapMemory(device, memory);
    f.DestroyFence(device, fence, NULL);
    f.DestroyCommandPool(device, pool, NULL);
    f.DestroyPipeline(device, pipeline, NULL);
    f.DestroyPipelineLayout(device, pl, NULL);
    f.DestroyShaderModule(device, vsm, NULL);
    f.DestroyShaderModule(device, fsm, NULL);
+   }
+   if (status == 0)
+      printf("PASS: %s\n", have_clip ? "the plain triangle and the clip distance case"
+                                      : "the plain triangle (no shaderClipDistance)");
+
+   f.UnmapMemory(device, memory);
    f.DestroyBuffer(device, vbuf, NULL);
    f.FreeMemory(device, bmemory, NULL);
    f.DestroyImageView(device, view, NULL);

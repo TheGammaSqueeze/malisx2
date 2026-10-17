@@ -348,6 +348,9 @@ enum mali_v7_desc_table {
  * panvk_v7's limits allow 32 + 256 and overflow the field.
  */
 #define MALI_V7_ATTRIB_BUF_RECORDS 512
+/* Clip distances on Bifrost: two vec4 varyings tested in the fragment
+ * shader (mali_shader.c, "Clip distances"). */
+#define MALI_V7_MAX_CLIP_DISTANCES 8
 #define MALI_V7_MAX_STAGE_IMG_ENTRIES (MALI_V7_ATTRIB_BUF_RECORDS / 2 - 16)
 
 struct mali_v7_shader_desc {
