@@ -246,6 +246,11 @@ struct mali_device {
       uint32_t shaders_compiled;
       uint32_t shader_cache_hits;
    } pipeline_stats;
+
+   /* How many of free_slabs are 1 MiB big slabs (JM v7 command memory for
+    * large blocks, mali_jm_cmd_buffer.c); under slab_lock. Last, so the
+    * members before it keep their offsets. */
+   unsigned free_big_slab_count;
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)

@@ -108,6 +108,7 @@ mali_cmd_slabs_finish(struct mali_device *dev)
       free(s);
    }
    dev->free_slab_count = 0;
+   dev->free_big_slab_count = 0;
 }
 
 struct mali_ptr

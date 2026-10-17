@@ -351,6 +351,12 @@ struct mali_cmd_buffer {
    uint32_t dispatches;
    uint32_t draws;
    uint32_t passes;
+
+   /* v7: the 1 MiB slab large blocks are being carved from (on the slabs
+    * list too). Last, so the members before it keep their offsets. */
+   uint8_t *big_cpu;
+   uint64_t big_gpu;
+   uint64_t big_offset;
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_cmd_buffer, vk.base, VkCommandBuffer,

@@ -79,6 +79,16 @@
  * mali_cmd_slabs_finish. */
 #define MALI_CMD_FREE_SLABS_MAX 512
 
+/* Bifrost (v7): blocks larger than half a slab (a draw's varying buffers,
+ * vertex count times varying stride) are carved from 1 MiB slabs the device
+ * keeps for reuse too, instead of a dedicated BO each: that was an mmap and
+ * a GPU MMU update at allocation and an munmap and MMU flush at every reset
+ * (28 percent of azahar's Vulkan worker in 3D Land). Big slabs sit at the
+ * tail of free_slabs, standard ones at the head; at most this many big ones
+ * are kept. */
+#define MALI_CMD_BIG_SLAB_SIZE (1024 * 1024)
+#define MALI_CMD_FREE_BIG_SLABS_MAX 32
+
 /* A slab of command memory: CPU and GPU read/write (the GPU writes job
  * headers back), CPU-uncached, written and never read by the CPU. */
 static struct mali_cmd_slab *
@@ -88,9 +98,24 @@ slab_new(struct mali_device *dev, uint64_t size, bool recycle)
       simple_mtx_lock(&dev->slab_lock);
       struct mali_cmd_slab *s = NULL;
       if (!list_is_empty(&dev->free_slabs)) {
+#if PAN_ARCH < 9
+         /* Standard slabs at the head, big ones at the tail. */
+         struct list_head *e = size == MALI_CMD_SLAB_SIZE ? dev->free_slabs.next
+                                                           : dev->free_slabs.prev;
+         s = list_entry(e, struct mali_cmd_slab, link);
+         if (s->bo.size != size) {
+            s = NULL;
+         } else {
+            list_del(&s->link);
+            dev->free_slab_count--;
+            if (size != MALI_CMD_SLAB_SIZE)
+               dev->free_big_slab_count--;
+         }
+#else
          s = list_first_entry(&dev->free_slabs, struct mali_cmd_slab, link);
          list_del(&s->link);
          dev->free_slab_count--;
+#endif
       }
       simple_mtx_unlock(&dev->slab_lock);
       if (s)
@@ -118,6 +143,17 @@ slab_release(struct mali_device *dev, struct mali_cmd_slab *s)
 {
    if (s->recycle) {
       simple_mtx_lock(&dev->slab_lock);
+#if PAN_ARCH < 9
+      if (s->bo.size != MALI_CMD_SLAB_SIZE) {
+         if (dev->free_big_slab_count < MALI_CMD_FREE_BIG_SLABS_MAX &&
+             dev->free_slab_count < MALI_CMD_FREE_SLABS_MAX) {
+            list_addtail(&s->link, &dev->free_slabs);
+            dev->free_slab_count++;
+            dev->free_big_slab_count++;
+            s = NULL;
+         }
+      } else
+#endif
       if (dev->free_slab_count < MALI_CMD_FREE_SLABS_MAX) {
          list_add(&s->link, &dev->free_slabs);
          dev->free_slab_count++;
@@ -144,6 +180,9 @@ release_memory(struct mali_cmd_buffer *cmd)
    cmd->cur_offset = 0;
    cmd->cur_cpu = NULL;
    cmd->cur_gpu = 0;
+   cmd->big_cpu = NULL;
+   cmd->big_gpu = 0;
+   cmd->big_offset = 0;
    cmd->tls.size = 0;
    cmd->tls.gpu = 0;
 }
@@ -155,6 +194,22 @@ MALI_PER_ARCH(cmd_alloc_slow)(struct mali_cmd_buffer *cmd, uint64_t size, uint64
    size = MAX2(size, 1);
 
    if (size > MALI_CMD_SLAB_SIZE / 2) {
+#if PAN_ARCH < 9
+      if (size <= MALI_CMD_BIG_SLAB_SIZE) {
+         uint64_t boff = ALIGN_POT(cmd->big_offset, align);
+         if (!cmd->big_cpu || boff + size > MALI_CMD_BIG_SLAB_SIZE) {
+            struct mali_cmd_slab *s = slab_new(cmd->dev, MALI_CMD_BIG_SLAB_SIZE, true);
+            if (!s)
+               goto oom;
+            list_addtail(&s->link, &cmd->slabs);
+            cmd->big_cpu = s->bo.cpu;
+            cmd->big_gpu = s->bo.gpu_va;
+            boff = 0;
+         }
+         cmd->big_offset = boff + size;
+         return (struct mali_ptr){cmd->big_cpu + boff, cmd->big_gpu + boff};
+      }
+#endif
       struct mali_cmd_slab *s = slab_new(cmd->dev, size, false);
       if (!s)
          goto oom;
