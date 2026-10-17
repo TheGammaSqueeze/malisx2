@@ -27,9 +27,10 @@
 
 /*
  * AFBC (lossless framebuffer compression) for the images whose memory
- * traffic is the GPU's own: colour and depth/stencil attachments. Kept to
- * what ARMSX2 creates (single-sampled 2D, one level, one layer) and to
- * images nothing reads or writes as raw bytes behind the GPU's back:
+ * traffic is the GPU's own: colour and depth/stencil attachments (colour
+ * only on v7). Kept to what ARMSX2 creates (single-sampled 2D, one level,
+ * one layer) and to images nothing reads or writes as raw bytes behind the
+ * GPU's back:
  *
  *  - no storage (shader image stores cannot write AFBC), no host transfer;
  *  - no mutable or block-compatible formats and no aliasing: views keep
@@ -44,16 +45,14 @@
  * raw compute copy. panvk makes the same choices (panvk_image_can_use_mod,
  * pan_mod_afbc_test_props).
  *
- * Both arches. On a G57 at 2x upscaling, uncompressed render targets made
- * fragment-bound dumps 20-25 % slower than with AFBC.
+ * v9 and v11. On a G57 at 2x upscaling, uncompressed render targets made
+ * fragment-bound dumps 20-25 % slower than with AFBC. Bifrost (v7) has its
+ * own, narrower rules (colour targets only, mali_v7_image_can_use_afbc in
+ * mali_image_view.c); this function is not asked for it.
  */
 static bool
 afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
 {
-   /* TODO v7: the G52 compresses too (panvk_v7 uses AFBC through
-    * pan_emit_afbc_color_attachment and the texture's own format), but
-    * the v7 back half packs no AFBC targets or plane descriptors yet
-    * (mali_fb.c, mali_image_view.c), so its images stay uncompressed. */
    if (arch < 9)
       return false;
    switch (mode) {
@@ -100,7 +99,7 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
  * The layout of an image, by panvk's rules for the modifiers we use
  * (panvk_image_can_use_mod, pan_mod_u_tiled_test_props):
  *
- * - AFBC when can_use_afbc says so;
+ * - AFBC when can_use_afbc says so (mali_v7_image_can_use_afbc on v7);
  * - linear when the application asks for linear tiling, for 1D images,
  *   and when the base level is a single texel wide or high (tiling cannot
  *   help then);
@@ -110,9 +109,11 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
  * - 16x16 u-interleaved otherwise.
  */
 static uint64_t
-choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch)
+choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
+                const VkImageCreateInfo *info)
 {
-   if (can_use_afbc(image, formats, arch))
+   if (arch == 7 ? mali_v7_image_can_use_afbc(image, formats, info)
+                 : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
        image->vk.image_type == VK_IMAGE_TYPE_1D ||
@@ -199,7 +200,7 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       goto fail;
    }
    const unsigned arch = mali_device_physical(dev)->arch;
-   image->vk.drm_format_mod = choose_modifier(image, formats, arch);
+   image->vk.drm_format_mod = choose_modifier(image, formats, arch, pCreateInfo);
    /* No CRC on the job manager (v7, v9) yet: it cannot update the seed
     * from the GPU, and the CPU-side seed it needs is not written yet. */
    const bool crc = !mali_arch_is_jm(arch) &&
@@ -382,6 +383,17 @@ mali_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
    return result;
 }
 
+/*
+ * The subresource's bytes as laid out (mali_image_layout.c). For an AFBC
+ * plane (optimal tiling only, so the spec gives these numbers no meaning
+ * for host access) the offset is the first header, size covers the
+ * headers and the sparse body of the layer, rowPitch is the header row
+ * stride and depthPitch the surface stride. Nothing reads AFBC through
+ * these: the decompressing paths are vkCmdCopyImageToBuffer and
+ * vkCmdCopyImage into an uncompressed image (mali_cmd_image.c
+ * copy_from_afbc, a compute copy that reads the plane through the texture
+ * unit), and vkCmdBlitImage.
+ */
 VKAPI_ATTR void VKAPI_CALL
 mali_GetImageSubresourceLayout2(VkDevice _device, VkImage _image,
                                 const VkImageSubresource2 *pSubresource,

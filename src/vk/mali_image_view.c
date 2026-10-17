@@ -31,8 +31,10 @@
  * (layer, sample, level) in that nesting, cube faces counted as layers,
  * a 3D view one entry per level at its first slice (Mesa pan_texture.c
  * pan_emit_iview_texture_payload / get_linear_or_u_tiled_surface_props /
- * pan_sampled_texture_emit at PAN_ARCH 7). An ASTC surface pointer carries
- * the block size in its low bits. A v7 storage view is no texture at all
+ * get_afbc_surface_props / pan_sampled_texture_emit at PAN_ARCH 7). An
+ * ASTC surface pointer carries the block size in its low bits, an AFBC one
+ * the AFBC surface flags. Which v7 images are AFBC is decided here too
+ * (mali_v7_image_can_use_afbc). A v7 storage view is no texture at all
  * but an Attribute Buffer pair (v7_pack_storage_attr_bufs below), which
  * the descriptor copy of a draw or dispatch turns into an image table
  * entry (mali_jm_desc_v7.c).
@@ -53,9 +55,14 @@
 
 #include "drm-uapi/drm_fourcc.h"
 #include "util/format/u_format.h"
+#include "util/log.h"
 #include "util/u_math.h"
 #include "vk_format.h"
 #include "vk_log.h"
+#include "vk_util.h"
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+#include "vulkan/vk_android_native_buffer.h"
+#endif
 
 #if PAN_ARCH < 9
 #define PLANE_DESC_SIZE 16   /* Surface With Stride */
@@ -146,23 +153,121 @@ texture_dim(VkImageViewType type)
 
 #if PAN_ARCH < 9
 
-/* TODO v7: Bifrost has no AFBC compression mode word; an AFBC texture is
- * read through its format and the surface pointers (Mesa pan_texture.c at
- * PAN_ARCH 7, panvk_v7 panvk_vX_image_view.c). mali_image.c gives v7
- * images no AFBC modifier yet, so neither is reached. */
+/*
+ * Bifrost (v7) AFBC: which images, and how they are described.
+ *
+ * Bifrost has no AFBC compression mode word. The hardware compresses a
+ * render target in its writeback format and decompresses a texture in its
+ * texel format (Mesa pan_desc.c pan_emit_afbc_color_attachment and
+ * pan_texture.c at PAN_ARCH 7), so an AFBC plane is only ever written and
+ * read in its own format; copies too (mali_cmd_image.c, as panvk's
+ * preserve_img_fmt on Bifrost). These two hooks of the v9+ back half are
+ * therefore never called on v7.
+ */
 unsigned
 MALI_PER_ARCH(image_afbc_hw_mode)(const struct mali_image *image, unsigned plane)
 {
-   MALI_TODO_V7("AFBC compression modes");
-   return 0;
+   UNREACHABLE("v7 AFBC has no compression mode word");
 }
 
 unsigned
 MALI_PER_ARCH(image_afbc_hw_read_mode)(const struct mali_image *image, unsigned plane,
                                        enum pipe_format view)
 {
-   MALI_TODO_V7("AFBC compression modes");
-   return 0;
+   UNREACHABLE("v7 AFBC has no compression mode word");
+}
+
+/*
+ * The plane formats v7 AFBC takes here: the 8-bit UNORM formats whose
+ * component order is one the v7 texture unit allows with AFBC as it is
+ * (RGBA, or RGB1 for R and RG: pan_texture_afbc_reswizzle has nothing to
+ * do for them), with sRGB as a flag on RGBA8. pan_afbc_format at arch 7
+ * accepts more (RGB565, RGB5A1, RGBA4, RGB10A2, BGR orders through a
+ * reswizzle that also moves sampler border colours); those stay
+ * u-interleaved until each is tested on the device.
+ */
+static bool
+v7_afbc_format(enum pipe_format f)
+{
+   switch (f) {
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* MALISX2_V7_AFBC=0 or debug.malisx2.v7_afbc=0 keeps every v7 image
+ * uncompressed; on by default. Read once per process. */
+static bool
+v7_afbc_enabled(void)
+{
+   /* 0 unread, 1 off, 2 on; a race only repeats the read. */
+   static int state;
+   int s = __atomic_load_n(&state, __ATOMIC_RELAXED);
+   if (!s) {
+      s = mali_v7_debug_switch("MALISX2_V7_AFBC", "debug.malisx2.v7_afbc", true) ? 2 : 1;
+      __atomic_store_n(&state, s, __ATOMIC_RELAXED);
+      if (s == 1)
+         mesa_logi("malisx2: v7 AFBC off (MALISX2_V7_AFBC / debug.malisx2.v7_afbc)");
+   }
+   return s == 2;
+}
+
+/*
+ * AFBC on v7 (panvk_image_can_use_mod and pan_mod_afbc_test_props at arch
+ * 7, narrowed to what the v7 back half handles):
+ *
+ *  - a colour attachment, no depth/stencil usage or format, one plane;
+ *  - nothing that reads or writes the bytes behind the GPU's back: no
+ *    storage or host-transfer usage, no external memory, no swapchain or
+ *    Android native buffer (the window system's buffers stay linear,
+ *    mali_wsi.c);
+ *  - no mutable, block-compatible, aliased, disjoint or sparse image: every
+ *    view has the image's format (v7 cannot reinterpret AFBC at all);
+ *  - optimal tiling, 2D, single-sampled, one level, one layer;
+ *  - a format of v7_afbc_format, at least half a header tile (8x8
+ *    superblocks) each way, as on v9+.
+ *
+ * Copies, clears and blits handle these images through the tile buffer and
+ * the texture unit in the plane's own format (mali_cmd_image.c).
+ */
+bool
+mali_v7_image_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
+                           const VkImageCreateInfo *info)
+{
+   const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
+   if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+       (usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                 VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
+      return false;
+   if (image->plane_count != 1 || vk_format_is_depth_or_stencil(image->vk.format) ||
+       !v7_afbc_format(formats[0]))
+      return false;
+   if (image->vk.create_flags &
+       (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+        VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_DISJOINT_BIT |
+        VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+        VK_IMAGE_CREATE_SPARSE_ALIASED_BIT))
+      return false;
+   if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != 1 ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != 1)
+      return false;
+   if (vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO) ||
+       vk_find_struct_const(info->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR))
+      return false;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   if (vk_find_struct_const(info->pNext, NATIVE_BUFFER_ANDROID))
+      return false;
+#endif
+   const unsigned min = mali_afbc_min_extent(formats[0]);
+   if (image->vk.extent.width < min || image->vk.extent.height < min)
+      return false;
+   return v7_afbc_enabled();
 }
 
 #else
@@ -259,7 +364,34 @@ emit_surface(const struct view_src *src, unsigned level, unsigned layer, unsigne
    const struct mali_image_slice *s = &pl->slices[level];
    const struct util_format_description *desc = util_format_description(src->format);
 
-   assert(!mali_image_is_afbc(image));
+   if (mali_image_is_afbc(image)) {
+      /* get_afbc_surface_props at PAN_ARCH 7: the layer's first header
+       * with the AFBC flags in the pointer's low bits (the header is 4 KiB
+       * aligned), the header row stride in bytes, and the surface stride
+       * (headers and body), which the payload range check bounds the
+       * headers' body offsets by. 2D, single-sampled, one level. The view
+       * reads the plane in its own format, sRGB aside (no compression
+       * mode word on v7). */
+      const uint64_t mod = image->vk.drm_format_mod;
+      assert(image->vk.image_type == VK_IMAGE_TYPE_2D && sample == 0);
+      assert(util_format_linear(src->format) ==
+             util_format_linear(image->planes[src->plane].format));
+      unsigned flags = MALI_AFBC_SURFACE_FLAG_PREFETCH | MALI_AFBC_SURFACE_FLAG_CHECK_PAYLOAD_RANGE;
+      if (mod & AFBC_FORMAT_MOD_YTR)
+         flags |= MALI_AFBC_SURFACE_FLAG_YTR;
+      if (mod & AFBC_FORMAT_MOD_TILED)
+         flags |= MALI_AFBC_SURFACE_FLAG_TILED_HEADER;
+      const uint64_t header = image->base + s->offset + (uint64_t)layer * pl->array_stride;
+      assert(!(header & (MALI_AFBC_ALIGN - 1)));
+      assert(s->surface_stride <= UINT32_MAX);
+      pan_cast_and_pack(out, SURFACE_WITH_STRIDE, cfg) {
+         cfg.pointer = header | flags;
+         cfg.row_stride = s->row_stride;
+         cfg.surface_stride = (uint32_t)s->surface_stride;
+      }
+      return;
+   }
+
    uint64_t addr = image->base + s->offset;
    if (image->vk.image_type == VK_IMAGE_TYPE_3D)
       addr += (uint64_t)layer * s->surface_stride;
@@ -345,7 +477,9 @@ pack_texture(const struct view_src *src, const unsigned char swizzle[4],
       else
          cfg.sample_count = MAX2(image->vk.samples, 1);
       cfg.swizzle = sw;
-      cfg.texel_ordering = image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ?
+      /* pan_modifier_to_layout. */
+      cfg.texel_ordering = mali_image_is_afbc(image) ? MALI_TEXTURE_LAYOUT_AFBC :
+                           image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ?
                               MALI_TEXTURE_LAYOUT_LINEAR : MALI_TEXTURE_LAYOUT_TILED;
       cfg.levels = src->levels;
       cfg.array_size = array_size;

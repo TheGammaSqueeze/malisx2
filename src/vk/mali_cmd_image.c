@@ -42,7 +42,13 @@
  *
  * On Bifrost (v7) the blit pass runs on the v7 frame shaders and also
  * blits depth and stencil (blit_region_v7); image copies stay on the
- * compute copy (no fragment-side copy pass yet, copy_on_fragment).
+ * compute copy (no fragment-side copy pass yet, copy_on_fragment). v7 AFBC
+ * planes (colour only) take the two AFBC paths above, but in the plane's
+ * own format instead of the uint one: Bifrost compresses and decompresses
+ * by the render target's and the texture's format, so the shaders convert
+ * between that format and the block's bits (mali_meta_copy_fmt). Blits and
+ * clears of them need nothing special: those already read the source and
+ * write the target in their own formats.
  */
 
 #if PAN_ARCH >= 10
@@ -233,10 +239,33 @@ static enum pipe_format
 copy_read_format(const struct mali_image *img, unsigned plane)
 {
    const enum pipe_format f = img->planes[plane].format;
+#if PAN_ARCH < 9
+   /* v7 decompresses by the texture's format: an AFBC plane is read in its
+    * own (linear) format and converted to bits in the shader (v7_copy_fmt). */
+   if (mali_image_is_afbc(img))
+      return util_format_linear(f);
+#endif
    if (f == PIPE_FORMAT_S8_UINT)
       return f;
    return uint_format(util_format_get_blocksize(f));
 }
+
+#if PAN_ARCH < 9
+/* The copy format of a v7 AFBC plane (mali_cmd_gfx.h): its own format,
+ * sRGB read and written as UNORM so the bits pass unchanged. */
+static enum mali_meta_copy_fmt
+v7_copy_fmt(const struct mali_image *img, unsigned plane)
+{
+   switch (util_format_linear(img->planes[plane].format)) {
+   case PIPE_FORMAT_R8_UNORM: return MALI_META_COPY_FMT_R8;
+   case PIPE_FORMAT_R8G8_UNORM: return MALI_META_COPY_FMT_R8G8;
+   case PIPE_FORMAT_R8G8B8A8_UNORM: return MALI_META_COPY_FMT_R8G8B8A8;
+   default:
+      /* mali_v7_image_can_use_afbc admits no other format. */
+      UNREACHABLE("no v7 AFBC copy format");
+   }
+}
+#endif
 
 /* The source of a copy into an AFBC plane: an AFBC image plane (read as a
  * texture) or a raw surface. Block coordinates. */
@@ -324,6 +353,15 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
    };
    key.rt_op[0] = MALI_META_FS_COPY;
    key.rt_type[0] = MALI_META_FS_UINT;
+#if PAN_ARCH < 9
+   /* v7: the target in its own format, the bits converted in the shader
+    * (and an AFBC source read in its own); see mali_meta_copy_fmt. */
+   const enum pipe_format target_format = util_format_linear(img->planes[plane].format);
+   key.rt_type[0] = MALI_META_FS_FLOAT;
+   key.copy_dst_fmt = v7_copy_fmt(img, plane);
+   if (src->img)
+      key.copy_src_fmt = v7_copy_fmt(src->img, src->plane);
+#endif
 
    struct mali_meta_fs_push push = {
       .area = {dx, dy, dx + (int32_t)w - 1, dy + (int32_t)h - 1},
@@ -364,7 +402,11 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
       .plane = plane,
       .level = level,
       .layer = layer,
+#if PAN_ARCH < 9
+      .format = target_format,
+#else
       .format = uint_format(elem),
+#endif
       .load = MALI_ATT_LOAD_DONT_CARE,
       .store = true,
       .always_write = true,
@@ -385,8 +427,14 @@ copy_from_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsign
 {
    if (!w || !h || !layers)
       return;
+#if PAN_ARCH < 9
+   /* v7: read in the plane's own format, packed into bits in the shader. */
+   const struct mali_shader *s =
+      MALI_PER_ARCH(meta_copy_tex_fmt_get)(cmd, v7_copy_fmt(img, plane));
+#else
    const unsigned elem = util_format_get_blocksize(img->planes[plane].format);
    const struct mali_shader *s = MALI_PER_ARCH(meta_copy_tex_get)(cmd, util_logbase2(elem));
+#endif
    if (!s)
       return;
 

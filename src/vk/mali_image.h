@@ -183,6 +183,16 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(mali_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAG
 
 /* Should an image get a CRC table (mali_image.c)? Exposed for the tests. */
 bool mali_image_wants_crc(const VkImageCreateInfo *info, uint64_t modifier);
+
+/*
+ * Bifrost (v7): should an image be AFBC? Colour render targets only, in
+ * the formats the v7 back half packs AFBC targets and textures for
+ * (mali_image_view.c, built into the v7 library only). The planes'
+ * formats are `formats`; `info` is the creation info (external memory and
+ * swapchain images stay uncompressed).
+ */
+bool mali_v7_image_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
+                                const VkImageCreateInfo *info);
 static inline bool
 mali_image_is_afbc(const struct mali_image *image)
 {

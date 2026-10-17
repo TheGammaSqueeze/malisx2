@@ -330,6 +330,20 @@ MALI_PER_ARCH(fb_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_de
     * grows to them and a tile smaller than a superblock counts as one. */
    uint32_t tw, th;
    tile_dims(r->tile_size, &tw, &th);
+#if PAN_ARCH < 9
+   /* pan_force_clean_write_on: a tile smaller than an AFBC superblock
+    * writes part of the superblocks it shares with its neighbours, which
+    * only compresses right when every tile is written back, geometry or
+    * not; the frame shaders then run on every tile (fix_frame_mode). Only
+    * multiple or wide targets make the v7 tile that small. */
+   if (tw < AFBC_BLOCK || th < AFBC_BLOCK) {
+      for (unsigned i = 0; i < desc->rt_count; i++) {
+         struct mali_fb_target *t = &r->desc.rt[i];
+         if (target_is_afbc(t) && t->store)
+            t->always_write = true;
+      }
+   }
+#endif
    bool afbc_store = false;
    for (unsigned i = 0; i < n; i++)
       afbc_store |= target_is_afbc(targets[i]) && targets[i]->store;
@@ -459,7 +473,6 @@ target_mem(const struct mali_fb_target *t, unsigned layer, uint64_t *base,
    *surf_stride = s->surface_stride;
 }
 
-#if PAN_ARCH >= 9
 /* get_afbc_att_mem_props: the layer's first header, the body offset from
  * it and the header row stride. */
 static void
@@ -484,7 +497,6 @@ afbc_reverse_issue_order(const struct mali_render_state *r)
    tile_dims(r->tile_size, &tw, &th);
    return tw < AFBC_BLOCK || th < AFBC_BLOCK;
 }
-#endif /* PAN_ARCH >= 9 */
 
 static enum mali_block_format
 target_block_format(const struct mali_fb_target *t)
@@ -773,20 +785,49 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
 }
 
 #if PAN_ARCH < 9
-/* TODO v7: AFBC colour targets take an absolute body pointer and body
- * size and no compression mode word (Mesa pan_emit_afbc_color_attachment
- * at PAN_ARCH 7). mali_image.c gives v7 images no AFBC modifier yet, so
- * this is never reached; a target that writes nothing is packed in case. */
+/*
+ * pan_emit_afbc_color_attachment at PAN_ARCH 7 (with pan_emit_rt's common
+ * words): an absolute body pointer, the header row stride counted in
+ * superblocks (pan_afbc_stride_blocks: header row bytes over 16 bytes per
+ * header times the superblocks per header tile side), no compression mode
+ * word (the writeback format is the compression format, so the target is
+ * always the plane's own format, sRGB aside: mali_cmd_image.c), no body
+ * size (v5 only). RAW24 needs no RAW32 stand-in before v9.
+ */
 static void
 pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, unsigned i,
              unsigned layer, const uint32_t clear[4], void *out)
 {
-   MALI_TODO_V7("AFBC render targets");
-   pan_cast_and_pack(out, RGB_RENDER_TARGET, cfg) {
+   uint64_t header;
+   uint32_t body, row;
+   target_afbc_mem(t, layer, &header, &body, &row);
+   const unsigned header_tile_sbs =
+      util_format_get_blocksizebits(t->image->planes[t->plane].format) <= 32 ? 8 : 4;
+   const uint32_t row_blocks = row / (16 * header_tile_sbs);
+   assert(row_blocks < (1u << 13));
+   assert(util_format_linear(t->format) ==
+          util_format_linear(t->image->planes[t->plane].format));
+
+   pan_cast_and_pack(out, AFBC_RGB_RENDER_TARGET, cfg) {
       cfg.internal_buffer_offset = r->rt_offset[i];
-      cfg.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
-      cfg.write_enable = false;
-      cfg.writeback_block_format = MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED;
+      cfg.dithering_enable = true;
+      cfg.clean_tile_write_enable = clean_tile_write(t);
+      cfg.clear.color_0 = clear[0];
+      cfg.clear.color_1 = clear[1];
+      cfg.clear.color_2 = clear[2];
+      cfg.clear.color_3 = clear[3];
+      cfg.write_enable = t->store;
+      rt_formats(t->format, &cfg.writeback_format, &cfg.internal_format, &cfg.swizzle);
+      cfg.srgb = util_format_is_srgb(t->format);
+      cfg.writeback_block_format = MALI_BLOCK_FORMAT_AFBC_TILED;
+      cfg.writeback_msaa = MALI_MSAA_SINGLE;
+      cfg.yuv_transform = t->image->vk.drm_format_mod & AFBC_FORMAT_MOD_YTR;
+      cfg.wide_block = false;
+      cfg.split_block = false;
+      cfg.reverse_issue_order = afbc_reverse_issue_order(r);
+      cfg.header = header;
+      cfg.body = header + body;
+      cfg.row_stride = row_blocks;
    }
 }
 #else

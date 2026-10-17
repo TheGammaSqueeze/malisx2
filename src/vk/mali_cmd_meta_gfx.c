@@ -52,6 +52,7 @@
 #include <string.h>
 
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_format_convert.h"
 #include "util/format/u_format.h"
 #include "util/mesa-blake3.h"
 #include "vk_pipeline.h"
@@ -76,6 +77,10 @@ struct mali_meta_gfx {
       struct mali_meta_fs_key key;
       struct mali_shader *shader;
    } e[META_FS_CACHE_SIZE];
+#if PAN_ARCH < 9
+   /* v7: the copies out of AFBC planes, by copy format. */
+   struct mali_shader *copy_tex_fmt[MALI_META_COPY_FMT_COUNT];
+#endif
 };
 
 static nir_def *
@@ -298,11 +303,33 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
          nir_def *sxy = nir_iadd(b, xy, delta);
          nir_push_if(b, inside);
+#if PAN_ARCH < 9
+         /* v7: an AFBC source is read in its own format and packed into
+          * the block's bits; an AFBC target takes them unpacked into its
+          * own format (mali_meta_copy_fmt). Exact for the UNORM formats
+          * used: n / (2^k - 1) converts back to n. */
+         nir_def *in;
+         if (key->copy_src_fmt) {
+            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
+            in = raw_to_uvec4(
+               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
+         } else {
+            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
+                                   : copy_raw_load(b, key, sxy, layer);
+         }
+         if (key->copy_dst_fmt)
+            in = nir_format_unpack_rgba(b, nir_channel(b, in, 0),
+                                        mali_meta_copy_fmt_pipe(key->copy_dst_fmt));
+         nir_push_else(b, NULL);
+         nir_def *out = fetch(b, tex + (key->copy_src_tex ? 1 : 0), xy, layer,
+                              key->copy_dst_fmt ? nir_type_float32 : nir_type_uint32);
+#else
          nir_def *in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
                                          : copy_raw_load(b, key, sxy, layer);
          nir_push_else(b, NULL);
          nir_def *out = fetch(b, tex + (key->copy_src_tex ? 1 : 0), xy, layer,
                               nir_type_uint32);
+#endif
          nir_pop_if(b, NULL);
          v = nir_if_phi(b, in, out);
          tex += key->copy_src_tex ? 2 : 1;
@@ -421,6 +448,10 @@ MALI_PER_ARCH(meta_gfx_finish)(struct mali_device *dev)
       MALI_PER_ARCH(shader_unref)(dev, mg->copy_quad[i]);
    for (unsigned i = 0; i < mg->count; i++)
       MALI_PER_ARCH(shader_unref)(dev, mg->e[i].shader);
+#if PAN_ARCH < 9
+   for (unsigned i = 0; i < ARRAY_SIZE(mg->copy_tex_fmt); i++)
+      MALI_PER_ARCH(shader_unref)(dev, mg->copy_tex_fmt[i]);
+#endif
    free(mg);
    dev->meta_gfx = NULL;
 }
@@ -1085,6 +1116,95 @@ MALI_PER_ARCH(meta_copy_tex_get)(struct mali_cmd_buffer *cmd, unsigned elem_log2
 {
    return copy_get(cmd, elem_log2, true);
 }
+
+#if PAN_ARCH < 9
+/* build_copy's texture source for v7 AFBC planes: texel fetch in the copy
+ * format, packed into the block's bits (one 32-bit value or less: the
+ * copy formats are at most 4 bytes), stored raw. */
+static nir_shader *
+build_copy_tex_fmt(struct mali_device *dev, enum mali_meta_copy_fmt fmt)
+{
+   const enum pipe_format pf = mali_meta_copy_fmt_pipe(fmt);
+   const unsigned elem = util_format_get_blocksize(pf);
+   unsigned comps, bits;
+   raw_block_type(elem, &comps, &bits);
+   assert(comps == 1);
+
+   nir_builder bld = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
+      "mali_meta_copy_tex_%s", util_format_short_name(pf));
+   nir_builder *b = &bld;
+   b->shader->info.workgroup_size[0] = MALI_META_COPY_WG;
+   b->shader->info.workgroup_size[1] = MALI_META_COPY_WG;
+   b->shader->info.workgroup_size[2] = 1;
+
+   nir_def *id = nir_load_global_invocation_id(b, 32);
+   nir_def *gx = nir_channel(b, id, 0), *gy = nir_channel(b, id, 1), *gz = nir_channel(b, id, 2);
+   nir_def *w = copy_push(b, 32, COPY_PUSH(width));
+   nir_def *h = copy_push(b, 32, COPY_PUSH(height));
+
+   nir_push_if(b, nir_iand(b, nir_ult(b, gx, w), nir_ult(b, gy, h)));
+   {
+      nir_def *sx = nir_iadd(b, gx, copy_push(b, 32, COPY_PUSH(src_x)));
+      nir_def *sy = nir_iadd(b, gy, copy_push(b, 32, COPY_PUSH(src_y)));
+      nir_def *t = fetch(b, 0, nir_vec2(b, sx, sy), gz, nir_type_float32);
+      nir_def *v = nir_format_pack_rgba(b, pf, t);
+      if (bits < 32)
+         v = nir_u2uN(b, v, bits);
+      nir_def *da = surface_addr(
+         b, copy_push(b, 64, COPY_PUSH(dst)), copy_push(b, 64, COPY_PUSH(dst_layer_stride)),
+         copy_push(b, 32, COPY_PUSH(dst_row_stride)),
+         nir_iadd(b, gx, copy_push(b, 32, COPY_PUSH(dst_x))),
+         nir_iadd(b, gy, copy_push(b, 32, COPY_PUSH(dst_y))), gz,
+         copy_push(b, 32, COPY_PUSH(dst_tile_shift)), elem);
+      nir_store_global(b, v, da, .write_mask = 0x1, .align_mul = elem);
+   }
+   nir_pop_if(b, NULL);
+   return b->shader;
+}
+
+const struct mali_shader *
+MALI_PER_ARCH(meta_copy_tex_fmt_get)(struct mali_cmd_buffer *cmd, enum mali_meta_copy_fmt fmt)
+{
+   struct mali_device *dev = cmd->dev;
+   struct mali_shader *s = NULL;
+
+   assert(fmt > MALI_META_COPY_FMT_RAW && fmt < MALI_META_COPY_FMT_COUNT);
+   simple_mtx_lock(&dev->meta_lock);
+   if (!dev->meta_gfx)
+      dev->meta_gfx = calloc(1, sizeof(struct mali_meta_gfx));
+   struct mali_meta_gfx *mg = dev->meta_gfx;
+   if (mg) {
+      s = mg->copy_tex_fmt[fmt];
+      if (!s) {
+         nir_shader *nir = build_copy_tex_fmt(dev, fmt);
+         MALI_PER_ARCH(shader_preprocess)(dev, nir);
+         const struct vk_pipeline_robustness_state rs = {
+            .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .vertex_inputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+         };
+         const struct mali_shader_compile_info info = {.nir = nir, .rs = &rs};
+         const uint32_t f32 = fmt;
+         blake3_hash hash;
+         struct mesa_blake3 h;
+         _mesa_blake3_init(&h);
+         _mesa_blake3_update(&h, "mali-meta-copy-tex-fmt", 22);
+         _mesa_blake3_update(&h, &f32, sizeof(f32));
+         _mesa_blake3_final(&h, hash);
+         if (MALI_PER_ARCH(shader_compile)(dev, &info, hash, &s) != VK_SUCCESS)
+            s = NULL;
+         mg->copy_tex_fmt[fmt] = s;
+      }
+   }
+   simple_mtx_unlock(&dev->meta_lock);
+
+   if (!s)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   return s;
+}
+#endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
 /* vkCmdClearAttachments                                                   */
