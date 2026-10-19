@@ -5,15 +5,16 @@
 
 /*
  * Compiled shaders: one pipeline stage taken from NIR through panvk-style
- * lowering and kraid to v9 or v11 machine code (mali_shader.c is built per
- * arch), uploaded to the device's executable pool, with its Shader Program
- * Descriptors (SPDs) built.
+ * lowering and kraid to v9 or v11 machine code, or Mesa's Bifrost backend
+ * to v7 machine code (mali_shader.c is built per arch), uploaded to the
+ * device's executable pool, with its Shader Program Descriptors (SPDs)
+ * built (on v7, a vertex shader's Renderer State Descriptor).
  *
  * A mali_shader is a pipeline cache object: pipelines share them through
  * the application's VkPipelineCache or the device's own in-memory cache,
  * and they are serialized into vkGetPipelineCacheData.
  *
- * The resource model is panvk's for v9+ (the same on both arches), because
+ * The resource model is panvk's for v9+ (the same on v9 and v11), because
  * the shaders come from Mesa's compiler and that is the model its lowering
  * produces:
  *
@@ -24,6 +25,11 @@
  *    dummy sampler, dynamic buffers), table N + 1 is descriptor set N;
  *  - graphics and compute system values have the layouts of
  *    struct mali_graphics_sysvals / mali_compute_sysvals.
+ *
+ * v7 keeps the FAU block and the system values but has no resource
+ * tables, and takes no descriptors: a shader that uses descriptor sets,
+ * uniform buffers, textures, samplers, images or constant data is refused
+ * (mali_shader.c v7_fixup_info).
  */
 
 #ifndef MALI_SHADER_H
@@ -95,6 +101,12 @@ struct mali_graphics_sysvals {
       int32_t first_vertex;
       int32_t base_instance;
       uint32_t noperspective_varyings;
+      /* v7: what the vertex shader adds to the raw vertex id to get
+       * gl_VertexIndex (pan_nir_lower_vertex_id): firstVertex, or the
+       * smallest index plus vertexOffset for an indexed draw, as in the
+       * Draw descriptor's offset_start. It fills padding, so the other
+       * words keep their offsets. */
+      int32_t raw_vertex_offset;
    } vs;
    struct {
       mali_aligned_u64 blend_descs[MALI_MAX_RTS];
@@ -232,7 +244,10 @@ struct mali_shader_desc_info {
 };
 
 /* SPD slots. A vertex shader has three (panvk v11): position for points,
- * position for other primitives (point-size writes removed), varyings. */
+ * position for other primitives (point-size writes removed), varyings.
+ * On v7 the slots hold the Renderer State Descriptor of a vertex shader
+ * (both position slots alike, no varying shader) and the code address of
+ * a fragment or compute shader (mali_shader.c shader_upload). */
 enum mali_spd {
    MALI_SPD_MAIN = 0,          /* fragment or compute */
    MALI_SPD_POS_POINTS = 0,
@@ -284,7 +299,8 @@ struct mali_shader {
    } ubo_copy;
 
    /* GPU copies: code in the executable pool (128-byte aligned), SPDs in
-    * the pipeline descriptor pool (32-byte aligned). */
+    * the pipeline descriptor pool (32-byte aligned; on v7 a 64-byte RSD,
+    * for a vertex shader only). */
    struct mali_bo_ref code;
    struct mali_bo_ref spd_mem;
    uint64_t spd[MALI_SPD_COUNT];   /* GPU addresses; 0 if absent */
@@ -299,9 +315,11 @@ mali_shader_code_va(const struct mali_shader *s)
 /* The cache object operations, per arch (a v9 shader object uploads and
  * builds v9 SPDs); also the physical device's pipeline_cache_import_ops
  * entry. */
+extern const struct vk_pipeline_cache_object_ops mali_v7_shader_cache_ops;
 extern const struct vk_pipeline_cache_object_ops mali_v9_shader_cache_ops;
 extern const struct vk_pipeline_cache_object_ops mali_v11_shader_cache_ops;
 /* NULL-terminated lists for vk_physical_device::pipeline_cache_import_ops. */
+extern const struct vk_pipeline_cache_object_ops *const mali_v7_pipeline_cache_import_ops[];
 extern const struct vk_pipeline_cache_object_ops *const mali_v9_pipeline_cache_import_ops[];
 extern const struct vk_pipeline_cache_object_ops *const mali_v11_pipeline_cache_import_ops[];
 
@@ -350,11 +368,12 @@ MALI_PER_ARCH_DECL(bool, shader_fs_keeps_dual_source,
 MALI_PER_ARCH_DECL(void, shader_preprocess, (struct mali_device *dev, nir_shader *nir));
 
 /*
- * Lower, compile with kraid, upload. A vertex shader reads the fragment
- * shader's noperspective mask from the vs.noperspective_varyings system
- * value, so it does not depend on the fragment shader. On success *out holds one reference
- * and its cache key is key. VK_ERROR_INVALID_SHADER_NV if the compiler
- * refuses the shader (logged).
+ * Lower, compile (kraid on v9 and v11, Mesa's Bifrost backend on v7),
+ * upload. A vertex shader reads the fragment shader's noperspective mask
+ * from the vs.noperspective_varyings system value, so it does not depend
+ * on the fragment shader. On success *out holds one reference and its
+ * cache key is key. VK_ERROR_INVALID_SHADER_NV if the compiler refuses the
+ * shader (logged).
  */
 MALI_PER_ARCH_DECL(VkResult, shader_compile,
                    (struct mali_device *dev, const struct mali_shader_compile_info *info,

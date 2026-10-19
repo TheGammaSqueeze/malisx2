@@ -4,9 +4,10 @@
  */
 
 /*
- * Render passes on the job manager (v9): the tiler side (heap slot, Tiler
- * Contexts, the pass's Local Storage descriptor), the fragment jobs, and
- * the full-screen jobs (in-pass clears and the in-pass by-region barrier).
+ * Render passes on the job manager (v7 and v9): the tiler side (heap slot,
+ * Tiler Contexts, the pass's Local Storage descriptor), the fragment jobs,
+ * and the full-screen jobs (in-pass clears and the in-pass by-region
+ * barrier).
  * What does not depend on the frontend (tile-buffer layout, preloads and
  * frame shaders, framebuffer descriptors, vkCmdBeginRendering) is in
  * mali_fb.c, shared with the v11 back half.
@@ -28,7 +29,7 @@
  *    (mali_jm_heap.c), and the pass gets one 192-byte Tiler Context per
  *    layer, every word written, all pointing at the batch's one heap
  *    descriptor. A pass that never tiles has no contexts (the FBD's tiler
- *    pointer stays 0, as Mesa's v9 gallium driver does for a clear-only
+ *    pointer stays 0, as Mesa's gallium driver does for a clear-only
  *    batch) and no heap slot;
  *  - end: the framebuffer descriptors (mali_fb.c, one per layer) and one
  *    128-byte Fragment job per layer in the open batch's current fragment
@@ -54,14 +55,19 @@
  *    would drop it from every layer but the first. Noysz's arch-9 port
  *    runs one context per layer with offset 0 and passes the layered
  *    rendering tests on a G57. To be confirmed on the device. A draw of a
- *    layered pass goes to layer 0's context only: no v9 shader writes a
- *    layer, so all its primitives are in layer 0 (mali_jm_cmd_draw.c);
+ *    layered pass goes to layer 0's context only: no job-manager shader
+ *    writes a layer, so all its primitives are in layer 0
+ *    (mali_jm_cmd_draw.c, mali_jm_cmd_draw_v7.c);
  *  - all layers' fragment jobs in one fragment chain (the blob has a chain
  *    per layer): they need no order between them;
- *  - transaction elimination (CRC) is off on v9 until the device shows it
- *    pays: no image has CRC state, so no pass picks a CRC target. Turning
- *    it on means putting the image's seed into the CRC Clear Color here,
- *    on the CPU, from a per-image seed counter bumped at record time.
+ *  - transaction elimination (CRC) is off on the job manager until the
+ *    device shows it pays: no image has CRC state, so no pass picks a CRC
+ *    target. Turning it on means putting the image's seed into the CRC
+ *    Clear Color here, on the CPU, from a per-image seed counter bumped at
+ *    record time.
+ *
+ * Bifrost (v7) has no Fullscreen job: its in-pass clears
+ * (mali_cmd_meta_gfx.c) and fragment barrier are logged once and skipped.
  */
 
 #include "mali_cmd_state.h"
@@ -70,8 +76,8 @@
 
 #include "mali_measure.h"
 
-#if PAN_ARCH != 9
-#error "mali_jm_cmd_render.c is the v9 (job manager) back half"
+#if PAN_ARCH != 7 && PAN_ARCH != 9
+#error "mali_jm_cmd_render.c is the job manager back half (PAN_ARCH 7 or 9)"
 #endif
 
 /* What one tiled pass adds to its batch's heap estimate on top of its
@@ -80,7 +86,7 @@
  * of passes, which the pass limit closes first. */
 #define MALI_JM_HEAP_PASS_EST (64 * 1024)
 
-_Static_assert(MALI_LAYERS_PER_TILER_CTX == 1, "one Tiler Context per layer on v9");
+_Static_assert(MALI_LAYERS_PER_TILER_CTX == 1, "one Tiler Context per layer on v7 and v9");
 
 /* ---------------------------------------------------------------------- */
 /* Begin                                                                   */
@@ -148,11 +154,19 @@ pack_tiler_context(struct mali_cmd_buffer *cmd, const struct mali_render_state *
       cfg.polygon_list = 0;
       cfg.hierarchy_mask = mask;
       cfg.sample_pattern = MALI_SAMPLE_PATTERN_SINGLE_SAMPLED;
+#if PAN_ARCH >= 9
       cfg.first_provoking_vertex = r->first_provoking_vertex;
+#endif
       cfg.fb_width = r->desc.width;
       cfg.fb_height = r->desc.height;
+#if PAN_ARCH >= 9
       cfg.layer_count = 1;
       cfg.layer_offset = 0;
+#else
+      /* v7: no layer fields (one context per layer either way), and the
+       * provoking vertex is a Primitive bit of each Tiler job (Mesa's
+       * pan_jm.c jm_emit_tiler_desc sets it here only on v9). */
+#endif
       cfg.heap = heap;
    }
    memcpy(dst, &tc, sizeof(tc));
@@ -244,6 +258,10 @@ static void
 fullscreen_jobs(struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
                 uint32_t base_layer, uint32_t layer_count, bool barrier)
 {
+#if PAN_ARCH < 9
+   /* v7 has no Fullscreen job. */
+   MALI_V7_UNSUPPORTED("a full-screen job");
+#else
    struct mali_render_state *r = &cmd->gfx.render;
    if (!MALI_PER_ARCH(cmd_render_tiler)(cmd)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -287,6 +305,7 @@ fullscreen_jobs(struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
       memcpy((uint8_t *)job.cpu + 32, tmpl + 32, sizeof(tmpl) - 32);
    }
    r->draws++;
+#endif /* PAN_ARCH >= 9 */
 }
 
 void
@@ -311,6 +330,9 @@ MALI_PER_ARCH(cmd_run_fullscreen)(struct mali_cmd_buffer *cmd, uint64_t dcd, con
 void
 MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
 {
+#if PAN_ARCH < 9
+   MALI_V7_UNSUPPORTED("the in-pass fragment barrier");
+#else
    struct mali_render_state *r = &cmd->gfx.render;
    struct mali_ptr zsd = mali_cmd_alloc(cmd, pan_size(DEPTH_STENCIL), 32);
    struct mali_ptr dcd = mali_cmd_alloc(cmd, pan_size(DRAW), 64);
@@ -334,6 +356,7 @@ MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
    }
    const VkRect2D all = {{0, 0}, {r->desc.width, r->desc.height}};
    fullscreen_jobs(cmd, dcd.gpu, &all, 0, MAX2(r->desc.layer_count, 1), false);
+#endif /* PAN_ARCH >= 9 */
 }
 
 /* ---------------------------------------------------------------------- */
@@ -396,7 +419,7 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
       if (!fbds) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       } else {
-         /* No CRC state on v9 (see the file comment). */
+         /* No CRC state on the job manager (see the file comment). */
          assert(r->crc_rt < 0);
          /* Each layer's descriptors are 64-byte aligned, so the tag of the
           * first pointer holds for all. */
@@ -419,8 +442,8 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
 }
 
-/* CRCs (transaction elimination) are off on v9 until the device shows
- * they pay; with no CRC state there is nothing to
+/* CRCs (transaction elimination) are off on the job manager until the
+ * device shows they pay; with no CRC state there is nothing to
  * invalidate. */
 void
 MALI_PER_ARCH(cmd_crc_invalidate)(struct mali_cmd_buffer *cmd, const struct mali_image *image)

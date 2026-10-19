@@ -6,7 +6,7 @@
 /*
  * vkCmdCopyBuffer, vkCmdFillBuffer and vkCmdUpdateBuffer, as compute
  * dispatches of small internal shaders: on the compute subqueue (CSF, v11)
- * or as Compute jobs in the open batch's vtc chain (job manager, v9).
+ * or as Compute jobs in the open batch's vtc chain (job manager, v7 and v9).
  * Built once per arch.
  *
  * Why compute and not the command stream itself: CS LOAD_MULTIPLE /

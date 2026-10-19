@@ -32,13 +32,18 @@
  * Depth and stencil planes are copied as colour (R32_UINT / R8_UINT), as
  * panvk does; the compression mode stays the plane's.
  *
- * Built per arch. On the job manager (v9) the transfer passes are marked
- * as fragment-side transfers of their batch (barriers from transfer stages
- * wait for them, mali_jm.h), and an image -> image copy whose compute job
- * would close the open batch (a barrier makes it wait for this batch's
- * fragment work, typically a copy of what a pass just rendered) is done by
- * the fragment-side copy pass instead, which stays in the batch behind a
- * barrier in its fragment chain.
+ * Built per arch. On the job manager (v7 and v9) the transfer passes are
+ * marked as fragment-side transfers of their batch (barriers from transfer
+ * stages wait for them, mali_jm.h). On v9 an image -> image copy whose
+ * compute job would close the open batch (a barrier makes it wait for this
+ * batch's fragment work, typically a copy of what a pass just rendered) is
+ * done by the fragment-side copy pass instead, which stays in the batch
+ * behind a barrier in its fragment chain.
+ *
+ * On v7 (Bifrost) the blit pass and the fragment-side copy pass are not
+ * supported (their frame shaders draw with meta_fs_dcd): a blit is logged
+ * once and skipped, and image copies take the compute copy, whose
+ * dispatches are logged once and skipped as well (mali_jm_cmd_dispatch.c).
  */
 
 #if PAN_ARCH >= 10
@@ -440,7 +445,11 @@ copy_on_fragment(struct mali_cmd_buffer *cmd, const struct mali_image *src,
                  const struct mali_image *dst, VkImageAspectFlags aspect,
                  const struct copy_surface *s)
 {
-#if PAN_ARCH < 10
+#if PAN_ARCH < 9
+   /* The fragment-side copy pass is not supported on v7 (its frame shader
+    * draws with meta_fs_dcd in mali_cmd_meta_gfx.c). */
+   return false;
+#elif PAN_ARCH < 10
    return aspect == VK_IMAGE_ASPECT_COLOR_BIT && src->vk.image_type == VK_IMAGE_TYPE_2D &&
           dst->vk.image_type == VK_IMAGE_TYPE_2D && s->block_w == 1 && s->block_h == 1 &&
           util_is_power_of_two_nonzero(s->block_bytes) && s->block_bytes <= 16 &&
@@ -727,6 +736,13 @@ MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInf
       const int32_t dy1 = MAX2(r->dstOffsets[0].y, r->dstOffsets[1].y);
       if (dx1 <= dx0 || dy1 <= dy0)
          continue;
+
+#if PAN_ARCH < 9
+      /* The blit pass is not supported on v7 (its frame shader draws with
+       * meta_fs_dcd in mali_cmd_meta_gfx.c). */
+      MALI_V7_UNSUPPORTED("a blit");
+      continue;
+#endif
 
       struct mali_meta_fs_key key = {
          .layered = layers > 1,

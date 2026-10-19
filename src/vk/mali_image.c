@@ -44,12 +44,16 @@
  * raw compute copy. panvk makes the same choices (panvk_image_can_use_mod,
  * pan_mod_afbc_test_props).
  *
- * Both arches. On a G57 at 2x upscaling, uncompressed render targets made
+ * v9 and v11. On a G57 at 2x upscaling, uncompressed render targets made
  * fragment-bound dumps 20-25 % slower than with AFBC.
+ *
+ * AFBC is not supported on v7, whose images stay uncompressed.
  */
 static bool
 afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
 {
+   if (arch < 9)
+      return false;
    switch (mode) {
    case MALI_AFBC_NONE:
       return false;
@@ -194,9 +198,10 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod = choose_modifier(image, formats, arch);
-   /* No CRC on v9 yet: the job manager cannot update the seed from the
+   /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
     * GPU, and the CPU-side seed it needs is not written yet. */
-   const bool crc = arch != 9 && mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
+   const bool crc = !mali_arch_is_jm(arch) &&
+                    mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
    /* Planes follow each other; each starts 4 KiB aligned (data_size is
     * rounded so). */
@@ -299,7 +304,7 @@ mali_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequiremen
 }
 
 /* The CRC knobs (mali_cmd_gfx.h): here, in code compiled once, so the
- * render-pass code of either arch reads the same ones. */
+ * render-pass code of every arch reads the same ones. */
 struct mali_crc_options mali_crc_options = {
    .empty_tile_read = true,
    .empty_tile_write = true,

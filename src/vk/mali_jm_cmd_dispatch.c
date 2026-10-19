@@ -4,12 +4,12 @@
  */
 
 /*
- * Compute dispatch on the job manager (v9): one 128-byte Compute job per
+ * Compute dispatch on the job manager (v7 and v9): one Compute job per
  * dispatch in the open batch's vtc chain (Mesa gallium pan_jm.c
  * jm_launch_grid; the T820 blob writes the same job). The FAU block,
  * resource table and Local Storage descriptor come from the builders
- * shared with the v11 back half (mali_cmd_state.h); what differs is where
- * they go:
+ * shared with the v11 back half (mali_cmd_state.h); what differs on v9,
+ * where the job is 128 bytes, is where they go:
  *
  *  - workgroup size, counts and task axis/increment in the Compute
  *    payload; offsets 0, as on v11 (the base workgroup is a system value);
@@ -23,6 +23,9 @@
  * The internal dispatches (cmd_dispatch_shader, cmd_dispatch_meta) are the
  * transfers done by compute (copies, fills, updates) and meet the barriers
  * whose destination is only the transfer stages; vkCmdDispatch does not.
+ *
+ * Compute dispatch is not supported on v7 (Bifrost): dispatch logs it once
+ * and skips the dispatch.
  */
 
 #include "mali_cmd_state.h"
@@ -40,6 +43,9 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    if (!groups[0] || !groups[1] || !groups[2])
       return;
 
+#if PAN_ARCH < 9
+   MALI_V7_UNSUPPORTED("compute dispatch");
+#else
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
 
    const uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
@@ -96,6 +102,7 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    cmd->dispatches++;
    if (unlikely(mh))
       mali_jm_measure_end(cmd, mh, c);
+#endif /* PAN_ARCH >= 9 */
 }
 
 void

@@ -460,8 +460,8 @@ copy_varying_layout(struct pan_varying_layout *dst, const struct pan_varying_lay
 }
 
 /* The bind block (struct mali_gfx_bind): register words, the static
- * states the draw reads, table keys, and a GPU copy of the Depth/stencil
- * descriptor when nothing dynamic feeds it. */
+ * states the draw reads, table keys, and on v9 and v11 a GPU copy of the
+ * Depth/stencil descriptor when nothing dynamic feeds it. */
 static VkResult
 fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
 {
@@ -549,6 +549,7 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->fs_srt_key = mali_device_intern_key(dev, &fkey, sizeof(fkey));
 
    bd->zsd = 0;
+#if PAN_ARCH >= 9
    if (!bk->uses_dynamic_state) {
       if (mali_bo_pool_alloc(&dev->desc_pool, sizeof(bk->zsd), 32, &p->zsd_mem) !=
           MALI_KBASE_SUCCESS)
@@ -556,6 +557,11 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
       memcpy(p->zsd_mem.cpu, bk->zsd, sizeof(bk->zsd));
       bd->zsd = p->zsd_mem.gpu_va;
    }
+#else
+   /* v7 has no Depth/stencil descriptor: the draw copies baked.zsd into
+    * its fragment Renderer State Descriptor (mali_jm_cmd_draw_v7.c
+    * build_fs_rsd). */
+#endif
    return VK_SUCCESS;
 }
 

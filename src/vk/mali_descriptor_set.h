@@ -128,7 +128,8 @@ mali_descriptor_set_size(const struct mali_descriptor_set *set)
  * The Resource entry for a bound set (resource table set + 1): the set's
  * memory, Contains descriptors set, size in bytes. set may be NULL (an
  * unbound or unused set number): an empty entry. out: 16 bytes, 16-byte
- * aligned in a 64-byte aligned table.
+ * aligned in a 64-byte aligned table. v9 and v11 only: v7 has no resource
+ * tables.
  */
 MALI_PER_ARCH_DECL(void, descriptor_set_pack_resource,
                    (const struct mali_descriptor_set *set, void *out));
@@ -138,7 +139,7 @@ MALI_PER_ARCH_DECL(void, descriptor_set_pack_resource,
  * offset applied, for the driver table (table 0) slot the shader's
  * mali_shader_desc_info::dyn_bufs map names. Sizes are rounded up to 16
  * bytes for uniform buffers and 4 for storage buffers (panvk). out: 32
- * bytes.
+ * bytes. v9 and v11 only: v7 has no resource tables.
  */
 MALI_PER_ARCH_DECL(void, descriptor_set_pack_dyn_buf,
                    (const struct mali_descriptor_set *set, uint32_t idx,

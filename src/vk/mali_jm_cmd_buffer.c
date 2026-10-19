@@ -4,11 +4,11 @@
  */
 
 /*
- * The v9 (job manager) command buffer: command memory, batches and job
- * chains, job writing and linking, barriers, begin/end, and what a command
- * buffer that runs more than once needs restored.
+ * The job-manager (v7 and v9) command buffer: command memory, batches and
+ * job chains, job writing and linking, barriers, begin/end, and what a
+ * command buffer that runs more than once needs restored.
  *
- * Every vkCmd* writes finished v9 jobs when it is recorded. A command
+ * Every vkCmd* writes finished jobs when it is recorded. A command
  * buffer is a list of batches (mali_jm.h); a batch is one vertex/tiler/
  * compute ("vtc") job chain, which runs as one atom on job slot 1, and
  * fragment segments, each a fragment chain that runs as one atom on slot 0
@@ -233,8 +233,14 @@ mali_jm_cmd_prepare_submit(struct mali_cmd_buffer *cmd)
 static inline bool
 job_is_tiler_side(enum mali_job_type type)
 {
+#if PAN_ARCH >= 9
    return type == MALI_JOB_TYPE_MALLOC_VERTEX || type == MALI_JOB_TYPE_FULLSCREEN ||
           type == MALI_JOB_TYPE_TILER;
+#else
+   /* v7 has no Malloc Vertex or Fullscreen jobs: a draw is a Vertex job
+    * (compute side) and a Tiler job that depends on it. */
+   return type == MALI_JOB_TYPE_TILER;
+#endif
 }
 
 /* Header and link of a job at job (size bytes, from command memory). */
@@ -768,6 +774,12 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    memset(&cmd->gfx, 0, sizeof(cmd->gfx));
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
    cmd->dispatches = cmd->draws = cmd->passes = 0;
+#if PAN_ARCH < 9
+   /* The v7 draw state goes with gfx: its index buffer view belongs to the
+    * binding in gfx.draw.ib, and everything else is rebuilt by
+    * MALI_GFX_DIRTY_ALL. */
+   mali_jm_draw_tmpl_init(&cmd->jm.draw);
+#endif
 }
 
 static VkResult

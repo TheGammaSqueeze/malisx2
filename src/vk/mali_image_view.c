@@ -47,6 +47,8 @@
 
 #define PLANE_DESC_SIZE 32
 
+#if PAN_ARCH >= 9
+
 /* Clump formats that are not raw N-byte texels (pan_texture.c's table,
  * less the YUV formats, which are not supported). */
 static enum mali_clump_format
@@ -104,6 +106,8 @@ astc_dim(unsigned dim)
    }
 }
 
+#endif /* PAN_ARCH >= 9 */
+
 static enum mali_texture_dimension
 texture_dim(VkImageViewType type)
 {
@@ -123,6 +127,8 @@ texture_dim(VkImageViewType type)
 
 /* ---------------------------------------------------------------------- */
 /* AFBC                                                                    */
+
+#if PAN_ARCH >= 9
 
 static enum mali_afbc_compression_mode
 afbc_hw_mode(enum mali_afbc_mode m)
@@ -160,6 +166,8 @@ MALI_PER_ARCH(image_afbc_hw_read_mode)(const struct mali_image *image, unsigned 
    return MALI_PER_ARCH(image_afbc_hw_mode)(image, plane);
 }
 
+#endif /* PAN_ARCH >= 9 */
+
 /* What a view reads: one plane of the image, in one format. */
 struct view_src {
    const struct mali_image *image;
@@ -169,6 +177,32 @@ struct view_src {
    unsigned first_level, levels;
    unsigned first_layer, layers; /* 3D: first Z slice and slice count */
 };
+
+#if PAN_ARCH < 9
+
+/*
+ * v7 has no plane descriptors: its Texture descriptor points at 16-byte
+ * Surface With Stride entries (pan_texture.c
+ * pan_emit_iview_texture_payload at PAN_ARCH 7). Texture descriptors are
+ * not supported on v7, so vkCreateImageView fails for sampled and storage
+ * usage; attachment-only views need no descriptor.
+ */
+static unsigned
+emit_planes(const struct view_src *src, uint8_t *out)
+{
+   MALI_V7_UNSUPPORTED("a texture payload");
+   return 0;
+}
+
+static void
+pack_texture(const struct view_src *src, const unsigned char swizzle[4],
+             uint64_t planes, float min_lod, bool storage, uint32_t out[8])
+{
+   MALI_V7_UNSUPPORTED("a texture descriptor");
+   memset(out, 0, 8 * sizeof(uint32_t));
+}
+
+#else
 
 /* One plane descriptor: level `level`, layer or Z slice `layer`
  * (get_linear_or_u_tiled_plane_props + emit_generic_plane /
@@ -347,6 +381,8 @@ pack_texture(const struct view_src *src, const unsigned char swizzle[4],
    }
 }
 
+#endif /* PAN_ARCH >= 9 */
+
 VkResult
 MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_view *view)
 {
@@ -358,6 +394,11 @@ MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_
                              !vk_format_is_compressed(view->vk.view_format);
    if (!want_tex && !want_storage)
       return VK_SUCCESS;
+#if PAN_ARCH < 9
+   MALI_V7_UNSUPPORTED("a sampled or storage image view");
+   return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                    "sampled and storage image views are not supported on v7");
+#endif
 
    struct view_src src = {
       .image = image,

@@ -14,8 +14,8 @@
  * mali_cmd_state.[ch] and mali_cmd_meta_gfx.c are shared with the
  * job-manager back half and built per arch, as are the back halves'
  * functions declared here (mali_cmd_render.c and mali_cmd_draw.c on v11,
- * the mali_jm_* files on v9): every function below has a mali_v9_ and a
- * mali_v11_ variant (MALI_PER_ARCH).
+ * the mali_jm_* files on v7 and v9): every function below has a mali_v7_,
+ * a mali_v9_ and a mali_v11_ variant (MALI_PER_ARCH).
  */
 
 #ifndef MALI_CMD_GFX_H
@@ -121,8 +121,8 @@ mali_push_shadows_fini(struct mali_push_shadows *ps, const VkAllocationCallbacks
    }
 }
 
-/* Layers one Tiler Context covers: 8 on v11, 1 on v9 (Mesa v9, panvk JM
- * and the T820 blob use one per layer). Per-arch code only. */
+/* Layers one Tiler Context covers: 8 on v11, 1 on v7 and v9 (Mesa v9,
+ * panvk JM and the T820 blob use one per layer). Per-arch code only. */
 #if defined(PAN_ARCH) && PAN_ARCH < 10
 #define MALI_LAYERS_PER_TILER_CTX 1
 #else
@@ -399,7 +399,7 @@ MALI_PER_ARCH_DECL(void, cmd_crc_invalidate,
                    (struct mali_cmd_buffer *cmd, const struct mali_image *image));
 
 /* Knobs for the device CRC test; the driver runs with the defaults
- * (mali_image.c, compiled once: one set for both arches). */
+ * (mali_image.c, compiled once: one set for every arch). */
 struct mali_crc_options {
    bool disable;               /* no CRC at all */
    bool skip_copy_invalidate;  /* tests only: copies leave the CRC valid */

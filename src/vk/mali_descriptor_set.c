@@ -40,10 +40,12 @@
 #include "vk_util.h"
 
 static_assert(sizeof(struct mali_hw_desc) == MALI_DESCRIPTOR_SIZE, "descriptor size");
-static_assert(pan_size(BUFFER) == MALI_DESCRIPTOR_SIZE, "descriptor size");
 static_assert(pan_size(TEXTURE) == MALI_DESCRIPTOR_SIZE, "descriptor size");
+#if PAN_ARCH >= 9
+static_assert(pan_size(BUFFER) == MALI_DESCRIPTOR_SIZE, "descriptor size");
 static_assert(pan_size(NULL_DESCRIPTOR) == MALI_DESCRIPTOR_SIZE, "descriptor size");
 static_assert(pan_size(RESOURCE) == MALI_RESOURCE_SIZE, "descriptor size");
+#endif
 
 /* Where a dynamic buffer bound to nothing points: an address the GPU's
  * memory sink absorbs (panvk). */
@@ -74,6 +76,12 @@ MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *
    if (!view)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+#if PAN_ARCH < 9
+   MALI_V7_UNSUPPORTED("a buffer view");
+   (void)buffer;
+   vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+   return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+#else
    const enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.format);
    const unsigned stride = util_format_get_blocksize(pfmt);
    const uint64_t size = view->vk.elements * stride;
@@ -97,6 +105,7 @@ MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *
 
    *pView = mali_buffer_view_to_handle(view);
    return VK_SUCCESS;
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -134,9 +143,17 @@ static void
 write_null(const struct mali_descriptor_set *set, uint32_t binding, uint32_t elem,
            enum mali_subdesc sub)
 {
+#if PAN_ARCH >= 9
    struct mali_null_descriptor_packed null_desc;
    pan_pack(&null_desc, NULL_DESCRIPTOR, cfg);
    write_slot(set, binding, elem, sub, &null_desc);
+#else
+   /* No Null descriptor on Bifrost (panvk_v7 writes none either): the slot
+    * is zeroed. Reading through it is not robust, and nullDescriptor is
+    * not exposed. */
+   const uint8_t null_desc[MALI_DESCRIPTOR_SIZE] = {0};
+   write_slot(set, binding, elem, sub, null_desc);
+#endif
 }
 
 static enum mali_subdesc
@@ -192,6 +209,10 @@ write_image(const struct mali_descriptor_set *set, const VkDescriptorImageInfo *
 static void
 pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
 {
+#if PAN_ARCH < 9
+   MALI_V7_UNSUPPORTED("a buffer descriptor");
+   memset(out, 0, MALI_DESCRIPTOR_SIZE);
+#else
    const uint64_t size = align64(range, ssbo ? 4 : 16);
    pan_cast_and_pack(out, BUFFER, cfg) {
       cfg.address = addr;
@@ -202,6 +223,7 @@ pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
       cfg.size = MIN2(size, UINT32_MAX & ~(uint64_t)(ssbo ? 3 : 15));
 #endif
    }
+#endif
 }
 
 static void
@@ -673,6 +695,8 @@ MALI_PER_ARCH(FreeDescriptorSets)(VkDevice _device, VkDescriptorPool _pool, uint
 /* ---------------------------------------------------------------------- */
 /* Binding (for the command buffer)                                        */
 
+/* The resource table entries, on v9 and v11; v7 has no resource tables. */
+#if PAN_ARCH >= 9
 void
 MALI_PER_ARCH(descriptor_set_pack_resource)(const struct mali_descriptor_set *set, void *out)
 {
@@ -697,6 +721,7 @@ MALI_PER_ARCH(descriptor_set_pack_dyn_buf)(const struct mali_descriptor_set *set
    pack_buffer(set->dyn_bufs[idx].addr + dynamic_offset, set->dyn_bufs[idx].range,
                set->layout->dyn_ssbos & BITFIELD_BIT(idx), out);
 }
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Push descriptors (VK_KHR_push_descriptor): the command buffer           */

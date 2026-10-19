@@ -4,8 +4,9 @@
  */
 
 /*
- * The job-manager (JM) back half of a VkDevice, for the Mali-G57 (arch v9).
- * Compiled only at PAN_ARCH 9; the CSF counterpart is mali_queue.h.
+ * The job-manager (JM) back half of a VkDevice, for the Mali-G57 (arch v9)
+ * and the Mali-G52 (arch v7, Bifrost). Compiled at PAN_ARCH 7 and 9; the
+ * CSF counterpart is mali_queue.h.
  *
  * What the command-buffer side and the queue agree on:
  *
@@ -52,8 +53,8 @@
 
 #include "kbase/kbase.h"
 
-#if !defined(PAN_ARCH) || PAN_ARCH != 9
-#error "mali_jm.h is the v9 (job manager) back half: build with PAN_ARCH=9"
+#if !defined(PAN_ARCH) || (PAN_ARCH != 7 && PAN_ARCH != 9)
+#error "mali_jm.h is the job manager back half: build with PAN_ARCH=7 or 9"
 #endif
 #include "genxml/gen_macros.h"
 
@@ -191,6 +192,7 @@ struct mali_jm_reset {
    uint32_t size;
 };
 
+#if PAN_ARCH >= 9
 /*
  * The draw template (mali_jm_cmd_draw.c): a CPU-side image of the next
  * Malloc Vertex job in cached memory. The draw state's dirty groups
@@ -205,8 +207,43 @@ struct mali_jm_draw_tmpl {
    uint32_t packet_stride;  /* Allocation's vertex packet stride, for the heap estimate */
    bool secondary;          /* the varying shader runs (Primitive "Secondary Shader") */
 };
+#else
+/* A v7 draw's varying buffers, in the order of panvk's PANVK_VARY_BUF_*. */
+#define MALI_V7_VARY_BUF_GENERAL 0
+#define MALI_V7_VARY_BUF_POSITION 1
+#define MALI_V7_VARY_BUF_PSIZ 2
+#define MALI_V7_VARY_BUF_COUNT 3
 
-/* Inside the v9 command buffer: what submit reads, and the open batch. */
+/*
+ * The v7 draw state (mali_jm_cmd_draw_v7.c): what a draw's Vertex and Tiler
+ * jobs point at that outlives one draw, rebuilt by the dirty groups named
+ * below. A draw packs its two jobs from these and its own counts.
+ */
+struct mali_jm_draw_tmpl {
+   /* Per pipeline (MALI_GFX_DIRTY_PIPELINE). */
+   uint32_t prim0;          /* Primitive word 0 without index type and provoking vertex */
+   uint32_t dcd0;           /* Draw word 0: the baked culling / front face / flat bits */
+   uint64_t vs_rsd;         /* the vertex shader's Renderer State Descriptor */
+   uint64_t fs_code;        /* the fragment shader's code address, 0 without one */
+   uint64_t vs_vary;        /* varying Attribute descriptors the vertex shader writes */
+   uint64_t fs_vary;        /* ... and the fragment shader reads */
+   uint32_t vary_stride[MALI_V7_VARY_BUF_COUNT];
+   enum mesa_prim prim;
+   bool writes_psiz;        /* points with a shader-written size */
+   bool lines;
+   /* Per state group. */
+   uint64_t fs_rsd;         /* fragment RSD + Blend descriptors (PIPELINE, BLEND, ZSD) */
+   uint64_t vs_fau, fs_fau; /* push uniform blocks (VS_FAU, FS_FAU) */
+   uint64_t viewport;       /* Viewport descriptor (VIEWPORT) */
+   uint64_t tiler, tsd;     /* layer 0's Tiler Context, the pass's Local Storage (PASS) */
+   int32_t raw_vertex_offset;   /* the value the VS FAU block was built with */
+   /* The bound index buffer's CPU view (mali_cmd_state.c), NULL when none. */
+   const uint8_t *ib_cpu;
+};
+#endif
+
+/* Inside the job-manager command buffer: what submit reads, and the open
+ * batch. */
 struct mali_jm_cmd {
    struct mali_jm_draw_tmpl draw;
 
@@ -238,9 +275,9 @@ struct mali_jm_cmd {
 };
 
 /*
- * The v9 command buffer: what submit reads (jm), and the recording state
- * the builders shared with the v11 back half read, under the same member
- * names as the v11 struct (mali_cmd_state.h lists them).
+ * The job-manager command buffer: what submit reads (jm), and the
+ * recording state the builders shared with the v11 back half read, under
+ * the same member names as the v11 struct (mali_cmd_state.h lists them).
  */
 struct mali_cmd_buffer {
    struct vk_command_buffer vk;
@@ -365,14 +402,14 @@ struct mali_jm_chain *mali_jm_cmd_frag(struct mali_cmd_buffer *cmd, bool new_seg
 void mali_jm_cmd_mark_frag_transfer(struct mali_cmd_buffer *cmd);
 
 /*
- * Append a job to chain c: size bytes (a v9 job, its header included) at
- * 128-byte alignment from command memory, with the header written (type,
- * the next index, Barrier from the chain's pending barrier or `barrier`,
- * Dependency 1 = dep1, Dependency 2 = the previous tiler-side job for a
- * tiler-side job, Next = 0) and linked behind the chain's last job. A
- * pending Cache Flush job goes in first. The caller writes the payload,
- * every byte of it (slabs are recycled without clearing). {0} on failure,
- * with the command buffer's error set.
+ * Append a job to chain c: size bytes (the whole job, its header included)
+ * at 128-byte alignment from command memory, with the header written
+ * (type, the next index, Barrier from the chain's pending barrier or
+ * `barrier`, Dependency 1 = dep1, Dependency 2 = the previous tiler-side
+ * job for a tiler-side job, Next = 0) and linked behind the chain's last
+ * job. A pending Cache Flush job goes in first. The caller writes the
+ * payload, every byte of it (slabs are recycled without clearing). {0} on
+ * failure, with the command buffer's error set.
  */
 struct mali_ptr mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                                     enum mali_job_type type, unsigned size, bool barrier,
@@ -427,28 +464,35 @@ void mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_
 void mali_jm_cmd_prepare_submit(struct mali_cmd_buffer *cmd);
 
 /* The draw template's words that no draw state owns (mali_jm_cmd_draw.c),
- * at command buffer creation. */
+ * at command buffer creation. On v7 (mali_jm_cmd_draw_v7.c) it clears the
+ * draw state, at creation and at every reset. */
 void mali_jm_draw_tmpl_init(struct mali_jm_draw_tmpl *t);
 
 /* ---------------------------------------------------------------------- */
 /* Render passes (mali_jm_cmd_render.c) and the tiler heap (mali_jm_heap.c) */
 
 /*
- * What a draw (mali_jm_cmd_draw.c) uses of the pass, after
+ * What a draw (mali_jm_cmd_draw.c on v9, mali_jm_cmd_draw_v7.c on v7) and
+ * the internal draws of a pass use of the pass, after
  * MALI_PER_ARCH(cmd_render_tiler) has returned true for it:
  *  - the chain its jobs go into: mali_jm_cmd_pass_vtc (the open batch's
  *    vtc chain; the batch closes inside a pass only at the pass job limit,
  *    MALI_JM_PASS_MAX_JOBS, and the barriers owed to the pass's vtc work
  *    were applied by cmd_render_tiler, so a draw takes the chain as it
- *    is). Call it once per job;
+ *    is). Call it once before jobs that depend on each other, such as a v7
+ *    draw's Vertex job and Tiler job: a split between them would leave a
+ *    dependency pointing into the closed chain (the chain may pass the
+ *    limit by those few jobs). Independent jobs, such as one Fullscreen
+ *    job per layer, may take it once each;
  *  - one Tiler Context per layer: mali_jm_pass_tiler(r, layer), layers
- *    0 .. r->td_count - 1 (MALI_LAYERS_PER_TILER_CTX is 1 on v9);
+ *    0 .. r->td_count - 1 (MALI_LAYERS_PER_TILER_CTX is 1 on v7 and v9);
  *  - the pass's Local Storage descriptor: r->tsd (filled at the end of the
  *    pass from r->tls_size, which the draw raises to its shaders' need);
- *  - the batch's heap estimate: mali_jm_cmd_heap_use(cmd, bytes) per draw
- *    (vertices x instances x (packet stride + 16) plus the polygon list
- *    estimate); the next pass's begin closes the
- *    batch past half a heap slot.
+ *  - the batch's heap estimate: mali_jm_cmd_heap_use(cmd, bytes) per draw,
+ *    a guess at its use of the tiler heap: vertices x instances x (packet
+ *    stride + 16) on v9 (vertex packets and polygon lists), vertices x
+ *    instances x 32 on v7 (polygon lists only: the varyings are in command
+ *    memory). The next pass's begin closes the batch past half a heap slot.
  */
 void mali_jm_cmd_pass_split(struct mali_cmd_buffer *cmd);
 
@@ -485,6 +529,43 @@ void mali_jm_heap_finish(struct mali_jm_device *jd);
  * is new) and its Tiler Heap descriptor in command memory (b->heap_slot,
  * b->heap_desc). False on failure, with the command buffer's error set. */
 bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
+
+#if PAN_ARCH < 9
+/* ---------------------------------------------------------------------- */
+/* Bifrost job sizing                                                      */
+
+/*
+ * The Invocation section of groups[] workgroups of local[] invocations
+ * (Mesa pan_encoder.h pan_pack_work_groups_compute, without indirect
+ * dispatch). graphics is Mesa's quirk_graphics, for a draw's Vertex and
+ * Tiler jobs: a workgroup Z shift of 32 for one instance and the minimum
+ * efficient thread group split. Otherwise the split equals the workgroup
+ * X shift, which barriers need.
+ */
+static inline void
+mali_v7_pack_invocation(struct mali_invocation_packed *out, const uint32_t local[3],
+                        const uint32_t groups[3], bool graphics)
+{
+   const unsigned values[6] = {local[0], local[1], local[2], groups[0], groups[1], groups[2]};
+   unsigned shifts[7] = {0};
+   uint32_t packed = 0;
+
+   for (unsigned i = 0; i < 6; i++) {
+      assert(values[i] >= 1);
+      packed |= (values[i] - 1) << shifts[i];
+      shifts[i + 1] = shifts[i] + util_logbase2_ceil(values[i]);
+   }
+   pan_pack(out, INVOCATION, cfg) {
+      cfg.invocations = packed;
+      cfg.size_y_shift = shifts[1];
+      cfg.size_z_shift = shifts[2];
+      cfg.workgroups_x_shift = shifts[3];
+      cfg.workgroups_y_shift = shifts[4];
+      cfg.workgroups_z_shift = (graphics && groups[2] <= 1) ? 32 : shifts[5];
+      cfg.thread_group_split = graphics ? MALI_SPLIT_MIN_EFFICIENT : cfg.workgroups_x_shift;
+   }
+}
+#endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
 /* The device and queue                                                    */
@@ -534,15 +615,15 @@ struct mali_jm_atom_info {
 };
 
 /*
- * The tiler heap ring (mali_jm_heap.c). On v9 the tiler
- * allocates polygon lists and vertex packets (varyings) from the heap, and
- * the kernel does not order atoms that share memory, so a heap region is
- * reused only after the fragment work that reads it. The ring has
- * MALI_JM_HEAP_SLOTS regions; a batch that tiles takes the next one when
- * its first pass starts tiling, and every pass and layer of the batch tiles
- * through one Tiler Heap descriptor in its command memory. The queue keeps,
- * per slot, the last fragment atom that read it, and the vtc atom of the
- * next batch using the slot waits for it.
+ * The tiler heap ring (mali_jm_heap.c). The tiler allocates polygon lists
+ * from the heap, and on v9 vertex packets (varyings) too; v7 keeps its
+ * varyings in command memory. The kernel does not order atoms that share
+ * memory, so a heap region is reused only after the fragment work that
+ * reads it. The ring has MALI_JM_HEAP_SLOTS regions; a batch that tiles
+ * takes the next one when its first pass starts tiling, and every pass and
+ * layer of the batch tiles through one Tiler Heap descriptor in its
+ * command memory. The queue keeps, per slot, the last fragment atom that
+ * read it, and the vtc atom of the next batch using the slot waits for it.
  *
  * Each slot is a separate growable allocation (a GROW_ON_GPF fault commits
  * every page up to the faulting one, so windows inside one region would
@@ -746,11 +827,11 @@ void mali_jm_wait_locked(struct mali_device *dev, int64_t abs_ns);
 /* Sync objects (mali_sync.c, built per arch)                              */
 
 /*
- * The vk_sync type behind VkFence and binary VkSemaphore on v9. The
- * payload of a GPU signal is req[0], the submission number (reached when
- * the queue's completed_seq is at least that), and req[1], that
- * submission's tracker atom, which a same-queue wait or a sync-file export
- * depends on while it is in flight.
+ * The vk_sync type behind VkFence and binary VkSemaphore on the job
+ * manager (v7 and v9). The payload of a GPU signal is req[0], the
+ * submission number (reached when the queue's completed_seq is at least
+ * that), and req[1], that submission's tracker atom, which a same-queue
+ * wait or a sync-file export depends on while it is in flight.
  */
 #define MALI_SYNC_REQ_COUNT 2
 
