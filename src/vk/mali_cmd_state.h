@@ -1123,10 +1123,16 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
       d->dirty |= MALI_GFX_DIRTY_VS_SRT;
    if (d->fs_sets_dirty & bd->fs_sets)
       d->dirty |= MALI_GFX_DIRTY_FS_SRT;
+#if PAN_ARCH < 9
+   /* v7: the draw marks a stage's FAU group for its uniform-buffer words
+    * when the stage's tables or dynamic offsets change
+    * (mali_jm_cmd_draw_v7.c). */
+#else
    /* A fragment shader with uniform-buffer words in FAU needs them again
     * whenever its sets or dynamic offsets change. */
    if ((d->dirty & MALI_GFX_DIRTY_FS_SRT) && p->fs && p->fs->fau.ubo_push_count)
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
+#endif
 
    r->tls_size = MAX2(r->tls_size, bd->tls_size);
    return true;

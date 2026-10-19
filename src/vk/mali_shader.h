@@ -197,8 +197,9 @@ mali_sysval_word(const void *sysvals, size_t size, unsigned w)
 }
 
 /* Most 64-bit words of dynamic uniform buffers one shader keeps in FAU,
- * and the part of a buffer they may come from (ARMSX2's constant buffers
- * are smaller). */
+ * and on v11 the part of a buffer they may come from (ARMSX2's constant
+ * buffers are smaller). v7 has its own byte limit (mali_shader.c
+ * V7_UBO_PUSH_MAX_BYTES). */
 #define MALI_MAX_UBO_PUSH_FAUS 32
 #define MALI_UBO_PUSH_MAX_BYTES 1024
 
@@ -228,17 +229,21 @@ struct mali_ubo_push_word {
  * push-constant words in order, then the const_count words of consts[],
  * then the pushed uniform-buffer words (ubo_push, from FAU word
  * ubo_push_start on): total_count words of 64 bits, with kraid's promoted
- * constants after them.
+ * constants after them on v9 and v11.
  *
- * Pushed uniform-buffer words come from dynamic uniform buffers, fragment
- * shaders only, and only on v11: the draw copies them into the FAU block
- * with command-stream loads and stores, which the v9 job manager does not
- * have, so v9 shaders load from the buffer (ubo_push_count 0).
+ * Pushed uniform-buffer words come from dynamic uniform buffers. On v11
+ * they are pushed in fragment shaders, and the draw copies them into the
+ * FAU block with command-stream loads and stores (mali_cmd_draw.c
+ * emit_ubo_push). On v7 they are pushed in vertex and fragment shaders,
+ * and a Compute job ahead of the job that reads the block copies them
+ * (mali_jm_desc_v7.c mali_v7_ubo_copy). v9 shaders load from the buffer
+ * (ubo_push_count 0).
  *
  * The block's GPU address and total_count reach the hardware as one FAU
- * word on v11 (address | count << 56, the FAU register) and as the Shader
+ * word on v11 (address | count << 56, the FAU register), as the Shader
  * Environment's separate FAU pointer and FAU count fields on v9, where a
- * count of 0 drops the uniforms.
+ * count of 0 drops the uniforms, and on v7 as the job's Draw push
+ * uniforms pointer and the Renderer State's preload uniform count.
  */
 struct mali_shader_fau {
    BITSET_DECLARE(used_sysvals, MALI_MAX_SYSVAL_FAUS);

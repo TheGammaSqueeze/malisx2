@@ -619,6 +619,18 @@ bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                        const struct mali_shader *s, const struct mali_v7_desc_tables *t,
                        uint32_t attrib_buf_idx_offset, uint16_t *index);
 
+/*
+ * A shader's uniform buffer words in FAU (mali_shader.c lower_ubo_push): a
+ * Compute job on chain c, depending on job dep (0: none), that copies them
+ * from the bound dynamic uniform buffers into the draw's FAU block at
+ * fau_va (the block's address, without the count in the top byte). *index
+ * (when not NULL): that job's index, or dep when there is nothing to copy.
+ * False on failure, with the command buffer's error set.
+ */
+bool mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                      const struct mali_shader *s, const struct mali_desc_state *desc,
+                      uint64_t fau_va, uint16_t dep, uint16_t *index);
+
 /* The v7_desc.sets system values of one stage: the addresses of the bound
  * sets the shader reads and, at MALI_V7_SETS_DYN_SSBOS, its dynamic
  * storage buffer table. */
@@ -674,7 +686,7 @@ mali_v7_compute_task_split(const uint32_t local[3])
           util_logbase2_ceil(local[2] + 1);
 }
 
-/* Frees the device's descriptor copy shader. */
+/* Frees the device's descriptor and uniform buffer word copy shaders. */
 void mali_v7_desc_finish(struct mali_device *dev);
 
 /* ---------------------------------------------------------------------- */
@@ -848,6 +860,8 @@ struct mali_jm_device {
    /* The descriptor copy shader (mali_jm_desc_v7.c), compiled on first
     * use under mali_device::meta_lock, unreferenced at device_finish. */
    struct mali_shader *v7_desc_copy;
+   /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
+   struct mali_shader *v7_ubo_copy;
 #endif
 
    /* Set for the duration of one vkQueueSubmit when MALISX2_MEASURE's

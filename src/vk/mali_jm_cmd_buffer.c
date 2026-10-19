@@ -638,6 +638,40 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
    cmd->jm.req |= req;
 }
 
+#if PAN_ARCH < 9
+/* Source accesses that can write buffer memory, once
+ * vk_filter_src_access_flags2 has expanded MEMORY_WRITE and SHADER_WRITE
+ * for the source stages: shader storage writes, transfer writes and host
+ * writes. Attachment writes reach images only. */
+#define BUFFER_WRITE_ACCESS                                                    \
+   (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |    \
+    VK_ACCESS_2_HOST_WRITE_BIT)
+
+/*
+ * v7 fragment shaders read their pushed uniform buffer words from FAU,
+ * which a copy job on the vtc chain fills (mali_v7_ubo_copy). A buffer or
+ * global barrier that makes fragment-shader uniform reads wait for buffer
+ * writes therefore orders that job too: its source accesses include
+ * BUFFER_WRITE_ACCESS, and its destination stages include the fragment
+ * shader with UNIFORM_READ among the accesses (MEMORY_READ includes it,
+ * vk_filter_dst_access_flags2). SHADER_READ does not: vk.xml defines it
+ * as sampled, storage and binding table reads, and synchronization1's
+ * SHADER_READ, which the runtime passes on unchanged, never covered
+ * uniform buffers either. A render-to-texture barrier writes only
+ * attachments and is not one.
+ */
+static bool
+ubo_copy_dep(VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_access,
+             VkPipelineStageFlags2 dst_stages, VkAccessFlags2 dst_access)
+{
+   src_stages = vk_expand_src_stage_flags2(src_stages);
+   dst_stages = vk_expand_dst_stage_flags2(dst_stages);
+   return (vk_filter_src_access_flags2(src_stages, src_access) & BUFFER_WRITE_ACCESS) &&
+          (dst_stages & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) &&
+          (vk_filter_dst_access_flags2(dst_stages, dst_access) & VK_ACCESS_2_UNIFORM_READ_BIT);
+}
+#endif
+
 /*
  * Image barriers after which the image's CRCs may not describe its memory
  * (the same rule as on v11, mali_cmd_buffer.c): a transition from
@@ -683,6 +717,12 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       srca |= m->srcAccessMask;
       dsta |= m->dstAccessMask;
    }
+#if PAN_ARCH < 9
+   /* The buffer and global dependencies (an image barrier's access scope
+    * is the image), for ubo_copy_dep. */
+   const VkPipelineStageFlags2 buf_src = src, buf_dst = dst;
+   const VkAccessFlags2 buf_srca = srca, buf_dsta = dsta;
+#endif
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
       src |= m->srcStageMask;
@@ -707,6 +747,11 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       return;
    }
    mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
+#if PAN_ARCH < 9
+   if (ubo_copy_dep(buf_src, buf_srca, buf_dst, buf_dsta))
+      mali_jm_cmd_barrier(cmd, buf_src, buf_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+                          VK_ACCESS_2_UNIFORM_READ_BIT);
+#endif
 }
 
 /* ---------------------------------------------------------------------- */

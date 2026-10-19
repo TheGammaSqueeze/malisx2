@@ -791,9 +791,18 @@ mali_jm_build_abort(struct mali_device *dev)
 #define GATE_FRAG 1u
 #define GATE_VTC  2u
 
+/* The slots a wait with this destination stage mask gates. On v7 a
+ * fragment shader's pushed uniform buffer words are read by a copy job on
+ * the vtc chain (mali_v7_ubo_copy), so a mask with the fragment shader
+ * stage gates the vtc slot as well, as a barrier into that stage orders
+ * the copy job (mali_jm_cmd_buffer.c ubo_copy_dep). */
 static unsigned
 stage_gate(VkPipelineStageFlags2 mask)
 {
+#if PAN_ARCH < 9
+   if (mask & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT)
+      return GATE_FRAG | GATE_VTC;
+#endif
    if (mask && !(mask & ~FRAG_ONLY_STAGES))
       return GATE_FRAG;
    if (mask && !(mask & ~VTC_ONLY_STAGES))

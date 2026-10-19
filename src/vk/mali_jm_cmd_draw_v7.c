@@ -44,8 +44,10 @@
  *
  * Job dependencies (Mesa pan_jc.h rules): a stage whose tables were
  * rebuilt gets a descriptor copy job (a Compute job) in front of the
- * Vertex job, the vertex shader's before the fragment shader's. The
- * Vertex job's Dependency 1 is the vertex shader's copy job, the Tiler
+ * Vertex job, the vertex shader's before the fragment shader's. A stage
+ * whose FAU block holds uniform buffer words gets a job that copies them
+ * in, the vertex shader's also in front of the Vertex job. The Vertex
+ * job's Dependency 1 is the vertex shader's last copy job, the Tiler
  * job's Dependency 1 the Vertex job and its Dependency 2 the previous
  * tiler-side job. A pending barrier goes to the draw's first job, and to
  * the Vertex job as well when that first job is the fragment copy.
@@ -511,6 +513,9 @@ struct draw_data {
     * buffer index the vertex shader's image Attributes start at. */
    bool vs_copy, fs_copy;
    uint32_t vs_img_buf_offset;
+   /* The stages whose FAU block was rebuilt for this draw with uniform
+    * buffer words still to be copied in (mali_v7_ubo_copy). */
+   bool vs_ubo_copy, fs_ubo_copy;
 };
 
 /*
@@ -852,7 +857,9 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       }
       d->vs_srt_key = bd->vs_srt_key;
       d->vs_sets_dirty = 0;
-      if (p->vs->v7.needs_set_addrs)
+      /* The set addresses and the uniform buffer words in FAU follow the
+       * tables (mali_gfx_update_dirty leaves the second to this). */
+      if (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count)
          d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
@@ -863,7 +870,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
                return false;
             dd->fs_copy = true;
          }
-         if (p->fs->v7.needs_set_addrs)
+         if (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count)
             d->dirty |= MALI_GFX_DIRTY_FS_FAU;
       } else {
          memset(&t->fs_tab, 0, sizeof(t->fs_tab));
@@ -888,6 +895,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
        * the block built here has as many words. */
       assert((v >> 56) == DIV_ROUND_UP(p->vs->info.fau.count, 2));
       t->vs_fau = v & BITFIELD64_MASK(56);
+      dd->vs_ubo_copy = p->vs->fau.ubo_push_count && t->vs_fau;
       t->raw_vertex_offset = dd->raw_vertex_offset;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_FAU) {
@@ -899,6 +907,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          return false;
       assert(!p->fs || (v >> 56) == DIV_ROUND_UP(p->fs->info.fau.count, 2));
       t->fs_fau = v & BITFIELD64_MASK(56);
+      dd->fs_ubo_copy = p->fs && p->fs->fau.ubo_push_count && t->fs_fau;
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
       t->viewport = emit_viewport(cmd);
@@ -1189,22 +1198,29 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 
    struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
 
-   /* The descriptor copies of the stages whose tables were rebuilt go in
-    * front of the Vertex job (panvk_cmd_draw). The Vertex job depends on
-    * the vertex shader's; the fragment shader's tables are read by the
-    * fragment job, which follows the whole vtc atom. A barrier pending on
-    * the chain goes to the first of these jobs, and to the Vertex job too
-    * when that is the fragment copy, which the Vertex job does not wait for. */
+   /* The descriptor copies of the stages whose tables were rebuilt and the
+    * vertex shader's uniform buffer word copy go in front of the Vertex job
+    * (panvk_cmd_draw). The Vertex job depends on the vertex shader's; the
+    * fragment shader's tables are read by the fragment job, which follows
+    * the whole vtc atom. A barrier pending on the chain goes to the first of
+    * these jobs, and to the Vertex job too when that is the fragment copy,
+    * which the Vertex job does not wait for. */
    const bool pending = c->pending != 0;
    uint16_t vs_copy = 0, fs_copy = 0;
    if (dd.vs_copy &&
        !mali_v7_desc_copy(cmd, c, p->vs, &t->vs_tab, dd.vs_img_buf_offset, &vs_copy))
       return;
+   /* The vertex shader's uniform buffer words, which the Vertex job reads
+    * from its FAU block: a copy job between the descriptor copy and it. */
+   uint16_t vs_dep = vs_copy;
+   if (dd.vs_ubo_copy &&
+       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
+      return;
    if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, &fs_copy))
       return;
 
    struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
-                                            pending && !vs_copy && fs_copy, vs_copy);
+                                            pending && !vs_dep && fs_copy, vs_dep);
    if (!vj.cpu)
       return;
    const uint16_t vertex_index = c->index;
@@ -1292,6 +1308,11 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       }
       dcd.opaque[0] |= t->dcd0;
       memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
+
+      /* The fragment shader's uniform buffer words: no job here depends
+       * on the copy, as the fragment job reads them after the vtc atom. */
+      if (dd.fs_ubo_copy && !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, NULL))
+         return;
    }
 
    /* Heap use: polygon-list entries only, the varyings being in command

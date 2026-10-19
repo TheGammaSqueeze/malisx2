@@ -218,8 +218,8 @@ MALI_PER_ARCH(cmd_gfx_fau)(struct mali_cmd_buffer *cmd, const struct mali_shader
       tmp[n++] = v;
    }
    n += mali_shader_fau_consts(&s->fau, &tmp[n]);
-   /* Uniform-buffer words (v11): zero here, copied in by the GPU
-    * (mali_cmd_draw.c emit_ubo_push). */
+   /* Pushed uniform-buffer words: zero here, copied in by the GPU
+    * (mali_shader.h struct mali_shader_fau). */
    assert(!s->fau.ubo_push_count || n == s->fau.ubo_push_start);
    for (unsigned i = n; i < total; i++)
       tmp[i] = 0;

@@ -5,7 +5,8 @@
 
 /*
  * The Bifrost (v7) descriptor tables of a draw or dispatch, built by one
- * builder for both (struct mali_v7_desc_tables, mali_jm.h). Follows panvk's
+ * builder for both (struct mali_v7_desc_tables, mali_jm.h), and the job
+ * that copies uniform buffer words into a FAU block. Follows panvk's
  * Bifrost job-manager path (Mesa panvk_vX_cmd_desc_state.c and
  * bifrost/panvk_vX_meta_desc_copy.c) on this driver's command memory,
  * shader objects and job chains.
@@ -629,12 +630,100 @@ build_desc_copy_nir(struct mali_device *dev)
    return b.shader;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Uniform buffer words in FAU                                             */
+
+/*
+ * The copy job of a shader whose dynamic uniform buffer reads became FAU
+ * reads (mali_shader.c lower_ubo_push, fau.ubo_push): one invocation per
+ * 32-bit half of a pushed word, dst[i] = *table[i], where table[i] is the
+ * address of that half in the bound buffer, offset applied, or of a zero
+ * word for a half past the binding's range. A vertex shader's copy runs
+ * between its descriptor copy and the Vertex job. A fragment shader's
+ * needs no dependency: the fragment job reads the FAU block after the
+ * whole vtc atom.
+ */
+struct ubo_copy_info {
+   uint64_t table;
+   uint64_t dst;
+};
+
+static nir_shader *
+build_ubo_copy_nir(struct mali_device *dev)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE), "%s",
+      "mali_v7_ubo_copy");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *table =
+      nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, offsetof(struct ubo_copy_info, table)));
+   nir_def *dst =
+      nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, offsetof(struct ubo_copy_info, dst)));
+   nir_def *src = nir_load_global(
+      &b, 1, 64, nir_iadd(&b, table, nir_u2u64(&b, nir_imul_imm(&b, id, 8))), .align_mul = 8);
+   nir_def *v = nir_load_global(&b, 1, 32, src, .align_mul = 4);
+   nir_store_global(&b, v, nir_iadd(&b, dst, nir_u2u64(&b, nir_imul_imm(&b, id, 4))),
+                    .align_mul = 4);
+   return b.shader;
+}
+
+bool
+mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, const struct mali_shader *s,
+                 const struct mali_desc_state *desc, uint64_t fau_va, uint16_t dep, uint16_t *index)
+{
+   const uint32_t n = s->fau.ubo_push_count;
+   if (index)
+      *index = dep;
+   if (!n || !fau_va)
+      return true;
+   const struct mali_shader *copy =
+      get_copy_shader(cmd, &cmd->dev->jm->v7_ubo_copy, build_ubo_copy_nir, "mali-v7-ubo-copy");
+   if (!copy)
+      return false;
+
+   /* 2n source addresses, then the zero word they fall back to. */
+   struct mali_ptr p = mali_cmd_alloc(cmd, (2 * n + 1) * sizeof(uint64_t), 16);
+   if (!p.cpu)
+      return false;
+   const uint64_t zero = p.gpu + 2 * n * sizeof(uint64_t);
+   uint64_t table[2 * MALI_MAX_UBO_PUSH_FAUS + 1];
+   uint32_t dyn_cached = UINT32_MAX;
+   uint64_t addr = 0, range = 0;
+   for (uint32_t i = 0; i < n; i++) {
+      const struct mali_ubo_push_word *w = &s->fau.ubo_push[i];
+      if (w->dyn != dyn_cached) {
+         dyn_cached = w->dyn;
+         if (w->dyn >= s->v7.dyn_ubo_count ||
+             !dyn_buf(desc, s->desc.dyn_bufs.map[w->dyn], &addr, &range) || (addr >> 56))
+            addr = range = 0;
+      }
+      for (unsigned h = 0; h < 2; h++) {
+         const uint64_t off = w->offset + 4 * h;
+         table[2 * i + h] = addr && off + 4 <= range ? addr + off : zero;
+      }
+   }
+   table[2 * n] = 0;
+   memcpy(p.cpu, table, (2 * n + 1) * sizeof(uint64_t));
+
+   const struct ubo_copy_info info = {
+      .table = p.gpu,
+      .dst = fau_va + (uint64_t)s->fau.ubo_push_start * MALI_FAU_WORD_SIZE,
+   };
+   return add_copy_job(cmd, c, copy, &info, sizeof(info), 2 * n, dep, index);
+}
+
 void
 mali_v7_desc_finish(struct mali_device *dev)
 {
    struct mali_jm_device *jd = dev->jm;
    MALI_PER_ARCH(shader_unref)(dev, jd->v7_desc_copy);
    jd->v7_desc_copy = NULL;
+   MALI_PER_ARCH(shader_unref)(dev, jd->v7_ubo_copy);
+   jd->v7_ubo_copy = NULL;
 }
 
 /* ---------------------------------------------------------------------- */
