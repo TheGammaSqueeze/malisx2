@@ -4,7 +4,7 @@
  */
 
 /*
- * blend_g52: colour blending on the Bifrost (v7) path of this driver. Three
+ * blend_g52: colour blending on the Bifrost (v7) path of this driver. Five
  * 64x64 linear RGBA8 images, each cleared to (0.5, 0.5, 0.5, 1.0) and drawn
  * once with one full-screen triangle, in one command buffer:
  *
@@ -20,10 +20,28 @@
  *      ONE_MINUS_CONSTANT_COLOR and CONSTANT_ALPHA / ONE_MINUS_CONSTANT_ALPHA
  *      with the constant (0.5, 0.5, 0.5, 0.5), fragment colour
  *      (1.0, 0.0, 1.0, 0.0): the 16-bit UNORM blend constant of the
- *      descriptor.
+ *      descriptor;
+ *   D. blending off (blendEnable VK_FALSE) with write mask R, G and B, the
+ *      attachment's factors left at SRC_ALPHA / ONE_MINUS_SRC_ALPHA (colour
+ *      and alpha, as an application that toggles blending leaves them),
+ *      fragment colour (0.25, 0.75, 1.0, 0.0): every pixel's RGB must be
+ *      the fragment's and its alpha the clear's;
+ *   E. blending off with write mask A alone, colour factors SRC_ALPHA /
+ *      ONE_MINUS_SRC_ALPHA and alpha factors ONE / ONE_MINUS_SRC_ALPHA left
+ *      in place, the same fragment colour: every pixel's alpha must be the
+ *      fragment's 0 and its RGB the clear's.
+ *
+ * D and E are partial-mask stores, so they take the fixed-function mode.
+ * Vulkan ignores the factors when blending is off, but a source alpha of 0
+ * with those factors is exactly when Mesa's pan_blend_alpha_zero_nop holds
+ * (the blend would leave the destination). A driver that derives the
+ * descriptor's alpha-zero-nop bit from the ignored factors makes the
+ * hardware skip every one of these stores, and the image keeps the clear
+ * colour (review #19).
  *
  * Each image is checked against the equation evaluated in floats and
- * rounded to 8 bits, one LSB of slack per channel (the fixed-function
+ * rounded to 8 bits (with blending off, the fragment's value in the
+ * written channels), one LSB of slack per channel (the fixed-function
  * blender works in the tile buffer's 8-bit precision and the render
  * target dithers).
  *
@@ -38,6 +56,11 @@
  *               #version 450
  *               layout(location = 0) out vec4 color;
  *               void main() { color = vec4(0.25, 0.75, 1.0, 0.5); }   (and so on)
+ *
+ *   zero.frag (D and E):
+ *               #version 450
+ *               layout(location = 0) out vec4 color;
+ *               void main() { color = vec4(0.25, 0.75, 1.0, 0.0); }
  *
  * Usage: blend_g52 [path/to/libvulkan_malisx2.so]
  *   The path defaults to $MALISX2_ICD, then to BLEND_G52_DEFAULT_ICD.
@@ -159,6 +182,25 @@ static const uint32_t cst_frag_spv[] = {
    0x0000000c, 0x000100fd, 0x00010038,
 };
 
+static const uint32_t zero_frag_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x0000000f, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000004,
+   0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
+   0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+   0x6e69616d, 0x00000000, 0x00040005, 0x00000009, 0x6f6c6f63, 0x00000072,
+   0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00020013, 0x00000002,
+   0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
+   0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
+   0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003,
+   0x0004002b, 0x00000006, 0x0000000a, 0x3e800000, 0x0004002b, 0x00000006,
+   0x0000000b, 0x3f400000, 0x0004002b, 0x00000006, 0x0000000c, 0x3f800000,
+   0x0004002b, 0x00000006, 0x0000000d, 0x00000000, 0x0007002c, 0x00000007,
+   0x0000000e, 0x0000000a, 0x0000000b, 0x0000000c, 0x0000000d, 0x00050036,
+   0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+   0x0003003e, 0x00000009, 0x0000000e, 0x000100fd, 0x00010038,
+};
+
 /* A triangle covering clip space. */
 static const float vertices[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
 
@@ -173,13 +215,18 @@ struct blend_case {
    VkPipelineColorBlendAttachmentState blend;
    float constants[4];
    bool blend_shader;            /* expected to run as a blend shader */
+   /* Blending off with a source alpha of 0 and leftover factors for which
+    * the alpha-zero-nop shortcut would hold (D, E). */
+   bool alpha_zero_store;
 };
 
 #define MASK_RGBA                                                              \
    (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | \
     VK_COLOR_COMPONENT_A_BIT)
 
-static const struct blend_case cases[3] = {
+#define NUM_CASES 5u
+
+static const struct blend_case cases[NUM_CASES] = {
    {
       .name = "A",
       .what = "fixed-function SRC_ALPHA / ONE_MINUS_SRC_ALPHA, mask RGA",
@@ -234,6 +281,45 @@ static const struct blend_case cases[3] = {
       },
       .constants = {0.5f, 0.5f, 0.5f, 0.5f},
    },
+   {
+      .name = "D",
+      .what = "blending off, mask RGB, factors left at SRC_ALPHA / ONE_MINUS_SRC_ALPHA, "
+              "source alpha 0",
+      .fs_spv = zero_frag_spv,
+      .fs_size = sizeof(zero_frag_spv),
+      .src = {0.25f, 0.75f, 1.0f, 0.0f},
+      .blend = {
+         .blendEnable = VK_FALSE,
+         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .colorBlendOp = VK_BLEND_OP_ADD,
+         .srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+         .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .alphaBlendOp = VK_BLEND_OP_ADD,
+         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT,
+      },
+      .alpha_zero_store = true,
+   },
+   {
+      .name = "E",
+      .what = "blending off, mask A, alpha factors left at ONE / ONE_MINUS_SRC_ALPHA, "
+              "source alpha 0",
+      .fs_spv = zero_frag_spv,
+      .fs_size = sizeof(zero_frag_spv),
+      .src = {0.25f, 0.75f, 1.0f, 0.0f},
+      .blend = {
+         .blendEnable = VK_FALSE,
+         .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .colorBlendOp = VK_BLEND_OP_ADD,
+         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+         .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+         .alphaBlendOp = VK_BLEND_OP_ADD,
+         .colorWriteMask = VK_COLOR_COMPONENT_A_BIT,
+      },
+      .alpha_zero_store = true,
+   },
 };
 
 static float
@@ -255,7 +341,8 @@ factor(VkBlendFactor f, unsigned c, const float *src, const float *dst, const fl
 }
 
 /* The expected 8-bit result of a case: the equation in floats on the clear
- * colour, rounded to nearest. */
+ * colour (the source alone with blending off, whatever the factors say),
+ * rounded to nearest. */
 static void
 expected(const struct blend_case *bc, uint8_t out[4])
 {
@@ -266,6 +353,8 @@ expected(const struct blend_case *bc, uint8_t out[4])
       const VkColorComponentFlags bit = 1u << c;
       if (!(b->colorWriteMask & bit)) {
          v = d;
+      } else if (!b->blendEnable) {
+         v = s;
       } else {
          const VkBlendOp op = c == 3 ? b->alphaBlendOp : b->colorBlendOp;
          const VkBlendFactor sf = c == 3 ? b->srcAlphaBlendFactor : b->srcColorBlendFactor;
@@ -296,8 +385,8 @@ main(int argc, char **argv)
       return rc;
    const struct g52_fns *f = &g.f;
 
-   struct g52_image images[3];
-   for (unsigned i = 0; i < 3; i++) {
+   struct g52_image images[NUM_CASES];
+   for (unsigned i = 0; i < NUM_CASES; i++) {
       if (!g52_image_create(&g, &images[i], VK_FORMAT_R8G8B8A8_UNORM, IMG_W, IMG_H,
                             VK_IMAGE_TILING_LINEAR, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                             VK_IMAGE_ASPECT_COLOR_BIT, true, SENTINEL))
@@ -317,8 +406,8 @@ main(int argc, char **argv)
       return 1;
    }
 
-   VkPipeline pipes[3];
-   for (unsigned i = 0; i < 3; i++) {
+   VkPipeline pipes[NUM_CASES];
+   for (unsigned i = 0; i < NUM_CASES; i++) {
       const struct blend_case *bc = &cases[i];
       struct g52_pipeline_desc pd = {
          .vs_spv = pos2_vert_spv,
@@ -371,7 +460,7 @@ main(int argc, char **argv)
    }
 
    const VkDeviceSize vb_offset = 0;
-   for (unsigned i = 0; i < 3; i++) {
+   for (unsigned i = 0; i < NUM_CASES; i++) {
       g52_cmd_transition(&g, cmd, images[i].image, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
@@ -411,19 +500,26 @@ main(int argc, char **argv)
               "memory; see the log)\n", g52_result_str(r));
       return 1;
    }
-   printf("  command buffer recorded (three passes of clear + one blended draw)\n");
+   printf("  command buffer recorded (%u passes of clear + one blended draw)\n", NUM_CASES);
 
-   r = g52_submit_wait(&g, cmd, "(three vtc atoms, three fragment atoms)");
+   char submit_what[64];
+   snprintf(submit_what, sizeof(submit_what), "(%u vtc atoms, %u fragment atoms)", NUM_CASES,
+            NUM_CASES);
+   r = g52_submit_wait(&g, cmd, submit_what);
    if (r != VK_SUCCESS)
       return 1;
 
+   uint8_t clear8[4];
+   for (unsigned c = 0; c < 4; c++)
+      clear8[c] = (uint8_t)lrintf(clear_rgba[c] * 255.0f);
+
    unsigned passed = 0;
-   for (unsigned i = 0; i < 3; i++) {
+   for (unsigned i = 0; i < NUM_CASES; i++) {
       const struct blend_case *bc = &cases[i];
       uint8_t want[4];
       expected(bc, want);
       g52_image_sync_for_read(&g, &images[i]);
-      uint32_t bad = 0, sentinel = 0, unblended = 0;
+      uint32_t bad = 0, sentinel = 0, unblended = 0, cleared = 0;
       int first_x = -1, first_y = -1;
       uint8_t first_got[4] = {0};
       uint8_t src8[4];
@@ -432,11 +528,14 @@ main(int argc, char **argv)
       for (uint32_t y = 0; y < IMG_H; y++) {
          for (uint32_t x = 0; x < IMG_W; x++) {
             const uint8_t *px = g52_image_pixel(&images[i], x, y);
-            bool okpx = true;
+            bool okpx = true, is_clear = true;
             for (unsigned c = 0; c < 4; c++) {
                const int d = (int)px[c] - (int)want[c];
                if (d < -1 || d > 1)
                   okpx = false;
+               const int dc = (int)px[c] - (int)clear8[c];
+               if (dc < -1 || dc > 1)
+                  is_clear = false;
             }
             if (okpx)
                continue;
@@ -444,6 +543,8 @@ main(int argc, char **argv)
                sentinel++;
             else if (!memcmp(px, src8, 4))
                unblended++;
+            else if (is_clear)
+               cleared++;
             if (!bad) {
                first_x = (int)x;
                first_y = (int)y;
@@ -460,25 +561,29 @@ main(int argc, char **argv)
          passed++;
       } else {
          printf("  FAIL %s: %u of %u pixels wrong (%u still hold the sentinel, %u hold the "
-                "unblended source); first at (%d,%d) = %u %u %u %u\n", bc->name, bad,
-                IMG_W * IMG_H, sentinel, unblended, first_x, first_y, first_got[0], first_got[1],
-                first_got[2], first_got[3]);
+                "unblended source, %u the clear colour); first at (%d,%d) = %u %u %u %u\n",
+                bc->name, bad, IMG_W * IMG_H, sentinel, unblended, cleared, first_x, first_y,
+                first_got[0], first_got[1], first_got[2], first_got[3]);
          if (unblended == IMG_W * IMG_H && bc->blend_shader)
             printf("    (every pixel is the source: the blend shader did not run, or its "
                    "fallback stored the source)\n");
+         if (cleared == IMG_W * IMG_H && bc->alpha_zero_store)
+            printf("    (every pixel kept the clear colour: the stores of a source alpha of 0 "
+                   "were skipped, as when the Blend descriptor's alpha-zero-nop is set from "
+                   "factors that blending off ignores)\n");
       }
    }
 
-   int status = passed == 3 ? 0 : 1;
-   printf("%s: %u of 3 blend cases\n", status ? "FAIL" : "PASS", passed);
+   int status = passed == NUM_CASES ? 0 : 1;
+   printf("%s: %u of %u blend cases\n", status ? "FAIL" : "PASS", passed, NUM_CASES);
 
    f->DeviceWaitIdle(g.device);
    f->DestroyCommandPool(g.device, pool, NULL);
-   for (unsigned i = 0; i < 3; i++)
+   for (unsigned i = 0; i < NUM_CASES; i++)
       f->DestroyPipeline(g.device, pipes[i], NULL);
    f->DestroyPipelineLayout(g.device, layout, NULL);
    g52_buffer_destroy(&g, &vbuf);
-   for (unsigned i = 0; i < 3; i++)
+   for (unsigned i = 0; i < NUM_CASES; i++)
       g52_image_destroy(&g, &images[i]);
    g52_close(&g);
    return status;

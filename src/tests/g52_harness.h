@@ -8,8 +8,9 @@
  * draw_g52.c carry their own copies; the later tests include this): dlopen
  * the driver and reach it through vk_icdGetInstanceProcAddr (no loader, no
  * ICD manifest), create the instance, pick the first physical device,
- * create the device with VK_EXT_device_fault when offered, load the entry
- * points the tests use, and the small helpers around images, buffers,
+ * create the device with VK_EXT_device_fault when offered (and the optional
+ * extensions and features a test asks for through g52_open_ext), load the
+ * entry points the tests use, and the small helpers around images, buffers,
  * pipelines and a submit that waits on a fence and prints the device fault
  * record on a loss.
  *
@@ -80,6 +81,7 @@ struct g52_fns {
    PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
    PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties;
+   PFN_vkGetPhysicalDeviceFeatures GetPhysicalDeviceFeatures;
    PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
    PFN_vkCreateDevice CreateDevice;
    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
@@ -135,6 +137,20 @@ struct g52_fns {
    PFN_vkGetDeviceFaultInfoEXT GetDeviceFaultInfoEXT; /* optional */
 };
 
+/*
+ * What a test asks of the device beyond g52_open's defaults (g52_open_ext):
+ * optional device extensions, each enabled only when the physical device
+ * offers it, and Vulkan 1.0 features, each enabled only when the device
+ * reports it. struct g52 says afterwards which were.
+ */
+#define G52_MAX_WANTED_EXTS 8u
+
+struct g52_device_wants {
+   const char *exts[G52_MAX_WANTED_EXTS];
+   uint32_t ext_count;
+   VkPhysicalDeviceFeatures features;
+};
+
 struct g52 {
    const char *prog;
    void *lib;
@@ -145,6 +161,11 @@ struct g52 {
    VkDevice device;
    VkQueue queue;
    bool have_fault_ext;
+   /* g52_open_ext only: per g52_device_wants.exts entry, whether it was
+    * enabled, and the Vulkan 1.0 features that were (all false from
+    * g52_open, which enables none). */
+   bool have_ext[G52_MAX_WANTED_EXTS];
+   VkPhysicalDeviceFeatures features;
 };
 
 static inline PFN_vkVoidFunction
@@ -240,13 +261,20 @@ g52_pick_memory_type(const struct g52 *g, uint32_t type_bits, bool host, bool *c
 
 /*
  * Opens the driver named by argv[1], $MALISX2_ICD or `default_icd`, and
- * creates the instance, device and queue. Returns 0, or the exit status
- * (2) after printing why.
+ * creates the instance, device and queue, with what `wants` asks for on
+ * top (NULL: nothing, the same device as g52_open). Returns 0, or the exit
+ * status (2) after printing why.
  */
 static inline int
-g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *default_icd)
+g52_open_ext(struct g52 *g, const char *prog, int argc, char **argv, const char *default_icd,
+             const struct g52_device_wants *wants)
 {
    memset(g, 0, sizeof(*g));
+   if (wants && wants->ext_count > G52_MAX_WANTED_EXTS) {
+      fprintf(stderr, "%s: %u optional extensions asked for, at most %u\n", prog,
+              wants->ext_count, G52_MAX_WANTED_EXTS);
+      return 2;
+   }
    g->prog = prog;
    setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -296,6 +324,7 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
    INST(GetPhysicalDeviceProperties2);
    INST(GetPhysicalDeviceMemoryProperties);
    INST(GetPhysicalDeviceFormatProperties);
+   INST(GetPhysicalDeviceFeatures);
    INST(EnumerateDeviceExtensionProperties);
    INST(CreateDevice);
    INST(GetDeviceProcAddr);
@@ -339,12 +368,30 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
       if (f->EnumerateDeviceExtensionProperties(g->pdev, NULL, &n, NULL) == VK_SUCCESS && n) {
          VkExtensionProperties *ext = calloc(n, sizeof(*ext));
          if (ext && f->EnumerateDeviceExtensionProperties(g->pdev, NULL, &n, ext) == VK_SUCCESS) {
-            for (uint32_t i = 0; i < n; i++)
+            for (uint32_t i = 0; i < n; i++) {
                if (!strcmp(ext[i].extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME))
                   g->have_fault_ext = true;
+               for (uint32_t w = 0; wants && w < wants->ext_count; w++) {
+                  if (!strcmp(ext[i].extensionName, wants->exts[w]))
+                     g->have_ext[w] = true;
+               }
+            }
          }
          free(ext);
       }
+   }
+
+   /* The features asked for that the device reports (VkPhysicalDeviceFeatures
+    * is nothing but VkBool32 members). */
+   if (wants) {
+      VkPhysicalDeviceFeatures supported;
+      memset(&supported, 0, sizeof(supported));
+      f->GetPhysicalDeviceFeatures(g->pdev, &supported);
+      const VkBool32 *want = (const VkBool32 *)&wants->features;
+      const VkBool32 *have = (const VkBool32 *)&supported;
+      VkBool32 *enable = (VkBool32 *)&g->features;
+      for (size_t i = 0; i < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); i++)
+         enable[i] = want[i] && have[i] ? VK_TRUE : VK_FALSE;
    }
 
    const float prio = 1.0f;
@@ -358,14 +405,23 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
       .deviceFault = VK_TRUE,
    };
-   const char *dev_exts[] = {VK_EXT_DEVICE_FAULT_EXTENSION_NAME};
+   const char *dev_exts[1 + G52_MAX_WANTED_EXTS];
+   uint32_t dev_ext_count = 0;
+   if (g->have_fault_ext)
+      dev_exts[dev_ext_count++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
+   for (uint32_t w = 0; wants && w < wants->ext_count; w++) {
+      /* VK_EXT_device_fault is in the list already when offered. */
+      if (g->have_ext[w] && strcmp(wants->exts[w], VK_EXT_DEVICE_FAULT_EXTENSION_NAME))
+         dev_exts[dev_ext_count++] = wants->exts[w];
+   }
    const VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = g->have_fault_ext ? &fault_feat : NULL,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
-      .enabledExtensionCount = g->have_fault_ext ? 1 : 0,
+      .enabledExtensionCount = dev_ext_count,
       .ppEnabledExtensionNames = dev_exts,
+      .pEnabledFeatures = wants ? &g->features : NULL,
    };
    r = f->CreateDevice(g->pdev, &dci, NULL, &g->device);
    if (r != VK_SUCCESS) {
@@ -373,6 +429,8 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
       return 2;
    }
    printf("  VkDevice created%s\n", g->have_fault_ext ? " (VK_EXT_device_fault enabled)" : "");
+   for (uint32_t w = 0; wants && w < wants->ext_count; w++)
+      printf("  %s: %s\n", wants->exts[w], g->have_ext[w] ? "enabled" : "not offered");
 
 #define DEV(name) f->name = (PFN_vk##name)g52_load_device_fn(g, "vk" #name, NULL, true, &ok)
    DEV(DestroyDevice);
@@ -438,6 +496,13 @@ g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *def
 
    f->GetDeviceQueue(g->device, 0, 0, &g->queue);
    return 0;
+}
+
+/* g52_open_ext asking for nothing beyond VK_EXT_device_fault. */
+static inline int
+g52_open(struct g52 *g, const char *prog, int argc, char **argv, const char *default_icd)
+{
+   return g52_open_ext(g, prog, argc, argv, default_icd, NULL);
 }
 
 static inline void

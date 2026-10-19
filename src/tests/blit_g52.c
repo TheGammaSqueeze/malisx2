@@ -30,7 +30,24 @@
  *   J  D24_UNORM_S8_UINT 2x nearest, mirrored on Y, depth and stencil in
  *      one region: depth within 1 (24-bit units), stencil exact;
  *   K  RGBA8 -> R4G4B4A4 1:1 (azahar's RGBA4 surfaces), within one 4-bit
- *      step.
+ *      step;
+ *   L  an unscaled 1:1 blit of a whole 32x32 image into another of the same
+ *      format, for each 1x1-block colour format of 3 or 12 bytes the device
+ *      offers as blit source and destination (R8G8B8_UNORM, B8G8R8_UNORM,
+ *      R8G8B8_SRGB, B8G8R8_SRGB, R8G8B8_SNORM, R32G32B32_SFLOAT, _UINT and
+ *      _SINT: every such format of Mesa's v7 table). Each format runs
+ *      twice. On optimal images, the source uploaded and the destination
+ *      prefilled with vkCmdCopyBufferToImage, both read back with
+ *      vkCmdCopyImageToBuffer; the source's readback is checked too, so a
+ *      copy that drops these texels is reported as such and not taken for
+ *      the blit. On linear host-visible images, written and read by the CPU
+ *      through the mapping: the blit alone, no copy involved. Every texel
+ *      of the destination must be the source's: within 1 for the 8-bit
+ *      formats (in signed steps for SNORM), bit for bit for the 32-bit
+ *      ones. The prefill differs from the source in every byte (each byte
+ *      XOR 0x80), so a blit that writes nothing leaves every texel wrong
+ *      (review #45: a v7 shortcut sends a same-format 1:1 blit to the raw
+ *      compute copy, which copies only 1, 2, 4, 8 and 16-byte texels).
  *
  * The colour cases allow one LSB per channel (the float round trip through
  * the shader and the blender); neighbouring texels of the pattern differ by
@@ -42,7 +59,7 @@
  *
  * Usage: blit_g52 [path/to/libvulkan_malisx2.so] [--only=X]
  *   The path defaults to $MALISX2_ICD, then to BLIT_G52_DEFAULT_ICD.
- *   --only=X runs case X alone (A..K; E and F run together).
+ *   --only=X runs case X alone (A..L; E and F run together).
  *
  * Exit status: 0 PASS (every case run passed); 1 FAIL once the device
  * exists; 2 the program did not get as far as a VkDevice.
@@ -708,6 +725,436 @@ run_d24s8_case(void)
    return pass;
 }
 
+/* ---------------------------------------------------------------------- */
+/* L: same-format 1:1 blits of 3- and 12-byte texels                        */
+
+enum l_kind { L_UNORM8, L_SRGB8, L_SNORM8, L_FLOAT32, L_UINT32, L_SINT32 };
+
+struct l_format {
+   VkFormat format;
+   const char *name;
+   enum l_kind kind;
+};
+
+/* The 1x1-block colour formats whose texel size is not a power of two and
+ * that Mesa's v7 table (pan_format.c) makes both a sampler view and a
+ * render target, so this driver offers them as blit source and
+ * destination on the G52. */
+static const struct l_format l_formats[] = {
+   {VK_FORMAT_R8G8B8_UNORM, "R8G8B8_UNORM", L_UNORM8},
+   {VK_FORMAT_B8G8R8_UNORM, "B8G8R8_UNORM", L_UNORM8},
+   {VK_FORMAT_R8G8B8_SRGB, "R8G8B8_SRGB", L_SRGB8},
+   {VK_FORMAT_B8G8R8_SRGB, "B8G8R8_SRGB", L_SRGB8},
+   {VK_FORMAT_R8G8B8_SNORM, "R8G8B8_SNORM", L_SNORM8},
+   {VK_FORMAT_R32G32B32_SFLOAT, "R32G32B32_SFLOAT", L_FLOAT32},
+   {VK_FORMAT_R32G32B32_UINT, "R32G32B32_UINT", L_UINT32},
+   {VK_FORMAT_R32G32B32_SINT, "R32G32B32_SINT", L_SINT32},
+};
+
+/* What the readback buffers start as: a texel still holding it was never
+ * written by the copy out of the image. */
+#define L_FILL 0xa5
+
+static unsigned
+l_bytes(enum l_kind k)
+{
+   return k >= L_FLOAT32 ? 12 : 3;
+}
+
+/*
+ * Texel (x, y) of the source, as the bytes of the format. The 8-bit
+ * formats: R 4x and G 4y (a neighbour differs by 4), B (3x + 5y) mod 255 -
+ * 127 as a byte, which is never 0x80 (SNORM reads 0x80 and 0x81 both as
+ * -1.0). The 32-bit formats: values past 16 bits and of both signs; the
+ * floats are never zero and are exact in half precision too.
+ */
+static void
+l_texel(enum l_kind k, int x, int y, uint8_t *out)
+{
+   switch (k) {
+   case L_FLOAT32: {
+      const float v[3] = {(float)(x + 32 * y) * 0.25f + 0.5f,
+                          -(float)(4 * x + 2 * y + 1) * 0.5f,
+                          (float)(x * y) * 0.125f + 1.5f};
+      memcpy(out, v, sizeof(v));
+      return;
+   }
+   case L_UINT32: {
+      const uint32_t v[3] = {(uint32_t)(x | y << 8) * 0x10001u + 0x80000000u,
+                             0xdeadbeefu ^ ((uint32_t)x * 0x9e3779b9u + (uint32_t)y),
+                             (uint32_t)(x * y) + 70000u};
+      memcpy(out, v, sizeof(v));
+      return;
+   }
+   case L_SINT32: {
+      const int32_t v[3] = {-(x + 32 * y) - 100000, (x - y) * 65537,
+                            INT32_MIN + x + 32 * y + 1};
+      memcpy(out, v, sizeof(v));
+      return;
+   }
+   default:
+      out[0] = (uint8_t)(4 * x);
+      out[1] = (uint8_t)(4 * y);
+      out[2] = (uint8_t)((3 * x + 5 * y) % 255 - 127);
+      return;
+   }
+}
+
+/* The destination's prefill at (x, y): the source texel with every byte
+ * XOR 0x80, so it differs from the source by 128 in every byte. */
+static void
+l_prefill(enum l_kind k, int x, int y, uint8_t *out)
+{
+   l_texel(k, x, y, out);
+   for (unsigned i = 0; i < l_bytes(k); i++)
+      out[i] ^= 0x80;
+}
+
+/* Whether a texel read back is the source's: within one step for the
+ * 8-bit formats (the blit pass converts through floats, and sRGB decodes
+ * and encodes), bit for bit for the 32-bit ones. */
+static bool
+l_match(enum l_kind k, const uint8_t *got, const uint8_t *want)
+{
+   switch (k) {
+   case L_UNORM8:
+   case L_SRGB8:
+      for (int c = 0; c < 3; c++)
+         if (abs((int)got[c] - (int)want[c]) > 1)
+            return false;
+      return true;
+   case L_SNORM8:
+      for (int c = 0; c < 3; c++)
+         if (abs((int)(int8_t)got[c] - (int)(int8_t)want[c]) > 1)
+            return false;
+      return true;
+   default:
+      return !memcmp(got, want, 12);
+   }
+}
+
+/*
+ * Checks the SRC_W x SRC_H texels at `base` (rows `pitch` bytes apart)
+ * against the source and prints the verdict. `dst`: the image was
+ * prefilled, so name texels that still hold the prefill; `via_copy`: they
+ * were read back through vkCmdCopyImageToBuffer, so name texels that still
+ * hold the buffer's fill.
+ */
+static bool
+l_check(const struct l_format *lf, const char *what, const uint8_t *base, size_t pitch, bool dst,
+        bool via_copy)
+{
+   const unsigned bytes = l_bytes(lf->kind);
+   struct tally t = {0};
+   unsigned prefilled = 0, unwritten = 0;
+   for (int y = 0; y < SRC_H; y++) {
+      for (int x = 0; x < SRC_W; x++) {
+         const uint8_t *got = base + (size_t)y * pitch + (size_t)x * bytes;
+         uint8_t want[12], pre[12];
+         l_texel(lf->kind, x, y, want);
+         if (l_match(lf->kind, got, want))
+            continue;
+         l_prefill(lf->kind, x, y, pre);
+         bool fill = true;
+         for (unsigned i = 0; i < bytes; i++)
+            fill &= got[i] == L_FILL;
+         if (dst && !memcmp(got, pre, bytes))
+            prefilled++;
+         else if (via_copy && fill)
+            unwritten++;
+         if (t.shown++ < 6) {
+            printf("    %s (%d, %d): got", what, x, y);
+            for (unsigned i = 0; i < bytes; i++)
+               printf(" %02x", got[i]);
+            printf(", want");
+            for (unsigned i = 0; i < bytes; i++)
+               printf(" %02x", want[i]);
+            printf("\n");
+         }
+         t.bad++;
+      }
+   }
+   if (prefilled)
+      printf("    %u texels still hold the destination's prefill (the blit wrote nothing "
+             "there)\n", prefilled);
+   if (unwritten)
+      printf("    %u texels read back as the readback buffer's 0x%02x fill (the copy out of the "
+             "image wrote nothing there)\n", unwritten, L_FILL);
+   return verdict('L', what, &t, SRC_W * SRC_H);
+}
+
+/*
+ * A 32x32 image of `format` with transfer usage only (all that a blit and
+ * the buffer/image copies ask for, so no view): optimal tiling in the
+ * first memory type it takes, or linear tiling in host-visible memory,
+ * created PREINITIALIZED and left mapped with its subresource layout for
+ * the CPU to fill and read.
+ */
+static bool
+l_image_create(struct g52_image *im, VkFormat format, bool linear)
+{
+   const struct g52_fns *f = &g.f;
+   memset(im, 0, sizeof(*im));
+   im->format = format;
+   im->width = SRC_W;
+   im->height = SRC_H;
+   if (linear && !f->GetImageSubresourceLayout) {
+      fprintf(stderr, "blit_g52: no vkGetImageSubresourceLayout for the linear images\n");
+      return false;
+   }
+   const VkImageCreateInfo ici = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = format,
+      .extent = {SRC_W, SRC_H, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = linear ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = linear ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED,
+   };
+   VkResult r = f->CreateImage(g.device, &ici, NULL, &im->image);
+   if (r != VK_SUCCESS) {
+      fprintf(stderr, "blit_g52: vkCreateImage (format %d, %s) failed: %s\n", format,
+              linear ? "linear" : "optimal", g52_result_str(r));
+      return false;
+   }
+   VkMemoryRequirements reqs;
+   f->GetImageMemoryRequirements(g.device, im->image, &reqs);
+   im->size = reqs.size;
+   const int type = g52_pick_memory_type(&g, reqs.memoryTypeBits, linear, &im->coherent);
+   if (type < 0) {
+      fprintf(stderr, "blit_g52: no %smemory type for the image (bits 0x%x)\n",
+              linear ? "host-visible " : "", reqs.memoryTypeBits);
+      return false;
+   }
+   const VkMemoryAllocateInfo mai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = reqs.size,
+      .memoryTypeIndex = (uint32_t)type,
+   };
+   r = f->AllocateMemory(g.device, &mai, NULL, &im->memory);
+   if (r == VK_SUCCESS)
+      r = f->BindImageMemory(g.device, im->image, im->memory, 0);
+   if (r == VK_SUCCESS && linear)
+      r = f->MapMemory(g.device, im->memory, 0, VK_WHOLE_SIZE, 0, &im->map);
+   if (r != VK_SUCCESS) {
+      fprintf(stderr, "blit_g52: image memory (format %d): %s\n", format, g52_result_str(r));
+      return false;
+   }
+   if (linear) {
+      const VkImageSubresource sub = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
+      f->GetImageSubresourceLayout(g.device, im->image, &sub, &im->layout);
+   }
+   return true;
+}
+
+/* Fills the linear image's texels through its mapping (`prefill`: the
+ * destination's prefill, else the source pattern) and flushes them. */
+static void
+l_image_fill(struct g52_image *im, enum l_kind k, bool prefill)
+{
+   const unsigned bytes = l_bytes(k);
+   uint8_t *base = (uint8_t *)im->map + im->layout.offset;
+   for (int y = 0; y < SRC_H; y++) {
+      for (int x = 0; x < SRC_W; x++) {
+         uint8_t *p = base + (size_t)y * im->layout.rowPitch + (size_t)x * bytes;
+         if (prefill)
+            l_prefill(k, x, y, p);
+         else
+            l_texel(k, x, y, p);
+      }
+   }
+   if (!im->coherent) {
+      const VkMappedMemoryRange whole = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = im->memory,
+         .size = VK_WHOLE_SIZE,
+      };
+      g.f.FlushMappedMemoryRanges(g.device, 1, &whole);
+   }
+}
+
+/* L on optimal images, through the buffer/image copies. */
+static bool
+l_run_optimal(const struct l_format *lf)
+{
+   const unsigned bytes = l_bytes(lf->kind);
+   const VkDeviceSize size = (VkDeviceSize)SRC_W * SRC_H * bytes;
+   char what_rt[96], what_blit[96];
+   snprintf(what_rt, sizeof(what_rt), "%s optimal, copy round trip of the source", lf->name);
+   snprintf(what_blit, sizeof(what_blit), "%s optimal, 1:1 blit", lf->name);
+
+   struct g52_image src = {0}, dst = {0};
+   struct g52_hostbuf up = {0}, pre = {0}, rb_src = {0}, rb_dst = {0};
+   bool ok = l_image_create(&src, lf->format, false) && l_image_create(&dst, lf->format, false) &&
+             g52_hostbuf_create(&g, &up, size, 0) && g52_hostbuf_create(&g, &pre, size, 0) &&
+             g52_hostbuf_create(&g, &rb_src, size, L_FILL) &&
+             g52_hostbuf_create(&g, &rb_dst, size, L_FILL) && begin();
+   if (ok) {
+      for (int y = 0; y < SRC_H; y++) {
+         for (int x = 0; x < SRC_W; x++) {
+            const size_t o = ((size_t)y * SRC_W + x) * bytes;
+            l_texel(lf->kind, x, y, (uint8_t *)up.map + o);
+            l_prefill(lf->kind, x, y, (uint8_t *)pre.map + o);
+         }
+      }
+      g52_hostbuf_flush(&g, &up);
+      g52_hostbuf_flush(&g, &pre);
+      to_layout(src.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+      to_layout(dst.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+      g52_cmd_copy_image(&g, cmd, src.image, VK_IMAGE_ASPECT_COLOR_BIT, SRC_W, SRC_H, up.buffer,
+                         true);
+      g52_cmd_copy_image(&g, cmd, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, SRC_W, SRC_H, pre.buffer,
+                         true);
+      to_layout(src.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      g52_cmd_full_barrier(&g, cmd);
+      blit(src.image, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, SRC_W, SRC_H, 0, 0, SRC_W, SRC_H,
+           VK_FILTER_NEAREST);
+      to_layout(dst.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      g52_cmd_copy_image(&g, cmd, src.image, VK_IMAGE_ASPECT_COLOR_BIT, SRC_W, SRC_H,
+                         rb_src.buffer, false);
+      g52_cmd_copy_image(&g, cmd, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, SRC_W, SRC_H,
+                         rb_dst.buffer, false);
+      ok = end_and_run(what_blit);
+   }
+   bool pass = ok;
+   if (ok) {
+      g52_hostbuf_invalidate(&g, &rb_src);
+      g52_hostbuf_invalidate(&g, &rb_dst);
+      const bool round_trip =
+         l_check(lf, what_rt, rb_src.map, (size_t)SRC_W * bytes, false, true);
+      if (!round_trip)
+         printf("    (the copies lose %u-byte texels, so the blit check below is seen through "
+                "them; the linear run checks the blit alone)\n", bytes);
+      const bool blitted = l_check(lf, what_blit, rb_dst.map, (size_t)SRC_W * bytes, true, true);
+      pass = round_trip && blitted;
+   } else {
+      printf("FAIL L (%s): not run to the end\n", what_blit);
+   }
+   g52_hostbuf_destroy(&g, &up);
+   g52_hostbuf_destroy(&g, &pre);
+   g52_hostbuf_destroy(&g, &rb_src);
+   g52_hostbuf_destroy(&g, &rb_dst);
+   g52_image_destroy(&g, &src);
+   g52_image_destroy(&g, &dst);
+   return pass;
+}
+
+/* L on linear host-visible images the CPU fills and reads: the blit
+ * alone. */
+static bool
+l_run_linear(const struct l_format *lf)
+{
+   char what[96];
+   snprintf(what, sizeof(what), "%s linear, 1:1 blit", lf->name);
+
+   struct g52_image src = {0}, dst = {0};
+   bool ok = l_image_create(&src, lf->format, true) && l_image_create(&dst, lf->format, true);
+   if (ok) {
+      l_image_fill(&src, lf->kind, false);
+      l_image_fill(&dst, lf->kind, true);
+      ok = begin();
+   }
+   if (ok) {
+      g52_cmd_transition(&g, cmd, src.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_WRITE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+      g52_cmd_transition(&g, cmd, dst.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_WRITE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+      blit(src.image, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, SRC_W, SRC_H, 0, 0, SRC_W, SRC_H,
+           VK_FILTER_NEAREST);
+      g52_cmd_transition(&g, cmd, dst.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+      ok = end_and_run(what);
+   }
+   bool pass = ok;
+   if (ok) {
+      g52_image_sync_for_read(&g, &dst);
+      pass = l_check(lf, what, (const uint8_t *)dst.map + dst.layout.offset,
+                     (size_t)dst.layout.rowPitch, true, false);
+   } else {
+      printf("FAIL L (%s): not run to the end\n", what);
+   }
+   g52_image_destroy(&g, &src);
+   g52_image_destroy(&g, &dst);
+   return pass;
+}
+
+static bool
+run_npot_cases(void)
+{
+   if (!want_case('L'))
+      return true;
+   printf("case L: same-format 1:1 blits of 3- and 12-byte texels\n");
+   PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties =
+      (PFN_vkGetPhysicalDeviceImageFormatProperties)g.f.gipa(
+         g.instance, "vkGetPhysicalDeviceImageFormatProperties");
+   const VkFormatFeatureFlags blits = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                      VK_FORMAT_FEATURE_BLIT_DST_BIT;
+   const VkFormatFeatureFlags copies = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                       VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+   bool pass = true;
+   unsigned ran = 0;
+   for (size_t i = 0; i < sizeof(l_formats) / sizeof(l_formats[0]); i++) {
+      const struct l_format *lf = &l_formats[i];
+      VkFormatProperties p;
+      g.f.GetPhysicalDeviceFormatProperties(g.pdev, lf->format, &p);
+      printf("  %s (%u-byte texels): optimal features 0x%x, linear 0x%x\n", lf->name,
+             l_bytes(lf->kind), p.optimalTilingFeatures, p.linearTilingFeatures);
+
+      if ((p.optimalTilingFeatures & (blits | copies)) == (blits | copies)) {
+         /* The driver's buffer/image copies skip 3- and 12-byte texels on
+          * every arch (mali_cmd_image.c dispatch_copy), so this half only
+          * reports; the linear half below is what checks the blit. */
+         if (!l_run_optimal(lf))
+            printf("KNOWN L (%s optimal): the buffer/image copies do not handle "
+                   "%u-byte texels\n", lf->name, l_bytes(lf->kind));
+         ran++;
+      } else {
+         printf("SKIP L (%s optimal): not offered as blit and transfer source and "
+                "destination\n", lf->name);
+      }
+
+      /* Linear images take the same features, but may be limited further
+       * (vkGetPhysicalDeviceImageFormatProperties). */
+      VkImageFormatProperties ifp;
+      const VkResult r =
+         (p.linearTilingFeatures & blits) != blits ? VK_ERROR_FORMAT_NOT_SUPPORTED :
+         !image_format_properties ? VK_SUCCESS :
+         image_format_properties(g.pdev, lf->format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_LINEAR,
+                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 0, &ifp);
+      if (r != VK_SUCCESS) {
+         printf("SKIP L (%s linear): not offered as a linear blit source and destination "
+                "(%s)\n", lf->name, g52_result_str(r));
+      } else if (image_format_properties &&
+                 (ifp.maxExtent.width < SRC_W || ifp.maxExtent.height < SRC_H)) {
+         printf("SKIP L (%s linear): linear images reach only %ux%u\n", lf->name,
+                ifp.maxExtent.width, ifp.maxExtent.height);
+      } else {
+         pass &= l_run_linear(lf);
+         ran++;
+      }
+   }
+   if (!ran)
+      printf("SKIP L: the device offers none of these formats as blit source and "
+             "destination\n");
+   return pass;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -804,6 +1251,7 @@ main(int argc, char **argv)
    pass &= run_d32_case();
    pass &= run_d24s8_case();
    pass &= run_rgba4_case(&src);
+   pass &= run_npot_cases();
 
    g52_hostbuf_destroy(&g, &up);
    g52_image_destroy(&g, &src);

@@ -25,26 +25,99 @@
  *              layout(location = 0) out vec4 color;
  *              void main() { color = vec4(0.5, 0.25, 1.0, 1.0); }
  *
- * A second case, when the device reports shaderClipDistance, draws the
- * same triangle with a vertex shader that also writes three clip
- * distances (the left half and the bottom quarter of the image are
- * clipped; the third distance is always 1.0):
+ * When the device reports shaderClipDistance, more cases draw the same
+ * triangle with vertex shaders that also write clip distances, and check
+ * that exactly the pixels whose centre is on the positive side of every
+ * distance hold the triangle colour, the others the clear colour. With x
+ * and y the pixel centre in normalized device coordinates (y = -1 is the
+ * first row):
  *
- *   clip.vert: #version 450
- *              layout(location = 0) in vec2 pos;
- *              out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[3]; };
- *              void main() {
- *                 gl_Position = vec4(pos, 0.0, 1.0);
- *                 gl_ClipDistance[0] = pos.x;
- *                 gl_ClipDistance[1] = pos.y + 0.5;
- *                 gl_ClipDistance[2] = 1.0;
- *              }
+ *   clip.vert:  three distances in a gl_PerVertex block, the third always
+ *               1.0; drawn where x > 0 and y > -0.5:
  *
- * and checks that exactly the pixels whose centre has x > 0 and y > -0.5
- * in normalized device coordinates hold the triangle colour, the others
- * the clear colour.
+ *               #version 450
+ *               layout(location = 0) in vec2 pos;
+ *               out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[3]; };
+ *               void main() {
+ *                  gl_Position = vec4(pos, 0.0, 1.0);
+ *                  gl_ClipDistance[0] = pos.x;
+ *                  gl_ClipDistance[1] = pos.y + 0.5;
+ *                  gl_ClipDistance[2] = 1.0;
+ *               }
  *
- * The pipeline uses dynamic rendering, no descriptor sets, no push
+ *   clip6.vert: six distances in a gl_PerVertex block, all 1.0 but the
+ *               fourth (the last of the first four) and the sixth (one of
+ *               the last two); drawn where x > -0.5 and y < 0.5:
+ *
+ *               #version 450
+ *               layout(location = 0) in vec2 pos;
+ *               out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[6]; };
+ *               void main() {
+ *                  gl_Position = vec4(pos, 0.0, 1.0);
+ *                  gl_ClipDistance[0] = 1.0;
+ *                  gl_ClipDistance[1] = 1.0;
+ *                  gl_ClipDistance[2] = 1.0;
+ *                  gl_ClipDistance[3] = pos.x + 0.5;
+ *                  gl_ClipDistance[4] = 1.0;
+ *                  gl_ClipDistance[5] = 0.5 - pos.y;
+ *               }
+ *
+ *   clip8.vert: eight distances, all 1.0 but the first and the last; drawn
+ *               where x > -0.75 and y < 0.25:
+ *
+ *               #version 450
+ *               layout(location = 0) in vec2 pos;
+ *               out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[8]; };
+ *               void main() {
+ *                  gl_Position = vec4(pos, 0.0, 1.0);
+ *                  gl_ClipDistance[0] = pos.x + 0.75;
+ *                  for (int i = 1; i < 7; i++)
+ *                     gl_ClipDistance[i] = 1.0;
+ *                  gl_ClipDistance[7] = 0.25 - pos.y;
+ *               }
+ *
+ * The last case draws with clip.vert and a fragment shader that reads the
+ * three distances itself. The pixels clip.vert keeps are drawn, red 0.5
+ * where y > 0 (gl_ClipDistance[1] > 0.5) and 0.25 elsewhere, blue the
+ * third distance (1.0):
+ *
+ *   clipread.frag: #version 450
+ *                  in float gl_ClipDistance[3];
+ *                  layout(location = 0) out vec4 color;
+ *                  void main() {
+ *                     color = vec4(gl_ClipDistance[1] > 0.5 ? 0.5 : 0.25, 0.25,
+ *                                  gl_ClipDistance[2], 1.0);
+ *                  }
+ *
+ * No pixel centre lies on a clip boundary, so the expected pixels are
+ * exact.
+ *
+ * A last clip case is depth-only: a pipeline with a vertex shader and no
+ * fragment shader, no colour attachment, the depth test LESS with depth
+ * writes, drawing into a D32_SFLOAT image (D16_UNORM when D32_SFLOAT is
+ * not offered) cleared to 1.0, read back through vkCmdCopyImageToBuffer:
+ *
+ *   depthclip.vert: depth 0.5, one clip distance that clips the left half
+ *                   (x < 0):
+ *
+ *               #version 450
+ *               layout(location = 0) in vec2 pos;
+ *               out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[1]; };
+ *               void main() {
+ *                  gl_Position = vec4(pos, 0.5, 1.0);
+ *                  gl_ClipDistance[0] = pos.x;
+ *               }
+ *
+ * Every pixel with x > 0 must hold depth 0.5 (within 1e-5 on D32_SFLOAT,
+ * 32767 or 32768 on D16_UNORM) and every clipped one exactly the clear
+ * depth 1.0. Vulkan clips the primitive whatever the fragment stage
+ * is; a driver that clips by a discard in the fragment shader has no
+ * shader to put it in here (review #9). A pipeline the driver refuses with
+ * VK_ERROR_FEATURE_NOT_PRESENT (its documented way of declining what it
+ * cannot do, logged) is reported and not counted as a failure, as is a
+ * command buffer that fails to record with that error.
+ *
+ * The colour pipelines use dynamic rendering, no descriptor sets, no push
  * constants, no depth/stencil, no blending (an opaque store), no dynamic
  * state (viewport and scissor are the whole image), no culling. The
  * triangle's vertices are (-1,-1), (3,-1), (-1,3): it covers the clip
@@ -202,8 +275,248 @@ static const uint32_t frag_spv[] = {
    0x00010038,
 };
 
+static const uint32_t vert_clip6_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x00000031, 0x00000000, 0x00020011,
+   0x00000001, 0x00020011, 0x00000020, 0x0006000b, 0x00000001, 0x4c534c47,
+   0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+   0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d,
+   0x00000012, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+   0x6e69616d, 0x00000000, 0x00060005, 0x0000000b, 0x505f6c67, 0x65567265,
+   0x78657472, 0x00000000, 0x00060006, 0x0000000b, 0x00000000, 0x505f6c67,
+   0x7469736f, 0x006e6f69, 0x00070006, 0x0000000b, 0x00000001, 0x435f6c67,
+   0x4470696c, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d, 0x00000000,
+   0x00030005, 0x00000012, 0x00736f70, 0x00030047, 0x0000000b, 0x00000002,
+   0x00050048, 0x0000000b, 0x00000000, 0x0000000b, 0x00000000, 0x00050048,
+   0x0000000b, 0x00000001, 0x0000000b, 0x00000003, 0x00040047, 0x00000012,
+   0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+   0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
+   0x00000006, 0x00000004, 0x00040015, 0x00000008, 0x00000020, 0x00000000,
+   0x0004002b, 0x00000008, 0x00000009, 0x00000006, 0x0004001c, 0x0000000a,
+   0x00000006, 0x00000009, 0x0004001e, 0x0000000b, 0x00000007, 0x0000000a,
+   0x00040020, 0x0000000c, 0x00000003, 0x0000000b, 0x0004003b, 0x0000000c,
+   0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020, 0x00000001,
+   0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040017, 0x00000010,
+   0x00000006, 0x00000002, 0x00040020, 0x00000011, 0x00000001, 0x00000010,
+   0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004002b, 0x00000006,
+   0x00000014, 0x00000000, 0x0004002b, 0x00000006, 0x00000015, 0x3f800000,
+   0x00040020, 0x00000019, 0x00000003, 0x00000007, 0x0004002b, 0x0000000e,
+   0x0000001b, 0x00000001, 0x00040020, 0x0000001c, 0x00000003, 0x00000006,
+   0x0004002b, 0x0000000e, 0x0000001f, 0x00000002, 0x0004002b, 0x0000000e,
+   0x00000021, 0x00000003, 0x0004002b, 0x00000008, 0x00000022, 0x00000000,
+   0x00040020, 0x00000023, 0x00000001, 0x00000006, 0x0004002b, 0x00000006,
+   0x00000026, 0x3f000000, 0x0004002b, 0x0000000e, 0x00000029, 0x00000004,
+   0x0004002b, 0x0000000e, 0x0000002b, 0x00000005, 0x0004002b, 0x00000008,
+   0x0000002c, 0x00000001, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+   0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000010, 0x00000013,
+   0x00000012, 0x00050051, 0x00000006, 0x00000016, 0x00000013, 0x00000000,
+   0x00050051, 0x00000006, 0x00000017, 0x00000013, 0x00000001, 0x00070050,
+   0x00000007, 0x00000018, 0x00000016, 0x00000017, 0x00000014, 0x00000015,
+   0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f, 0x0003003e,
+   0x0000001a, 0x00000018, 0x00060041, 0x0000001c, 0x0000001d, 0x0000000d,
+   0x0000001b, 0x0000000f, 0x0003003e, 0x0000001d, 0x00000015, 0x00060041,
+   0x0000001c, 0x0000001e, 0x0000000d, 0x0000001b, 0x0000001b, 0x0003003e,
+   0x0000001e, 0x00000015, 0x00060041, 0x0000001c, 0x00000020, 0x0000000d,
+   0x0000001b, 0x0000001f, 0x0003003e, 0x00000020, 0x00000015, 0x00050041,
+   0x00000023, 0x00000024, 0x00000012, 0x00000022, 0x0004003d, 0x00000006,
+   0x00000025, 0x00000024, 0x00050081, 0x00000006, 0x00000027, 0x00000025,
+   0x00000026, 0x00060041, 0x0000001c, 0x00000028, 0x0000000d, 0x0000001b,
+   0x00000021, 0x0003003e, 0x00000028, 0x00000027, 0x00060041, 0x0000001c,
+   0x0000002a, 0x0000000d, 0x0000001b, 0x00000029, 0x0003003e, 0x0000002a,
+   0x00000015, 0x00050041, 0x00000023, 0x0000002d, 0x00000012, 0x0000002c,
+   0x0004003d, 0x00000006, 0x0000002e, 0x0000002d, 0x00050083, 0x00000006,
+   0x0000002f, 0x00000026, 0x0000002e, 0x00060041, 0x0000001c, 0x00000030,
+   0x0000000d, 0x0000001b, 0x0000002b, 0x0003003e, 0x00000030, 0x0000002f,
+   0x000100fd, 0x00010038,
+};
+
+static const uint32_t vert_clip8_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x00000039, 0x00000000, 0x00020011,
+   0x00000001, 0x00020011, 0x00000020, 0x0006000b, 0x00000001, 0x4c534c47,
+   0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+   0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d,
+   0x00000012, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+   0x6e69616d, 0x00000000, 0x00060005, 0x0000000b, 0x505f6c67, 0x65567265,
+   0x78657472, 0x00000000, 0x00060006, 0x0000000b, 0x00000000, 0x505f6c67,
+   0x7469736f, 0x006e6f69, 0x00070006, 0x0000000b, 0x00000001, 0x435f6c67,
+   0x4470696c, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d, 0x00000000,
+   0x00030005, 0x00000012, 0x00736f70, 0x00030005, 0x00000025, 0x00000069,
+   0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000,
+   0x0000000b, 0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x0000000b,
+   0x00000003, 0x00040047, 0x00000012, 0x0000001e, 0x00000000, 0x00020013,
+   0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+   0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040015,
+   0x00000008, 0x00000020, 0x00000000, 0x0004002b, 0x00000008, 0x00000009,
+   0x00000008, 0x0004001c, 0x0000000a, 0x00000006, 0x00000009, 0x0004001e,
+   0x0000000b, 0x00000007, 0x0000000a, 0x00040020, 0x0000000c, 0x00000003,
+   0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000003, 0x00040015,
+   0x0000000e, 0x00000020, 0x00000001, 0x0004002b, 0x0000000e, 0x0000000f,
+   0x00000000, 0x00040017, 0x00000010, 0x00000006, 0x00000002, 0x00040020,
+   0x00000011, 0x00000001, 0x00000010, 0x0004003b, 0x00000011, 0x00000012,
+   0x00000001, 0x0004002b, 0x00000006, 0x00000014, 0x00000000, 0x0004002b,
+   0x00000006, 0x00000015, 0x3f800000, 0x00040020, 0x00000019, 0x00000003,
+   0x00000007, 0x0004002b, 0x0000000e, 0x0000001b, 0x00000001, 0x0004002b,
+   0x00000008, 0x0000001c, 0x00000000, 0x00040020, 0x0000001d, 0x00000001,
+   0x00000006, 0x0004002b, 0x00000006, 0x00000020, 0x3f400000, 0x00040020,
+   0x00000022, 0x00000003, 0x00000006, 0x00040020, 0x00000024, 0x00000007,
+   0x0000000e, 0x0004002b, 0x0000000e, 0x0000002c, 0x00000007, 0x00020014,
+   0x0000002d, 0x0004002b, 0x00000006, 0x00000033, 0x3e800000, 0x0004002b,
+   0x00000008, 0x00000034, 0x00000001, 0x00050036, 0x00000002, 0x00000004,
+   0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000024,
+   0x00000025, 0x00000007, 0x0004003d, 0x00000010, 0x00000013, 0x00000012,
+   0x00050051, 0x00000006, 0x00000016, 0x00000013, 0x00000000, 0x00050051,
+   0x00000006, 0x00000017, 0x00000013, 0x00000001, 0x00070050, 0x00000007,
+   0x00000018, 0x00000016, 0x00000017, 0x00000014, 0x00000015, 0x00050041,
+   0x00000019, 0x0000001a, 0x0000000d, 0x0000000f, 0x0003003e, 0x0000001a,
+   0x00000018, 0x00050041, 0x0000001d, 0x0000001e, 0x00000012, 0x0000001c,
+   0x0004003d, 0x00000006, 0x0000001f, 0x0000001e, 0x00050081, 0x00000006,
+   0x00000021, 0x0000001f, 0x00000020, 0x00060041, 0x00000022, 0x00000023,
+   0x0000000d, 0x0000001b, 0x0000000f, 0x0003003e, 0x00000023, 0x00000021,
+   0x0003003e, 0x00000025, 0x0000001b, 0x000200f9, 0x00000026, 0x000200f8,
+   0x00000026, 0x000400f6, 0x00000028, 0x00000029, 0x00000000, 0x000200f9,
+   0x0000002a, 0x000200f8, 0x0000002a, 0x0004003d, 0x0000000e, 0x0000002b,
+   0x00000025, 0x000500b1, 0x0000002d, 0x0000002e, 0x0000002b, 0x0000002c,
+   0x000400fa, 0x0000002e, 0x00000027, 0x00000028, 0x000200f8, 0x00000027,
+   0x0004003d, 0x0000000e, 0x0000002f, 0x00000025, 0x00060041, 0x00000022,
+   0x00000030, 0x0000000d, 0x0000001b, 0x0000002f, 0x0003003e, 0x00000030,
+   0x00000015, 0x000200f9, 0x00000029, 0x000200f8, 0x00000029, 0x0004003d,
+   0x0000000e, 0x00000031, 0x00000025, 0x00050080, 0x0000000e, 0x00000032,
+   0x00000031, 0x0000001b, 0x0003003e, 0x00000025, 0x00000032, 0x000200f9,
+   0x00000026, 0x000200f8, 0x00000028, 0x00050041, 0x0000001d, 0x00000035,
+   0x00000012, 0x00000034, 0x0004003d, 0x00000006, 0x00000036, 0x00000035,
+   0x00050083, 0x00000006, 0x00000037, 0x00000033, 0x00000036, 0x00060041,
+   0x00000022, 0x00000038, 0x0000000d, 0x0000001b, 0x0000002c, 0x0003003e,
+   0x00000038, 0x00000037, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t frag_clipread_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x0000001e, 0x00000000, 0x00020011,
+   0x00000001, 0x00020011, 0x00000020, 0x0006000b, 0x00000001, 0x4c534c47,
+   0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+   0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009,
+   0x0000000e, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002,
+   0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00040005,
+   0x00000009, 0x6f6c6f63, 0x00000072, 0x00060005, 0x0000000e, 0x435f6c67,
+   0x4470696c, 0x61747369, 0x0065636e, 0x00040047, 0x00000009, 0x0000001e,
+   0x00000000, 0x00040047, 0x0000000e, 0x0000000b, 0x00000003, 0x00020013,
+   0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+   0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020,
+   0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009,
+   0x00000003, 0x00040015, 0x0000000a, 0x00000020, 0x00000000, 0x0004002b,
+   0x0000000a, 0x0000000b, 0x00000003, 0x0004001c, 0x0000000c, 0x00000006,
+   0x0000000b, 0x00040020, 0x0000000d, 0x00000001, 0x0000000c, 0x0004003b,
+   0x0000000d, 0x0000000e, 0x00000001, 0x00040015, 0x0000000f, 0x00000020,
+   0x00000001, 0x0004002b, 0x0000000f, 0x00000010, 0x00000001, 0x00040020,
+   0x00000011, 0x00000001, 0x00000006, 0x0004002b, 0x00000006, 0x00000014,
+   0x3f000000, 0x00020014, 0x00000015, 0x0004002b, 0x00000006, 0x00000017,
+   0x3e800000, 0x0004002b, 0x0000000f, 0x00000019, 0x00000002, 0x0004002b,
+   0x00000006, 0x0000001c, 0x3f800000, 0x00050036, 0x00000002, 0x00000004,
+   0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041, 0x00000011,
+   0x00000012, 0x0000000e, 0x00000010, 0x0004003d, 0x00000006, 0x00000013,
+   0x00000012, 0x000500ba, 0x00000015, 0x00000016, 0x00000013, 0x00000014,
+   0x000600a9, 0x00000006, 0x00000018, 0x00000016, 0x00000014, 0x00000017,
+   0x00050041, 0x00000011, 0x0000001a, 0x0000000e, 0x00000019, 0x0004003d,
+   0x00000006, 0x0000001b, 0x0000001a, 0x00070050, 0x00000007, 0x0000001d,
+   0x00000018, 0x00000017, 0x0000001b, 0x0000001c, 0x0003003e, 0x00000009,
+   0x0000001d, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t vert_depthclip_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x00000022, 0x00000000, 0x00020011,
+   0x00000001, 0x00020011, 0x00000020, 0x0006000b, 0x00000001, 0x4c534c47,
+   0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+   0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d,
+   0x00000012, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+   0x6e69616d, 0x00000000, 0x00060005, 0x0000000b, 0x505f6c67, 0x65567265,
+   0x78657472, 0x00000000, 0x00060006, 0x0000000b, 0x00000000, 0x505f6c67,
+   0x7469736f, 0x006e6f69, 0x00070006, 0x0000000b, 0x00000001, 0x435f6c67,
+   0x4470696c, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d, 0x00000000,
+   0x00030005, 0x00000012, 0x00736f70, 0x00030047, 0x0000000b, 0x00000002,
+   0x00050048, 0x0000000b, 0x00000000, 0x0000000b, 0x00000000, 0x00050048,
+   0x0000000b, 0x00000001, 0x0000000b, 0x00000003, 0x00040047, 0x00000012,
+   0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+   0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
+   0x00000006, 0x00000004, 0x00040015, 0x00000008, 0x00000020, 0x00000000,
+   0x0004002b, 0x00000008, 0x00000009, 0x00000001, 0x0004001c, 0x0000000a,
+   0x00000006, 0x00000009, 0x0004001e, 0x0000000b, 0x00000007, 0x0000000a,
+   0x00040020, 0x0000000c, 0x00000003, 0x0000000b, 0x0004003b, 0x0000000c,
+   0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020, 0x00000001,
+   0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040017, 0x00000010,
+   0x00000006, 0x00000002, 0x00040020, 0x00000011, 0x00000001, 0x00000010,
+   0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004002b, 0x00000006,
+   0x00000014, 0x3f000000, 0x0004002b, 0x00000006, 0x00000015, 0x3f800000,
+   0x00040020, 0x00000019, 0x00000003, 0x00000007, 0x0004002b, 0x0000000e,
+   0x0000001b, 0x00000001, 0x0004002b, 0x00000008, 0x0000001c, 0x00000000,
+   0x00040020, 0x0000001d, 0x00000001, 0x00000006, 0x00040020, 0x00000020,
+   0x00000003, 0x00000006, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+   0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000010, 0x00000013,
+   0x00000012, 0x00050051, 0x00000006, 0x00000016, 0x00000013, 0x00000000,
+   0x00050051, 0x00000006, 0x00000017, 0x00000013, 0x00000001, 0x00070050,
+   0x00000007, 0x00000018, 0x00000016, 0x00000017, 0x00000014, 0x00000015,
+   0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f, 0x0003003e,
+   0x0000001a, 0x00000018, 0x00050041, 0x0000001d, 0x0000001e, 0x00000012,
+   0x0000001c, 0x0004003d, 0x00000006, 0x0000001f, 0x0000001e, 0x00060041,
+   0x00000020, 0x00000021, 0x0000000d, 0x0000001b, 0x0000000f, 0x0003003e,
+   0x00000021, 0x0000001f, 0x000100fd, 0x00010038,
+};
+
 /* A triangle covering clip space: (-1,-1), (3,-1), (-1,3). */
 static const float vertices[6] = {-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f};
+
+/* The cases (see the file comment). */
+enum draw_case {
+   CASE_PLAIN,
+   CASE_CLIP3,
+   CASE_CLIP6,
+   CASE_CLIP8,
+   CASE_CLIP3_FS_READS,
+   CASE_COUNT,
+};
+
+static const struct {
+   const char *name;
+   const uint32_t *vs;
+   size_t vs_size;
+   const uint32_t *fs;
+   size_t fs_size;
+   /* Clip distances the vertex shader writes (0: none, the case needs no
+    * shaderClipDistance). */
+   uint32_t clip_distances;
+} cases[CASE_COUNT] = {
+   [CASE_PLAIN] = {"the plain triangle", vert_spv, sizeof(vert_spv), frag_spv,
+                   sizeof(frag_spv), 0},
+   [CASE_CLIP3] = {"three clip distances", vert_clip_spv, sizeof(vert_clip_spv), frag_spv,
+                   sizeof(frag_spv), 3},
+   [CASE_CLIP6] = {"six clip distances in gl_PerVertex", vert_clip6_spv,
+                   sizeof(vert_clip6_spv), frag_spv, sizeof(frag_spv), 6},
+   [CASE_CLIP8] = {"eight clip distances", vert_clip8_spv, sizeof(vert_clip8_spv), frag_spv,
+                   sizeof(frag_spv), 8},
+   [CASE_CLIP3_FS_READS] = {"three clip distances the fragment shader reads", vert_clip_spv,
+                            sizeof(vert_clip_spv), frag_clipread_spv,
+                            sizeof(frag_clipread_spv), 3},
+};
+
+/* Whether case c draws the pixel whose centre is (x, y) in normalized
+ * device coordinates, and its R8G8B8A8_UNORM bytes then. */
+static bool
+pixel_expected(enum draw_case c, float x, float y, uint8_t rgba[4])
+{
+   memcpy(rgba, expect_rgba, 4);
+   switch (c) {
+   case CASE_CLIP3:
+      return x > 0.0f && y > -0.5f;
+   case CASE_CLIP6:
+      return x > -0.5f && y < 0.5f;
+   case CASE_CLIP8:
+      return x > -0.75f && y < 0.25f;
+   case CASE_CLIP3_FS_READS:
+      /* Red 0.5 (128) where gl_ClipDistance[1] = y + 0.5 > 0.5, else 0.25
+       * (64). */
+      rgba[0] = y > 0.0f ? 128 : 64;
+      return x > 0.0f && y > -0.5f;
+   default:
+      return true;
+   }
+}
 
 /* ---------------------------------------------------------------------- */
 /* Helpers                                                                 */
@@ -247,6 +560,7 @@ struct fns {
    PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
    PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
+   PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties;
    PFN_vkGetPhysicalDeviceFeatures GetPhysicalDeviceFeatures;
    PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
    PFN_vkCreateDevice CreateDevice;
@@ -288,6 +602,7 @@ struct fns {
    PFN_vkCmdBindPipeline CmdBindPipeline;
    PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
    PFN_vkCmdDraw CmdDraw;
+   PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer; /* optional: the depth-only case */
    PFN_vkCreateFence CreateFence;
    PFN_vkDestroyFence DestroyFence;
    PFN_vkQueueSubmit QueueSubmit;
@@ -382,6 +697,524 @@ pick_memory_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t type_bits,
    return type;
 }
 
+/* The first memory type for `type_bits`, host-visible or not; -1 when
+ * there is none. */
+static int
+pick_any_memory_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t type_bits)
+{
+   for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
+      if (type_bits & (1u << i))
+         return (int)i;
+   }
+   return -1;
+}
+
+/* ---------------------------------------------------------------------- */
+/* The depth-only clip case (see the file comment)                         */
+
+#define DEPTH_CASE_NAME "depth only: one clip distance, no fragment shader"
+
+enum depth_result {
+   DEPTH_PASSED,
+   DEPTH_FAILED,
+   DEPTH_REFUSED,    /* VK_ERROR_FEATURE_NOT_PRESENT, not counted as a failure */
+};
+
+static enum depth_result
+run_depth_only_clip(const struct fns *f, VkPhysicalDevice pdev, VkDevice device, VkQueue queue,
+                    const VkPhysicalDeviceMemoryProperties *mem_props, VkBuffer vbuf,
+                    unsigned case_no)
+{
+   static const struct {
+      VkFormat format;
+      const char *name;
+      unsigned bytes;
+   } zformats[2] = {
+      {VK_FORMAT_D32_SFLOAT, "D32_SFLOAT", 4},
+      /* Vulkan requires it as a depth attachment and transfer source. */
+      {VK_FORMAT_D16_UNORM, "D16_UNORM", 2},
+   };
+   enum depth_result res = DEPTH_FAILED;
+   VkImage zimg = VK_NULL_HANDLE;
+   VkDeviceMemory zmem = VK_NULL_HANDLE, rbmem = VK_NULL_HANDLE;
+   VkImageView zview = VK_NULL_HANDLE;
+   VkBuffer rb = VK_NULL_HANDLE;
+   void *rbmap = NULL;
+   bool rbcoherent = false;
+   VkShaderModule vsm = VK_NULL_HANDLE;
+   VkPipelineLayout pl = VK_NULL_HANDLE;
+   VkPipeline pipeline = VK_NULL_HANDLE;
+   VkCommandPool pool = VK_NULL_HANDLE;
+   VkFence fence = VK_NULL_HANDLE;
+   VkResult r;
+
+   if (!f->CmdCopyImageToBuffer) {
+      printf("FAIL: case %u: the driver has no vkCmdCopyImageToBuffer to read the depth back\n",
+             case_no);
+      return DEPTH_FAILED;
+   }
+   const VkFormatFeatureFlags zwant =
+      VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+   int zf = -1;
+   for (int i = 0; i < 2 && zf < 0; i++) {
+      VkFormatProperties fp;
+      f->GetPhysicalDeviceFormatProperties(pdev, zformats[i].format, &fp);
+      if ((fp.optimalTilingFeatures & zwant) == zwant)
+         zf = i;
+   }
+   if (zf < 0) {
+      printf("FAIL: case %u: neither D32_SFLOAT nor D16_UNORM is offered as an optimally tiled "
+             "depth attachment and transfer source\n", case_no);
+      return DEPTH_FAILED;
+   }
+   const VkFormat zformat = zformats[zf].format;
+   const unsigned zbytes = zformats[zf].bytes;
+   const VkDeviceSize rb_size = (VkDeviceSize)IMG_W * IMG_H * zbytes;
+
+   /* The depth image, optimally tiled, and its view. */
+   const VkImageCreateInfo zici = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = zformat,
+      .extent = {IMG_W, IMG_H, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+   };
+   r = f->CreateImage(device, &zici, NULL, &zimg);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreateImage (%s): %s\n", case_no, zformats[zf].name,
+             result_str(r));
+      goto out;
+   }
+   VkMemoryRequirements zreqs;
+   f->GetImageMemoryRequirements(device, zimg, &zreqs);
+   const int ztype = pick_any_memory_type(mem_props, zreqs.memoryTypeBits);
+   if (ztype < 0) {
+      printf("FAIL: case %u: no memory type for the depth image\n", case_no);
+      goto out;
+   }
+   const VkMemoryAllocateInfo zmai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = zreqs.size,
+      .memoryTypeIndex = (uint32_t)ztype,
+   };
+   r = f->AllocateMemory(device, &zmai, NULL, &zmem);
+   if (r == VK_SUCCESS)
+      r = f->BindImageMemory(device, zimg, zmem, 0);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: depth image memory: %s\n", case_no, result_str(r));
+      goto out;
+   }
+   const VkImageViewCreateInfo zvci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = zimg,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = zformat,
+      .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+   };
+   r = f->CreateImageView(device, &zvci, NULL, &zview);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreateImageView (depth): %s\n", case_no, result_str(r));
+      goto out;
+   }
+
+   /* The readback buffer, host-visible, filled with the sentinel. */
+   const VkBufferCreateInfo rbci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = rb_size,
+      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   r = f->CreateBuffer(device, &rbci, NULL, &rb);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreateBuffer (readback): %s\n", case_no, result_str(r));
+      goto out;
+   }
+   VkMemoryRequirements rbreqs;
+   f->GetBufferMemoryRequirements(device, rb, &rbreqs);
+   const int rbtype = pick_memory_type(mem_props, rbreqs.memoryTypeBits, &rbcoherent);
+   if (rbtype < 0) {
+      printf("FAIL: case %u: no host-visible memory type for the readback buffer\n", case_no);
+      goto out;
+   }
+   const VkMemoryAllocateInfo rbmai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = rbreqs.size,
+      .memoryTypeIndex = (uint32_t)rbtype,
+   };
+   r = f->AllocateMemory(device, &rbmai, NULL, &rbmem);
+   if (r == VK_SUCCESS)
+      r = f->BindBufferMemory(device, rb, rbmem, 0);
+   if (r == VK_SUCCESS)
+      r = f->MapMemory(device, rbmem, 0, VK_WHOLE_SIZE, 0, &rbmap);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: readback buffer memory: %s\n", case_no, result_str(r));
+      goto out;
+   }
+   memset(rbmap, SENTINEL, (size_t)rb_size);
+   const VkMappedMemoryRange rbwhole = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = rbmem,
+      .offset = 0,
+      .size = VK_WHOLE_SIZE,
+   };
+   if (!rbcoherent)
+      f->FlushMappedMemoryRanges(device, 1, &rbwhole);
+   printf("  depth image: %ux%u %s optimal, %llu bytes, memory type %d\n", IMG_W, IMG_H,
+          zformats[zf].name, (unsigned long long)zreqs.size, ztype);
+
+   /* The pipeline: the vertex stage alone, depth LESS with writes, no
+    * colour attachment. */
+   const VkShaderModuleCreateInfo vsmci = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = sizeof(vert_depthclip_spv),
+      .pCode = vert_depthclip_spv,
+   };
+   r = f->CreateShaderModule(device, &vsmci, NULL, &vsm);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreateShaderModule: %s\n", case_no, result_str(r));
+      goto out;
+   }
+   const VkPipelineLayoutCreateInfo plci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+   };
+   r = f->CreatePipelineLayout(device, &plci, NULL, &pl);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreatePipelineLayout: %s\n", case_no, result_str(r));
+      goto out;
+   }
+   const VkPipelineShaderStageCreateInfo stage = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_VERTEX_BIT,
+      .module = vsm,
+      .pName = "main",
+   };
+   const VkVertexInputBindingDescription vb_desc = {
+      .binding = 0,
+      .stride = 2 * sizeof(float),
+      .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+   };
+   const VkVertexInputAttributeDescription va_desc = {
+      .location = 0,
+      .binding = 0,
+      .format = VK_FORMAT_R32G32_SFLOAT,
+      .offset = 0,
+   };
+   const VkPipelineVertexInputStateCreateInfo vi = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+      .vertexBindingDescriptionCount = 1,
+      .pVertexBindingDescriptions = &vb_desc,
+      .vertexAttributeDescriptionCount = 1,
+      .pVertexAttributeDescriptions = &va_desc,
+   };
+   const VkPipelineInputAssemblyStateCreateInfo ia = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+   };
+   const VkViewport viewport = {0.0f, 0.0f, (float)IMG_W, (float)IMG_H, 0.0f, 1.0f};
+   const VkRect2D scissor = {{0, 0}, {IMG_W, IMG_H}};
+   const VkPipelineViewportStateCreateInfo vp = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+      .viewportCount = 1,
+      .pViewports = &viewport,
+      .scissorCount = 1,
+      .pScissors = &scissor,
+   };
+   const VkPipelineRasterizationStateCreateInfo rs = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+      .polygonMode = VK_POLYGON_MODE_FILL,
+      .cullMode = VK_CULL_MODE_NONE,
+      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+      .lineWidth = 1.0f,
+   };
+   const VkPipelineMultisampleStateCreateInfo ms = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+   };
+   const VkPipelineDepthStencilStateCreateInfo ds = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+      .depthTestEnable = VK_TRUE,
+      .depthWriteEnable = VK_TRUE,
+      .depthCompareOp = VK_COMPARE_OP_LESS,
+   };
+   const VkPipelineColorBlendStateCreateInfo cb = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+      .attachmentCount = 0,
+   };
+   const VkPipelineRenderingCreateInfo prci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+      .colorAttachmentCount = 0,
+      .depthAttachmentFormat = zformat,
+   };
+   const VkGraphicsPipelineCreateInfo gpci = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      .pNext = &prci,
+      .stageCount = 1,
+      .pStages = &stage,
+      .pVertexInputState = &vi,
+      .pInputAssemblyState = &ia,
+      .pViewportState = &vp,
+      .pRasterizationState = &rs,
+      .pMultisampleState = &ms,
+      .pDepthStencilState = &ds,
+      .pColorBlendState = &cb,
+      .layout = pl,
+   };
+   const int64_t tc0 = now_ns();
+   r = f->CreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, NULL, &pipeline);
+   const int64_t tc1 = now_ns();
+   if (r == VK_ERROR_FEATURE_NOT_PRESENT) {
+      printf("  case %u: the pipeline was refused with VK_ERROR_FEATURE_NOT_PRESENT (the driver "
+             "declines rather than drawing unclipped; not counted as a failure)\n", case_no);
+      res = DEPTH_REFUSED;
+      goto out;
+   }
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreateGraphicsPipelines (depth only): %s\n", case_no,
+             result_str(r));
+      goto out;
+   }
+   printf("  pipeline created in %.2f ms (vertex shader only)\n", (double)(tc1 - tc0) / 1e6);
+
+   /* Clear to 1.0, one draw, then the depth plane into the buffer. */
+   const VkCommandPoolCreateInfo cpci = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = 0,
+   };
+   r = f->CreateCommandPool(device, &cpci, NULL, &pool);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreateCommandPool: %s\n", case_no, result_str(r));
+      goto out;
+   }
+   const VkCommandBufferAllocateInfo cbai = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+   };
+   VkCommandBuffer cmd = VK_NULL_HANDLE;
+   r = f->AllocateCommandBuffers(device, &cbai, &cmd);
+   const VkCommandBufferBeginInfo bi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   if (r == VK_SUCCESS)
+      r = f->BeginCommandBuffer(cmd, &bi);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: command buffer: %s\n", case_no, result_str(r));
+      goto out;
+   }
+   const VkImageMemoryBarrier to_depth = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = 0,
+      .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = zimg,
+      .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+   };
+   f->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_depth);
+   const VkRenderingAttachmentInfo za = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = zview,
+      .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      .resolveMode = VK_RESOLVE_MODE_NONE,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue.depthStencil = {1.0f, 0},
+   };
+   const VkRenderingInfo ri = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {{0, 0}, {IMG_W, IMG_H}},
+      .layerCount = 1,
+      .colorAttachmentCount = 0,
+      .pDepthAttachment = &za,
+   };
+   f->CmdBeginRendering(cmd, &ri);
+   f->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   const VkDeviceSize vb_offset = 0;
+   f->CmdBindVertexBuffers(cmd, 0, 1, &vbuf, &vb_offset);
+   f->CmdDraw(cmd, 3, 1, 0, 0);
+   f->CmdEndRendering(cmd);
+   const VkImageMemoryBarrier to_copy = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = zimg,
+      .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+   };
+   f->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_copy);
+   const VkBufferImageCopy region = {
+      .bufferOffset = 0,
+      .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+      .imageExtent = {IMG_W, IMG_H, 1},
+   };
+   f->CmdCopyImageToBuffer(cmd, zimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &region);
+   const VkMemoryBarrier to_host = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+   };
+   f->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                         &to_host, 0, NULL, 0, NULL);
+   r = f->EndCommandBuffer(cmd);
+   if (r == VK_ERROR_FEATURE_NOT_PRESENT) {
+      printf("  case %u: recording was refused with VK_ERROR_FEATURE_NOT_PRESENT (the driver "
+             "declines rather than drawing unclipped; not counted as a failure)\n", case_no);
+      res = DEPTH_REFUSED;
+      goto out;
+   }
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkEndCommandBuffer: %s (see the log)\n", case_no, result_str(r));
+      goto out;
+   }
+
+   const VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   r = f->CreateFence(device, &fci, NULL, &fence);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkCreateFence: %s\n", case_no, result_str(r));
+      goto out;
+   }
+   const VkSubmitInfo si = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &cmd,
+   };
+   const int64_t t0 = now_ns();
+   r = f->QueueSubmit(queue, 1, &si, fence);
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkQueueSubmit: %s (kbase JOB_SUBMIT; see the log)\n", case_no,
+             result_str(r));
+      if (r == VK_ERROR_DEVICE_LOST)
+         print_fault(f, device);
+      goto out;
+   }
+   r = f->WaitForFences(device, 1, &fence, VK_TRUE, WAIT_NS);
+   const int64_t t1 = now_ns();
+   printf("  vkWaitForFences: %s after %.3f ms\n", result_str(r), (double)(t1 - t0) / 1e6);
+   if (r == VK_TIMEOUT) {
+      printf("FAIL: case %u: the fence never signalled (a hung job; check dmesg for mali/kbase "
+             "lines)\n", case_no);
+      /* The work may still run: leave everything it uses alone. */
+      return DEPTH_FAILED;
+   }
+   if (r != VK_SUCCESS) {
+      printf("FAIL: case %u: vkWaitForFences returned %s\n", case_no, result_str(r));
+      if (r == VK_ERROR_DEVICE_LOST)
+         print_fault(f, device);
+      goto out;
+   }
+
+   /* Check: depth 0.5 where the pixel centre has x > 0, the clear 1.0 in
+    * the clipped half. */
+   if (!rbcoherent)
+      f->InvalidateMappedMemoryRanges(device, 1, &rbwhole);
+   unsigned bad = 0, drawn_clipped = 0, kept_undrawn = 0, unwritten = 0, expect_drawn = 0;
+   int first_x = -1, first_y = -1;
+   double first_got = 0.0;
+   for (uint32_t y = 0; y < IMG_H; y++) {
+      for (uint32_t x = 0; x < IMG_W; x++) {
+         const uint8_t *p = (const uint8_t *)rbmap + ((size_t)y * IMG_W + x) * zbytes;
+         const float ndc_x = (x + 0.5f) * 2.0f / IMG_W - 1.0f;
+         const bool drawn = ndc_x > 0.0f;
+         expect_drawn += drawn;
+         bool at_half, at_one;
+         double got;
+         if (zbytes == 4) {
+            /* The interpolated depth of the flat triangle, allowed a few
+             * float steps; the clear value is stored as it is. */
+            float v;
+            memcpy(&v, p, sizeof(v));
+            at_half = v > 0.5f - 1e-5f && v < 0.5f + 1e-5f;
+            at_one = v == 1.0f;
+            got = v;
+         } else {
+            /* 0.5 is 32767.5 in 16-bit units: either neighbour. */
+            uint16_t v;
+            memcpy(&v, p, sizeof(v));
+            at_half = v >= 32767 && v <= 32768;
+            at_one = v == 65535;
+            got = v / 65535.0;
+         }
+         if (drawn ? at_half : at_one)
+            continue;
+         bool fill = true;
+         for (unsigned i = 0; i < zbytes; i++)
+            fill &= p[i] == SENTINEL;
+         if (fill)
+            unwritten++;
+         else if (!drawn && at_half)
+            drawn_clipped++;
+         else if (drawn && at_one)
+            kept_undrawn++;
+         if (!bad) {
+            first_x = (int)x;
+            first_y = (int)y;
+            first_got = got;
+         }
+         bad++;
+      }
+   }
+   const unsigned expect_clipped = IMG_W * IMG_H - expect_drawn;
+   if (bad == 0) {
+      printf("  case %u ok: %u pixels at depth 0.5, the %u clipped ones kept the clear depth 1.0 "
+             "(%s)\n", case_no, expect_drawn, expect_clipped, zformats[zf].name);
+      res = DEPTH_PASSED;
+   } else {
+      printf("FAIL: case %u: %u of %u depth pixels wrong (%u clipped ones at the triangle's "
+             "depth 0.5, %u kept ones still at 1.0, %u never written by the readback copy); "
+             "first at (%d,%d) = %.6f\n",
+             case_no, bad, IMG_W * IMG_H, drawn_clipped, kept_undrawn, unwritten, first_x,
+             first_y, first_got);
+      if (drawn_clipped == expect_clipped)
+         printf("  (every clipped pixel holds the triangle's depth: the pipeline without a "
+                "fragment shader was drawn unclipped)\n");
+   }
+
+out:
+   f->DeviceWaitIdle(device);
+   if (fence)
+      f->DestroyFence(device, fence, NULL);
+   if (pool)
+      f->DestroyCommandPool(device, pool, NULL);
+   if (pipeline)
+      f->DestroyPipeline(device, pipeline, NULL);
+   if (pl)
+      f->DestroyPipelineLayout(device, pl, NULL);
+   if (vsm)
+      f->DestroyShaderModule(device, vsm, NULL);
+   if (rbmap)
+      f->UnmapMemory(device, rbmem);
+   if (rb)
+      f->DestroyBuffer(device, rb, NULL);
+   if (rbmem)
+      f->FreeMemory(device, rbmem, NULL);
+   if (zview)
+      f->DestroyImageView(device, zview, NULL);
+   if (zimg)
+      f->DestroyImage(device, zimg, NULL);
+   if (zmem)
+      f->FreeMemory(device, zmem, NULL);
+   return res;
+}
+
 /* ---------------------------------------------------------------------- */
 
 int
@@ -438,6 +1271,7 @@ main(int argc, char **argv)
    INST(EnumeratePhysicalDevices);
    INST(GetPhysicalDeviceProperties2);
    INST(GetPhysicalDeviceMemoryProperties);
+   INST(GetPhysicalDeviceFormatProperties);
    INST(GetPhysicalDeviceFeatures);
    INST(EnumerateDeviceExtensionProperties);
    INST(CreateDevice);
@@ -509,6 +1343,7 @@ main(int argc, char **argv)
    memset(&supported, 0, sizeof(supported));
    f.GetPhysicalDeviceFeatures(pdev, &supported);
    const bool have_clip = supported.shaderClipDistance;
+   const uint32_t max_clip_distances = props2.properties.limits.maxClipDistances;
    const VkPhysicalDeviceFeatures enabled = {.shaderClipDistance = have_clip};
    const VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -574,6 +1409,8 @@ main(int argc, char **argv)
       &f, device, "vkCmdEndRendering", "vkCmdEndRenderingKHR", true, &ok);
    f.GetImageSubresourceLayout = (PFN_vkGetImageSubresourceLayout)load_device_fn(
       &f, device, "vkGetImageSubresourceLayout", NULL, false, &ok);
+   f.CmdCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)load_device_fn(
+      &f, device, "vkCmdCopyImageToBuffer", NULL, false, &ok);
    if (have_fault_ext)
       f.GetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)load_device_fn(
          &f, device, "vkGetDeviceFaultInfoEXT", NULL, false, &ok);
@@ -722,19 +1559,27 @@ main(int argc, char **argv)
    printf("  vertex buffer: %zu bytes, memory type %d\n", sizeof(vertices), btype);
 
    int status = 0;
-   for (unsigned clip = 0; clip < (have_clip ? 2u : 1u); clip++) {
-   printf("  case %u: %s\n", clip, clip ? "three clip distances" : "the plain triangle");
+   unsigned ran = 0;
+   for (unsigned clip = 0; clip < CASE_COUNT; clip++) {
+   if (cases[clip].clip_distances &&
+       (!have_clip || cases[clip].clip_distances > max_clip_distances)) {
+      printf("  case %u: %s: skipped (shaderClipDistance %u, maxClipDistances %u)\n", clip,
+             cases[clip].name, have_clip, max_clip_distances);
+      continue;
+   }
+   printf("  case %u: %s\n", clip, cases[clip].name);
+   ran++;
 
    /* Shaders and the pipeline. */
    const VkShaderModuleCreateInfo vsmci = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-      .codeSize = clip ? sizeof(vert_clip_spv) : sizeof(vert_spv),
-      .pCode = clip ? vert_clip_spv : vert_spv,
+      .codeSize = cases[clip].vs_size,
+      .pCode = cases[clip].vs,
    };
    const VkShaderModuleCreateInfo fsmci = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-      .codeSize = sizeof(frag_spv),
-      .pCode = frag_spv,
+      .codeSize = cases[clip].fs_size,
+      .pCode = cases[clip].fs,
    };
    VkShaderModule vsm = VK_NULL_HANDLE, fsm = VK_NULL_HANDLE;
    r = f.CreateShaderModule(device, &vsmci, NULL, &vsm);
@@ -997,11 +1842,12 @@ main(int argc, char **argv)
       const uint8_t *row = base + (size_t)y * layout.rowPitch;
       for (uint32_t x = 0; x < IMG_W; x++) {
          const uint8_t *px = row + (size_t)x * 4;
-         /* Clip case: the pixel centre's NDC x > 0 and y > -0.5. */
+         /* The pixel centre in normalized device coordinates. */
          const float ndc_x = (x + 0.5f) * 2.0f / IMG_W - 1.0f;
          const float ndc_y = (y + 0.5f) * 2.0f / IMG_H - 1.0f;
-         const bool drawn = !clip || (ndc_x > 0.0f && ndc_y > -0.5f);
-         const uint8_t *want = drawn ? expect_rgba : clear_bytes;
+         uint8_t drawn_rgba[4];
+         const bool drawn = pixel_expected(clip, ndc_x, ndc_y, drawn_rgba);
+         const uint8_t *want = drawn ? drawn_rgba : clear_bytes;
          expect_drawn += drawn;
          bool okpx = true;
          for (unsigned c = 0; c < 4; c++) {
@@ -1032,9 +1878,10 @@ main(int argc, char **argv)
           expect_rgba[1], expect_rgba[2], expect_rgba[3]);
 
    if (bad == 0) {
-      printf("  case %u ok: %u pixels the triangle colour (%.2f, %.2f, %.2f, %.2f), %u the "
+      printf("  case %u ok: %u pixels the triangle colour (%.2f, %.2f, %.2f, %.2f%s), %u the "
              "clear colour\n",
              clip, expect_drawn, tri_rgba[0], tri_rgba[1], tri_rgba[2], tri_rgba[3],
+             clip == CASE_CLIP3_FS_READS ? ", red by the distance" : "",
              IMG_W * IMG_H - expect_drawn);
    } else {
       printf("FAIL: case %u: %u of %u pixels wrong (%u black from the clear, %u still hold the "
@@ -1052,9 +1899,33 @@ main(int argc, char **argv)
    f.DestroyShaderModule(device, vsm, NULL);
    f.DestroyShaderModule(device, fsm, NULL);
    }
+
+   /* The depth-only clip case, after the colour ones. */
+   const unsigned depth_case = CASE_COUNT, total = CASE_COUNT + 1;
+   bool depth_refused = false;
+   if (!have_clip || max_clip_distances < 1) {
+      printf("  case %u: %s: skipped (shaderClipDistance %u, maxClipDistances %u)\n", depth_case,
+             DEPTH_CASE_NAME, have_clip, max_clip_distances);
+   } else {
+      printf("  case %u: %s\n", depth_case, DEPTH_CASE_NAME);
+      switch (run_depth_only_clip(&f, pdev, device, queue, &mem_props, vbuf, depth_case)) {
+      case DEPTH_PASSED:
+         ran++;
+         break;
+      case DEPTH_REFUSED:
+         depth_refused = true;
+         break;
+      default:
+         status = 1;
+         break;
+      }
+   }
+
    if (status == 0)
-      printf("PASS: %s\n", have_clip ? "the plain triangle and the clip distance case"
-                                      : "the plain triangle (no shaderClipDistance)");
+      printf("PASS: %u of %u cases%s\n", ran, total,
+             depth_refused ? " (the depth-only clip pipeline was refused with "
+                             "VK_ERROR_FEATURE_NOT_PRESENT)" :
+             ran < total ? " (the others need clip distances the device lacks)" : "");
 
    f.UnmapMemory(device, memory);
    f.DestroyBuffer(device, vbuf, NULL);

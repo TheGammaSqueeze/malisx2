@@ -27,7 +27,9 @@ executable(
 # draw_g52: the same image cleared to black, then one full-screen triangle
 # drawn into it through a vertex + fragment pipeline (a Vertex job and a
 # Tiler job on the Bifrost path), read back and checked for the triangle
-# colour. The SPIR-V is embedded (see the file comment).
+# colour; then the clip distance cases, the last a depth-only pipeline (no
+# fragment shader) whose clipped half must keep the clear depth. The SPIR-V
+# is embedded (see the file comment).
 executable(
   'draw_g52',
   files('draw_g52.c'),
@@ -50,9 +52,11 @@ executable(
   install : false,
 )
 
-# blend_g52: three images cleared to grey and drawn with a fixed-function
-# equation and a colour write mask, a blend-shader equation (MIN) and a
-# blend-constant equation, checked within one LSB.
+# blend_g52: five images cleared to grey and drawn with a fixed-function
+# equation and a colour write mask, a blend-shader equation (MIN), a
+# blend-constant equation, and two partial-mask stores with blending off
+# and a source alpha of 0 (factors left at SRC_ALPHA / ONE_MINUS_SRC_ALPHA),
+# checked within one LSB.
 executable(
   'blend_g52',
   files('blend_g52.c'),
@@ -104,7 +108,9 @@ executable(
 # scaled 2x nearest and linear, mirrored on X and Y, converted to R5G6B5 and
 # back and to sRGB, blitted into a 37x29 rectangle of a prefilled image,
 # and the depth blits (D32, D24S8 depth and stencil), every image optimally
-# tiled and read back through vkCmdCopyImageToBuffer.
+# tiled and read back through vkCmdCopyImageToBuffer; then same-format 1:1
+# blits of every offered 3- and 12-byte texel format (RGB8, RGB32), through
+# the copies on optimal images and through the mapping on linear ones.
 executable(
   'blit_g52',
   files('blit_g52.c'),
@@ -166,5 +172,23 @@ executable(
   include_directories : [inc_include],
   c_args : [malisx2_c_args, '-DDYN_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
   dependencies : [dep_dl],
+  install : false,
+)
+
+# ia_g52: input attachments. A two-subpass render pass: subpass 0 writes a
+# per-pixel RGBA8 colour, a depth gradient and an inverted stencil
+# prefill, subpass 1 reads all three back with subpassLoad (colour, depth
+# and stencil through one depth/stencil input attachment) into an RGBA32UI
+# output. Read as images (inputs that are not attachments of subpass 1),
+# from the tile buffer (read-only attachments of subpass 1) and as a
+# feedback loop (the colour read and written back in subpass 1), each with
+# a descriptor set and with vkCmdPushDescriptorSetKHR, for D24S8 and D32S8;
+# every image read back and checked pixel by pixel.
+executable(
+  'ia_g52',
+  files('ia_g52.c'),
+  include_directories : [inc_include],
+  c_args : [malisx2_c_args, '-DIA_G52_DEFAULT_ICD="@0@"'.format(_tests_default_icd)],
+  dependencies : [dep_dl, dep_m],
   install : false,
 )
