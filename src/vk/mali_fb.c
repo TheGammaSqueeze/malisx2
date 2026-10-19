@@ -31,10 +31,11 @@
 #include "mali_arch.h"
 #include "mali_image.h"
 
-/* Frame shader DCD slots (panvk: colour preload 0, depth/stencil 1). */
+/* Frame shader DCD slots (panvk: colour preload 0, depth/stencil 1). On v7
+ * every layer has its own three (mali_cmd_gfx.h). */
 #define FS_DCD_COLOR 0
 #define FS_DCD_ZS    1
-#define FS_DCD_COUNT 3
+#define FS_DCD_COUNT MALI_FRAME_SHADER_DCDS
 
 /* AFBC superblock size: the GPU writes whole superblocks of an AFBC target. */
 #define AFBC_BLOCK 16
@@ -358,16 +359,6 @@ MALI_PER_ARCH(fb_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_de
                    (r->partial_tiles && target_needs_border_load(t));
       any_preload |= t->preload;
    }
-#if PAN_ARCH < 9
-   /* No frame shaders on v7 (meta_fs_dcd in mali_cmd_meta_gfx.c): the
-    * pass runs without its preloads. */
-   if (any_preload) {
-      MALI_V7_UNSUPPORTED("an attachment preload");
-      for (unsigned i = 0; i < n; i++)
-         targets[i]->preload = false;
-      any_preload = false;
-   }
-#endif
 
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
    return any_preload;
@@ -382,6 +373,12 @@ MALI_PER_ARCH(fb_pass_has_work)(const struct mali_render_state *r)
    const struct mali_fb_target *ts[] = {&r->desc.z, &r->desc.s};
    for (unsigned i = 0; i < 2; i++)
       work |= ts[i]->image && ts[i]->store && ts[i]->load == MALI_ATT_LOAD_CLEAR;
+#if PAN_ARCH < 9
+   /* v7 also blits depth and stencil (mali_cmd_image.c), as always-written
+    * targets. */
+   for (unsigned i = 0; i < 2; i++)
+      work |= ts[i]->image && ts[i]->store && ts[i]->always_write;
+#endif
    for (unsigned i = 0; i < r->desc.rt_count; i++) {
       const struct mali_fb_target *t = &r->desc.rt[i];
       work |= t->image && t->store && (t->load == MALI_ATT_LOAD_CLEAR || t->always_write);
@@ -581,7 +578,15 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
    ckey.layered = zkey.layered = layered;
 
    const struct mali_fb_target *zt = &r->desc.z, *st = &r->desc.s;
-   if (zt->image && zt->preload) {
+#if PAN_ARCH < 9
+   /* A v7 blit's frame shader writes its depth and stencil targets itself,
+    * fetching them outside the blit area, so they get no separate
+    * preload. */
+   const bool zs_preload = !r->desc.blit;
+#else
+   const bool zs_preload = true;
+#endif
+   if (zs_preload && zt->image && zt->preload) {
       zkey.z_op = zt->load == MALI_ATT_LOAD_CLEAR ? MALI_META_FS_CLEAR_IN_AREA
                                                   : MALI_META_FS_LOAD;
       if (!MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, zt->image, zt->plane, zt->format, zt->level,
@@ -590,7 +595,7 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
          return false;
       zs = true;
    }
-   if (st->image && st->preload) {
+   if (zs_preload && st->image && st->preload) {
       zkey.s_op = st->load == MALI_ATT_LOAD_CLEAR ? MALI_META_FS_CLEAR_IN_AREA
                                                   : MALI_META_FS_LOAD;
       if (!MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, st->image, st->plane, st->format, st->level,
@@ -603,19 +608,43 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
    if (!color && !zs && !r->desc.blit)
       return true;
 
+#if PAN_ARCH < 9
+   /* v7: one triple per layer, as panvk_vX_cmd_frame_shaders.c
+    * alloc_pre_post_dcds allocates before v9; each layer's FBD points at
+    * its own (fb_build) and meta_fs_dcd writes every layer's copy. */
+   const uint64_t dcd_bytes =
+      (uint64_t)FS_DCD_COUNT * MAX2(r->desc.layer_count, 1) * pan_size(DRAW);
+   struct mali_ptr p = mali_cmd_alloc(cmd, dcd_bytes, 64);
+   if (!p.cpu)
+      return false;
+   memset(p.cpu, 0, dcd_bytes);
+#else
    struct mali_ptr p = mali_cmd_alloc(cmd, FS_DCD_COUNT * pan_size(DRAW), 64);
    if (!p.cpu)
       return false;
    memset(p.cpu, 0, FS_DCD_COUNT * pan_size(DRAW));
+#endif
 
    if (r->desc.blit) {
       const struct mali_render_blit *bl = r->desc.blit;
+#if PAN_ARCH < 9
+      /* A v7 depth/stencil blit takes the depth/stencil slot, where panvk
+       * and gallium (pan_fb_preload.c) put frame shaders that write depth
+       * or stencil. */
+      const unsigned slot = bl->key->rt_op[0] == MALI_META_FS_NONE &&
+                                  (bl->key->z_op != MALI_META_FS_NONE ||
+                                   bl->key->s_op != MALI_META_FS_NONE)
+                               ? FS_DCD_ZS
+                               : FS_DCD_COLOR;
+#else
+      const unsigned slot = FS_DCD_COLOR;
+#endif
       const struct mali_shader *fs = MALI_PER_ARCH(meta_fs_get)(cmd, bl->key);
       if (!fs || !MALI_PER_ARCH(meta_fs_dcd)(cmd, fs, bl->key, bl->push, bl->textures,
                                              bl->texture_count, bl->sampler, true,
-                                             (uint8_t *)p.cpu + FS_DCD_COLOR * pan_size(DRAW)))
+                                             (uint8_t *)p.cpu + slot * pan_size(DRAW)))
          return false;
-      modes[FS_DCD_COLOR] = MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS;
+      modes[slot] = MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS;
    } else if (color) {
       const struct mali_shader *fs = MALI_PER_ARCH(meta_fs_get)(cmd, &ckey);
       if (!fs || !MALI_PER_ARCH(meta_fs_dcd)(cmd, fs, &ckey, &push, (const uint32_t(*)[8])ctex,
@@ -903,7 +932,14 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
          cfg.pre_frame_0 = fix_frame_mode(modes[0], always_preload);
          cfg.pre_frame_1 = fix_frame_mode(modes[1], always_preload);
          cfg.post_frame = MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
+#if PAN_ARCH < 9
+         /* Layer l's own frame shader DCDs (jm/panvk_vX_cmd_buffer.c:
+          * dcd_pointer + layer * 3 Draw descriptors). */
+         cfg.frame_shader_dcds =
+            dcds ? dcds + (uint64_t)l * FS_DCD_COUNT * pan_size(DRAW) : 0;
+#else
          cfg.frame_shader_dcds = dcds;
+#endif
          cfg.sample_locations = samples;
 #if PAN_ARCH >= 9
          /* The layer inside its tiler context selects the primitive list;

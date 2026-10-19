@@ -549,11 +549,11 @@ mali_jm_cmd_add_batch(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b
 /* ---------------------------------------------------------------------- */
 /* Barriers                                                                */
 
-/* On v7 a blit runs as the compute copy on the vtc slot (mali_cmd_image.c;
- * only blits that are plain copies are supported), so the blit stage is a
- * vtc-slot transfer too (FRAG_XFER_STAGES has it as well). A synchronization2
- * mask can name the blit stage without the copy stage. On v9 a blit is
- * always a fragment pass. */
+/* On v7 a blit region that is a plain copy runs as the compute copy on the
+ * vtc slot (mali_cmd_image.c blit_region_v7) and any other region as a
+ * fragment pass, so the blit stage is a transfer on both slots
+ * (FRAG_XFER_STAGES has it too). A synchronization2 mask can name the blit
+ * stage without the copy stage. On v9 a blit is always a fragment pass. */
 #if PAN_ARCH < 9
 #define VTC_BLIT_STAGES VK_PIPELINE_STAGE_2_BLIT_BIT
 #else

@@ -66,8 +66,10 @@
  *    Clear Color here, on the CPU, from a per-image seed counter bumped at
  *    record time.
  *
- * Bifrost (v7) has no Fullscreen job: its in-pass clears
- * (mali_cmd_meta_gfx.c) and fragment barrier are logged once and skipped.
+ * Bifrost (v7) has no Fullscreen job: its in-pass clears and fragment
+ * barrier are Tiler jobs drawing a rectangle from CPU-written positions
+ * (mali_v7_cmd_meta_quads), and its frame shaders get one Draw triple per
+ * layer (mali_fb.c, mali_cmd_meta_gfx.c).
  */
 
 #include "mali_cmd_state.h"
@@ -247,6 +249,82 @@ mali_jm_cmd_pass_split(struct mali_cmd_buffer *cmd)
 /* ---------------------------------------------------------------------- */
 /* Full-screen jobs                                                        */
 
+#if PAN_ARCH < 9
+/* The job's fields follow the Tiler job of Mesa's pre-Bifrost preload
+ * (gallium pan_fb_preload.c pan_preload_emit_tiler_job): a triangle strip
+ * of 4, job task split 6, fixed primitive size 1, Invocation (1, 4, 1). */
+void
+mali_v7_cmd_meta_quads(struct mali_cmd_buffer *cmd, const void *draw, const VkRect2D *rect,
+                       uint32_t base_layer, uint32_t layer_count, bool barrier)
+{
+   struct mali_render_state *r = &cmd->gfx.render;
+   if (!MALI_PER_ARCH(cmd_render_tiler)(cmd)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   const int minx = MAX2(rect->offset.x, 0), miny = MAX2(rect->offset.y, 0);
+   const int maxx = MIN2(rect->offset.x + (int)rect->extent.width, (int)r->desc.width) - 1;
+   const int maxy = MIN2(rect->offset.y + (int)rect->extent.height, (int)r->desc.height) - 1;
+   if (maxx < minx || maxy < miny)
+      return;
+
+   const uint64_t position = mali_v7_meta_rect_positions(cmd, (float)minx, (float)miny,
+                                                         (float)(maxx + 1), (float)(maxy + 1));
+   const uint64_t viewport = mali_v7_meta_viewport(cmd, minx, miny, maxx, maxy);
+   if (!position || !viewport)
+      return;
+
+   /* Bytes 32-255 of the job: the sections, zero between them. */
+   uint8_t tmpl[256] __attribute__((aligned(16)));
+   STATIC_ASSERT(sizeof(tmpl) == pan_size(TILER_JOB));
+   memset(tmpl, 0, sizeof(tmpl));
+   /* One instance of four vertices, with the graphics quirks. */
+   const uint32_t local[3] = {1, 1, 1}, groups[3] = {1, 4, 1};
+   mali_v7_pack_invocation(pan_section_ptr(tmpl, TILER_JOB, INVOCATION), local, groups, true);
+   pan_section_pack(tmpl, TILER_JOB, PRIMITIVE, cfg) {
+      cfg.draw_mode = MALI_DRAW_MODE_TRIANGLE_STRIP;
+      cfg.index_count = 4;
+      cfg.job_task_split = 6;
+      cfg.first_provoking_vertex = r->first_provoking_vertex;
+   }
+   pan_section_pack(tmpl, TILER_JOB, PRIMITIVE_SIZE, cfg) {
+      cfg.fixed_sized = 1.0f;
+   }
+   pan_section_pack(tmpl, TILER_JOB, PADDING, cfg);
+
+   /* The template has position and viewport 0 and the genxml defaults
+    * elsewhere (the callers pack it with pan_pack), so ORing in a Draw
+    * packed with the same defaults and these two pointers sets just them.
+    * (pan_pack_nodefaults cannot pack a Draw: the padded instance sizes
+    * have no encoding for 0.) */
+   struct mali_draw_packed dcd, part;
+   memcpy(&dcd, draw, sizeof(dcd));
+   pan_pack(&part, DRAW, cfg) {
+      cfg.position = position;
+      cfg.viewport = viewport;
+   }
+   pan_merge(&dcd, &part, DRAW);
+   memcpy(pan_section_ptr(tmpl, TILER_JOB, DRAW), &dcd, sizeof(dcd));
+
+   const uint32_t end = MIN2(base_layer + layer_count, r->td_count);
+   for (uint32_t l = base_layer; l < end; l++) {
+      pan_section_pack(tmpl, TILER_JOB, TILER, cfg) {
+         cfg.address = mali_jm_pass_tiler(r, l);
+      }
+      struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
+      struct mali_ptr job =
+         mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_TILER, pan_size(TILER_JOB), barrier, 0);
+      if (!job.cpu)
+         return;
+      memcpy((uint8_t *)job.cpu + 32, tmpl + 32, sizeof(tmpl) - 32);
+      /* Polygon-list entries for two triangles, the draws' guess. */
+      mali_jm_cmd_heap_use(cmd, 2 * 32);
+   }
+   r->draws++;
+}
+#else
+
 /*
  * Fullscreen jobs (type 12, 128 bytes) running the Draw descriptor dcd over
  * rect in layers [base_layer, base_layer + layer_count), one per layer, on
@@ -258,10 +336,6 @@ static void
 fullscreen_jobs(struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
                 uint32_t base_layer, uint32_t layer_count, bool barrier)
 {
-#if PAN_ARCH < 9
-   /* v7 has no Fullscreen job. */
-   MALI_V7_UNSUPPORTED("a full-screen job");
-#else
    struct mali_render_state *r = &cmd->gfx.render;
    if (!MALI_PER_ARCH(cmd_render_tiler)(cmd)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -305,7 +379,6 @@ fullscreen_jobs(struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
       memcpy((uint8_t *)job.cpu + 32, tmpl + 32, sizeof(tmpl) - 32);
    }
    r->draws++;
-#endif /* PAN_ARCH >= 9 */
 }
 
 void
@@ -314,6 +387,7 @@ MALI_PER_ARCH(cmd_run_fullscreen)(struct mali_cmd_buffer *cmd, uint64_t dcd, con
 {
    fullscreen_jobs(cmd, dcd, rect, base_layer, layer_count, true);
 }
+#endif /* PAN_ARCH >= 9 */
 
 /*
  * A by-region fragment -> fragment barrier inside a pass: later
@@ -331,7 +405,51 @@ void
 MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
 {
 #if PAN_ARCH < 9
-   MALI_V7_UNSUPPORTED("the in-pass fragment barrier");
+   /* v7: the same draw as a Tiler job rectangle over the framebuffer
+    * (mali_v7_cmd_meta_quads), with Primitive Barrier in the Draw section
+    * and a Renderer State Descriptor without a shader (panvk_v7's
+    * panvk_draw_prepare_fs_rsd without a fragment shader): fixed-function
+    * depth tested ALWAYS and not written, stencil off, every Blend
+    * descriptor off, and both forward-pixel-kill bits clear as on v9. */
+   struct mali_render_state *r = &cmd->gfx.render;
+   if (!MALI_PER_ARCH(cmd_render_tiler)(cmd)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   struct mali_ptr rsd =
+      mali_cmd_alloc(cmd, pan_size(RENDERER_STATE) + r->rt_count * pan_size(BLEND),
+                     pan_alignment(RENDERER_STATE));
+   if (!rsd.cpu)
+      return;
+   pan_cast_and_pack(rsd.cpu, RENDERER_STATE, cfg) {
+      cfg.properties.depth_source = MALI_DEPTH_SOURCE_FIXED_FUNCTION;
+      cfg.properties.allow_forward_pixel_to_kill = false;
+      cfg.properties.allow_forward_pixel_to_be_killed = false;
+      cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+      cfg.properties.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+      cfg.multisample_misc.sample_mask = 0xffff;
+      cfg.multisample_misc.depth_function = MALI_FUNC_ALWAYS;
+      cfg.multisample_misc.depth_write_mask = false;
+      cfg.stencil_mask_misc.stencil_enable = false;
+   }
+   for (unsigned i = 0; i < r->rt_count; i++) {
+      pan_cast_and_pack((uint8_t *)rsd.cpu + pan_size(RENDERER_STATE) + i * pan_size(BLEND), BLEND,
+                        cfg) {
+         cfg.enable = false;
+         cfg.internal.mode = MALI_BLEND_MODE_OFF;
+         /* Not read in this mode; the v7 packer asserts it is at least 1. */
+         cfg.internal.fixed_function.num_comps = 4;
+      }
+   }
+   struct mali_draw_packed dcd;
+   pan_pack(&dcd, DRAW, cfg) {
+      cfg.primitive_barrier = true;
+      cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
+      cfg.state = rsd.gpu;
+      cfg.thread_storage = r->tsd;
+   }
+   const VkRect2D all = {{0, 0}, {r->desc.width, r->desc.height}};
+   mali_v7_cmd_meta_quads(cmd, &dcd, &all, 0, MAX2(r->desc.layer_count, 1), false);
 #else
    struct mali_render_state *r = &cmd->gfx.render;
    struct mali_ptr zsd = mali_cmd_alloc(cmd, pan_size(DEPTH_STENCIL), 32);

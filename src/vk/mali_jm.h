@@ -512,7 +512,7 @@ void mali_jm_draw_tmpl_init(struct mali_jm_draw_tmpl *t);
  *    draw's copy jobs, Vertex job and Tiler job: a split between them
  *    would leave a dependency pointing into the closed chain (the chain
  *    may pass the limit by those few jobs). Independent jobs, such as one
- *    Fullscreen job per layer, may take it once each;
+ *    Tiler job per layer, may take it once each;
  *  - one Tiler Context per layer: mali_jm_pass_tiler(r, layer), layers
  *    0 .. r->td_count - 1 (MALI_LAYERS_PER_TILER_CTX is 1 on v7 and v9);
  *  - the pass's Local Storage descriptor: r->tsd (filled at the end of the
@@ -648,6 +648,33 @@ mali_v7_compute_task_split(const uint32_t local[3])
 
 /* Frees the device's descriptor copy shader. */
 void mali_v7_desc_finish(struct mali_device *dev);
+
+/* ---------------------------------------------------------------------- */
+/* Internal draws inside a Bifrost pass (mali_jm_cmd_render.c)             */
+
+/*
+ * v7 has no Fullscreen job: an internal draw inside the current pass
+ * (vkCmdClearAttachments' fragment shader, the in-pass fragment barrier's
+ * Renderer State Descriptor without a shader) is one Tiler job per layer
+ * in [base_layer, base_layer + layer_count), drawing rect as a 4-vertex
+ * triangle strip from positions the CPU writes, with no Vertex job in
+ * front. draw is the Draw section's template (a struct mali_draw_packed);
+ * each job gets the rectangle as its position and scissor. barrier sets
+ * the job header's Barrier bit.
+ */
+void mali_v7_cmd_meta_quads(struct mali_cmd_buffer *cmd, const void *draw, const VkRect2D *rect,
+                            uint32_t base_layer, uint32_t layer_count, bool barrier);
+
+/* The four positions (x, y, 0, 1) of the rectangle [x0, x1) x [y0, y1) as
+ * a triangle strip, in command memory (mali_cmd_meta_gfx.c). 0 on failure. */
+uint64_t mali_v7_meta_rect_positions(struct mali_cmd_buffer *cmd, float x0, float y0, float x1,
+                                     float y1);
+
+/* A Viewport descriptor whose scissor is [minx, maxx] x [miny, maxy]
+ * (inclusive, each bound clamped to 16 bits) and whose depth range is 0
+ * to 1, in command memory (mali_cmd_meta_gfx.c). 0 on failure. */
+uint64_t mali_v7_meta_viewport(struct mali_cmd_buffer *cmd, uint32_t minx, uint32_t miny,
+                               uint32_t maxx, uint32_t maxy);
 #endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */

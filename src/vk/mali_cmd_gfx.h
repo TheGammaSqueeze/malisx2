@@ -15,7 +15,8 @@
  * job-manager back half and built per arch, as are the back halves'
  * functions declared here (mali_cmd_render.c and mali_cmd_draw.c on v11,
  * the mali_jm_* files on v7 and v9): every function below has a mali_v7_,
- * a mali_v9_ and a mali_v11_ variant (MALI_PER_ARCH).
+ * a mali_v9_ and a mali_v11_ variant (MALI_PER_ARCH), except where an #if
+ * limits one to some arches (cmd_run_fullscreen: v7 has no Fullscreen job).
  */
 
 #ifndef MALI_CMD_GFX_H
@@ -450,10 +451,15 @@ MALI_PER_ARCH_DECL(void, cmd_fb_barrier, (struct mali_cmd_buffer *cmd));
  * the draw descriptor, no vertex fetch, no primitive topology -- so the
  * pass's provoking-vertex mode never affects one; it only has to read the
  * same Tiler Context as the pass's real draws.
+ *
+ * Not on v7, which has no Fullscreen job: mali_v7_cmd_meta_quads draws
+ * these as Tiler jobs.
  */
+#if !defined(PAN_ARCH) || PAN_ARCH >= 9
 MALI_PER_ARCH_DECL(void, cmd_run_fullscreen,
                    (struct mali_cmd_buffer *cmd, uint64_t dcd, const VkRect2D *rect,
                     uint32_t base_layer, uint32_t layer_count));
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* mali_cmd_meta_gfx.c                                                     */
@@ -461,8 +467,9 @@ MALI_PER_ARCH_DECL(void, cmd_run_fullscreen,
 /*
  * Internal fragment shaders. A key says what each output does; the shader
  * reads its sources from resource table 0 (index 0: a sampler, 1 + i:
- * texture i in output order) and its constants from push constants
- * (struct mali_meta_fs_push).
+ * texture i in output order; on v7, which has no resource tables, sampler
+ * 0 and texture i of the draw's own tables) and its constants from push
+ * constants (struct mali_meta_fs_push).
  */
 enum mali_meta_fs_op {
    MALI_META_FS_NONE = 0,
@@ -471,7 +478,9 @@ enum mali_meta_fs_op {
    MALI_META_FS_CLEAR_IN_AREA, /* clear inside the push-constant rect, load outside */
    MALI_META_FS_BLIT,          /* inside the area: sample texture 0 at the
                                 * transformed position; outside: fetch
-                                * texture 1 (the target itself) */
+                                * texture 1 (the target itself). On v7 also
+                                * a z_op / s_op, with two textures each
+                                * after the colour ones */
    MALI_META_FS_COPY,          /* raw copy into an AFBC target read as a
                                 * uint format of its block size: inside the
                                 * area, the source block at the fragment's
@@ -507,7 +516,9 @@ struct mali_meta_fs_push {
    float blit_layer;
    float clear_depth;
    uint32_t clear_stencil;
-   uint32_t pad;
+   /* v7: the layer a frame shader runs for (v7 has no frame argument, so
+    * each layer has its own frame shader Draws). Unused on v9 and v11. */
+   uint32_t layer;
    uint32_t clear_color[8][4];
    /* COPY: source block = fragment position + delta (in blocks); a raw
     * source surface is addressed as the raw compute copy does
@@ -562,12 +573,22 @@ MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_quad_get,
 MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_tex_get,
                    (struct mali_cmd_buffer *cmd, unsigned elem_log2));
 
+/* Frame shader Draw descriptors of a framebuffer descriptor: colour preload,
+ * depth/stencil preload, post-frame (panvk's slots 0, 1, 2). On v7 every
+ * layer has its own three, layer after layer (mali_fb.c fb_build). */
+#define MALI_FRAME_SHADER_DCDS 3
+
 /*
  * Pack into `out` (a Draw descriptor, 64-byte aligned) the frame-shader or
  * full-screen draw that runs `fs` with `key`'s outputs over the current
  * render pass. `textures` are packed Texture descriptors in output order
  * (one per output that reads), `sampler` a packed Sampler (NULL: nearest).
  * False on failure.
+ *
+ * v7: for a frame shader, `out` is its slot in layer 0's triple and one
+ * Draw per layer is written, MALI_FRAME_SHADER_DCDS Draws apart, with the
+ * layer in its push constants. Otherwise `out` is a CPU template of a
+ * Tiler job's Draw section, completed per job by mali_v7_cmd_meta_quads.
  */
 MALI_PER_ARCH_DECL(bool, meta_fs_dcd,
                    (struct mali_cmd_buffer *cmd, const struct mali_shader *fs,
