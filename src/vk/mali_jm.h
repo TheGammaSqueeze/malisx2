@@ -363,6 +363,15 @@ struct mali_cmd_buffer {
    uint32_t dispatches;
    uint32_t draws;
    uint32_t passes;
+
+#if PAN_ARCH < 9
+   /* The 1 MiB slab being filled with blocks over half a slab
+    * (mali_jm_cmd_buffer.c). Like every slab it is on the slabs list,
+    * which releases it at reset. */
+   uint8_t *big_cpu;
+   uint64_t big_gpu;
+   uint64_t big_offset;
+#endif
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_cmd_buffer, vk.base, VkCommandBuffer,
@@ -862,6 +871,9 @@ struct mali_jm_device {
    struct mali_shader *v7_desc_copy;
    /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
    struct mali_shader *v7_ubo_copy;
+   /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
+    * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
+   unsigned free_big_slabs;
 #endif
 
    /* Set for the duration of one vkQueueSubmit when MALISX2_MEASURE's

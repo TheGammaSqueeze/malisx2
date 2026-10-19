@@ -175,8 +175,8 @@ struct mali_device {
     * runs, so it exists under either frontend.
     */
 
-   /* Command-buffer memory: free 64 KiB slabs, shared by every command
-    * pool of the device. */
+   /* Command-buffer memory: free slabs (64 KiB, and on v7 also 1 MiB),
+    * shared by every command pool of the device. */
    simple_mtx_t slab_lock;
    struct list_head free_slabs;
    unsigned free_slab_count;

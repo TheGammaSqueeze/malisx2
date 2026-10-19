@@ -47,13 +47,17 @@ struct mali_shader;
 /* Command-buffer memory (both back halves)                                */
 
 /* Command-buffer memory comes in 64 KiB slabs recycled through the device;
- * anything larger gets its own allocation, freed at reset. */
+ * anything larger gets its own allocation, freed at reset, except on v7,
+ * where blocks up to 1 MiB come from 1 MiB slabs that are recycled too
+ * (mali_jm_cmd_buffer.c). */
 #define MALI_CMD_SLAB_SIZE (64 * 1024)
 
 struct mali_cmd_slab {
    struct list_head link;
    struct mali_kbase_bo bo;
-   bool recycle;             /* a standard slab (else a dedicated BO) */
+   /* Kept on the device's free list for reuse: a standard slab, or on v7
+    * a 1 MiB slab (else a dedicated BO). */
+   bool recycle;
 };
 
 struct mali_ptr {
@@ -62,7 +66,8 @@ struct mali_ptr {
 };
 
 /* The slow path of mali_cmd_alloc (the back half's command buffer
- * header): a new slab, or a dedicated allocation for a large block. */
+ * header): a new slab, or a dedicated allocation for a large block (on v7
+ * a block up to 1 MiB comes from the current 1 MiB slab). */
 MALI_PER_ARCH_DECL(struct mali_ptr, cmd_alloc_slow,
                    (struct mali_cmd_buffer *cmd, uint64_t size, uint64_t align));
 
