@@ -5,8 +5,8 @@
 
 /*
  * The fields of the Bifrost (v7) Renderer State Descriptor that come from
- * a compiled shader, for the static vertex RSD of the shader upload
- * (mali_shader.c) and the fragment RSD, built per pipeline and draw
+ * a compiled shader, for the static vertex and compute RSDs of the shader
+ * upload (mali_shader.c) and the fragment RSD, built per pipeline and draw
  * (mali_pipeline_state.c, mali_jm_cmd_draw_v7.c).
  *
  * Ported from Mesa's src/panfrost/lib/pan_shader.h at PAN_ARCH 7

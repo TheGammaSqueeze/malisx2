@@ -237,13 +237,15 @@ malisx2_vk_v9 = static_library(
 # The job-manager back half a second time at PAN_ARCH 7, for the Bifrost
 # Mali-G52 (mali_v7_*). The same kbase JM frontend and job-chain model as
 # v9; the descriptors are Bifrost's (attribute and varying buffers, the
-# Renderer State Descriptor and its Blend descriptors), after panvk_v7.
+# Renderer State Descriptor, per-type descriptor tables), after panvk_v7.
 malisx2_vk_v7 = static_library(
   'mali_vk_v7',
   _vk_jm_files,
   # The Bifrost draws (a Vertex and a Tiler job each, in place of v9's
-  # mali_jm_cmd_draw.c).
-  files('vk/mali_jm_cmd_draw_v7.c'),
+  # mali_jm_cmd_draw.c); the descriptor tables and the copy jobs, shared by
+  # the v7 draws and dispatches; the Bifrost descriptor lowering.
+  files('vk/mali_jm_cmd_draw_v7.c', 'vk/mali_jm_desc_v7.c',
+        'vk/mali_nir_lower_descriptors_v7.c'),
   _vk_per_arch_files,
   mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
   include_directories : _vk_inc,

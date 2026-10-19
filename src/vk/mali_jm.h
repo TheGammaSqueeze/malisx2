@@ -215,6 +215,29 @@ struct mali_jm_draw_tmpl {
 #define MALI_V7_VARY_BUF_COUNT 3
 
 /*
+ * The v7 descriptor tables of one stage of a draw or dispatch
+ * (mali_shader.h, "Bifrost (v7) descriptor model"): what the Draw
+ * section's Uniform buffers, Textures, Samplers, Attribute buffers and
+ * Attributes pointers take, plus the dynamic storage buffer table and the
+ * set addresses the stage's system values carry. Built by
+ * mali_v7_desc_prepare; the entries that come from the sets are written by
+ * a copy job (mali_v7_desc_copy).
+ */
+struct mali_v7_desc_tables {
+   /* MALI_V7_DESC_TABLE_*, 0 for a table the shader does not have: 8-byte
+    * Uniform Buffer descriptors (the dynamic ones behind the others), the
+    * images' Attribute Buffer pairs, Texture and Sampler descriptors (a
+    * dummy Sampler for a shader with textures and no sampler). */
+   uint64_t tables[MALI_V7_DESC_TABLE_COUNT];
+   uint64_t img_attribs;                      /* the images' Attribute descriptors */
+   uint64_t dyn_ssbos;                        /* the dynamic storage buffer table */
+   uint64_t sets[MALI_MAX_SETS];              /* the bound sets' memory, 0 when unbound */
+   uint32_t set_desc_counts[MALI_MAX_SETS];   /* their slot counts */
+   /* The shader the tables were built for (their layout is its own). */
+   const struct mali_shader *shader;
+};
+
+/*
  * The v7 draw state (mali_jm_cmd_draw_v7.c): what a draw's Vertex and Tiler
  * jobs point at that outlives one draw, rebuilt by the dirty groups named
  * below. A draw packs its two jobs from these and its own counts.
@@ -233,6 +256,7 @@ struct mali_jm_draw_tmpl {
    bool lines;
    /* Per state group. */
    uint64_t fs_rsd;         /* fragment RSD + Blend descriptors (PIPELINE, BLEND, ZSD) */
+   struct mali_v7_desc_tables vs_tab, fs_tab;   /* descriptor tables (VS_SRT, FS_SRT) */
    uint64_t vs_fau, fs_fau; /* push uniform blocks (VS_FAU, FS_FAU) */
    uint64_t viewport;       /* Viewport descriptor (VIEWPORT) */
    uint64_t tiler, tsd;     /* layer 0's Tiler Context, the pass's Local Storage (PASS) */
@@ -272,6 +296,11 @@ struct mali_jm_cmd {
    /* Timing regions (measurement/timing_jm.c); NULL unless
     * MALISX2_MEASURE's "timing" mode is on. */
    struct mali_measure_cmd *measure;
+#if PAN_ARCH < 9
+   /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
+    * copy_tsd), 0 until the first one. */
+   uint64_t copy_tsd;
+#endif
 };
 
 /*
@@ -480,10 +509,10 @@ void mali_jm_draw_tmpl_init(struct mali_jm_draw_tmpl *t);
  *    MALI_JM_PASS_MAX_JOBS, and the barriers owed to the pass's vtc work
  *    were applied by cmd_render_tiler, so a draw takes the chain as it
  *    is). Call it once before jobs that depend on each other, such as a v7
- *    draw's Vertex job and Tiler job: a split between them would leave a
- *    dependency pointing into the closed chain (the chain may pass the
- *    limit by those few jobs). Independent jobs, such as one Fullscreen
- *    job per layer, may take it once each;
+ *    draw's copy jobs, Vertex job and Tiler job: a split between them
+ *    would leave a dependency pointing into the closed chain (the chain
+ *    may pass the limit by those few jobs). Independent jobs, such as one
+ *    Fullscreen job per layer, may take it once each;
  *  - one Tiler Context per layer: mali_jm_pass_tiler(r, layer), layers
  *    0 .. r->td_count - 1 (MALI_LAYERS_PER_TILER_CTX is 1 on v7 and v9);
  *  - the pass's Local Storage descriptor: r->tsd (filled at the end of the
@@ -532,7 +561,41 @@ bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
 
 #if PAN_ARCH < 9
 /* ---------------------------------------------------------------------- */
-/* Bifrost job sizing                                                      */
+/* Bifrost descriptor tables (mali_jm_desc_v7.c)                           */
+
+/*
+ * Allocates a shader's tables in command memory and writes what the CPU
+ * packs (panvk_v7 cmd_prepare_shader_desc_tables): the dynamic uniform
+ * buffers behind the regular ones, the dynamic storage buffer table, the
+ * dummy sampler and the bound sets' addresses. With img false the image
+ * tables are left out: a vertex shader's images live behind the vertex
+ * buffers in the draw's own Attribute Buffer and Attribute tables, which
+ * the draw points tables[MALI_V7_DESC_TABLE_IMG] and img_attribs at. desc
+ * may be NULL for a shader without descriptor sets. False on failure, with
+ * the command buffer's error set.
+ */
+bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                          const struct mali_desc_state *desc, bool img,
+                          struct mali_v7_desc_tables *out);
+
+/*
+ * Writes the table entries that come from the sets (the shader's copy map)
+ * with a Compute job on chain c, one invocation per entry (panvk_v7
+ * meta_get_copy_desc_job). *index: that job's index, the Dependency 1 of
+ * the job that reads the tables; 0 when there is nothing to copy.
+ * attrib_buf_idx_offset: the buffer index the image Attribute descriptors
+ * start at (twice the vertex binding count for a vertex shader, else 0).
+ * False on failure, with the command buffer's error set.
+ */
+bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                       const struct mali_shader *s, const struct mali_v7_desc_tables *t,
+                       uint32_t attrib_buf_idx_offset, uint16_t *index);
+
+/* The v7_desc.sets system values of one stage: the addresses of the bound
+ * sets the shader reads and, at MALI_V7_SETS_DYN_SSBOS, its dynamic
+ * storage buffer table. */
+void mali_v7_desc_sysvals(const struct mali_v7_desc_tables *t, const struct mali_shader *s,
+                          uint64_t sets[MALI_MAX_SETS + 1]);
 
 /*
  * The Invocation section of groups[] workgroups of local[] invocations
@@ -565,6 +628,26 @@ mali_v7_pack_invocation(struct mali_invocation_packed *out, const uint32_t local
       cfg.thread_group_split = graphics ? MALI_SPLIT_MIN_EFFICIENT : cfg.workgroups_x_shift;
    }
 }
+
+/* Compute job sizing: the Invocation section of a dispatch or copy job
+ * (no graphics quirks) and the Parameters' job task split. */
+static inline void
+mali_v7_compute_invocation(struct mali_invocation_packed *out, const uint32_t local[3],
+                           const uint32_t groups[3])
+{
+   mali_v7_pack_invocation(out, local, groups, false);
+}
+
+/* panvk's job_task_split for a dispatch (jm/panvk_vX_cmd_dispatch.c). */
+static inline unsigned
+mali_v7_compute_task_split(const uint32_t local[3])
+{
+   return util_logbase2_ceil(local[0] + 1) + util_logbase2_ceil(local[1] + 1) +
+          util_logbase2_ceil(local[2] + 1);
+}
+
+/* Frees the device's descriptor copy shader. */
+void mali_v7_desc_finish(struct mali_device *dev);
 #endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
@@ -691,6 +774,12 @@ struct mali_jm_device {
 
    /* Atoms of the JOB_SUBMIT being built (only while building). */
    struct mali_jm_build *build;
+
+#if PAN_ARCH < 9
+   /* The descriptor copy shader (mali_jm_desc_v7.c), compiled on first
+    * use under mali_device::meta_lock, unreferenced at device_finish. */
+   struct mali_shader *v7_desc_copy;
+#endif
 
    /* Set for the duration of one vkQueueSubmit when MALISX2_MEASURE's
     * "csf" mode is on (recorder_jm.c calls it "csf" too: one capture

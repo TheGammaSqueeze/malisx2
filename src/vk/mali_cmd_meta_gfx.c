@@ -349,20 +349,13 @@ MALI_PER_ARCH(cmd_pack_plane_texture)(struct mali_cmd_buffer *cmd, const struct 
                                       unsigned plane, enum pipe_format format, unsigned level,
                                       unsigned first_layer, unsigned layer_count, uint32_t out[8])
 {
-#if PAN_ARCH < 9
-   /* Not reached on v7: fb_begin drops the preloads, blits are skipped,
-    * image copies never take the fragment-side copy pass and no v7 image
-    * is AFBC (mali_cmd_image.c). */
-   MALI_V7_UNSUPPORTED("an image plane texture descriptor");
-   return false;
-#else
-   struct mali_ptr p = mali_cmd_alloc(cmd, mali_image_plane_texture_desc_size(layer_count), 64);
+   struct mali_ptr p =
+      mali_cmd_alloc(cmd, mali_image_plane_texture_desc_size(image, layer_count), 64);
    if (!p.cpu)
       return false;
    MALI_PER_ARCH(image_pack_plane_texture)(image, plane, format, level, first_layer, layer_count,
                                            p.cpu, p.gpu, out);
    return true;
-#endif
 }
 
 bool

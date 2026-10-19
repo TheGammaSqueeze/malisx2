@@ -80,10 +80,13 @@ EXCLUDE_FILES = {
 # tests match is hashed only for the architectures every one of them names.
 # The job-manager back half (mali_jm*) is built at 7 and 9, except its
 # draws: mali_jm_cmd_draw.c at 9 and mali_jm_cmd_draw_v7.c at 7. The
-# v7-only sources are named *_v7.c and *_v7.h.
+# v7-only sources are named *_v7.c and *_v7.h. Shaders take their
+# descriptor lowering from mali_nir_lower_descriptors.c on 9 and 11 and
+# from mali_nir_lower_descriptors_v7.c on 7 (mali_shader.c).
 ARCH_ONLY = [
     (lambda rel: rel.startswith('src/vk/mali_jm'), {7, 9}),
     (lambda rel: rel == 'src/vk/mali_jm_cmd_draw.c', {9}),
+    (lambda rel: rel == 'src/vk/mali_nir_lower_descriptors.c', {9, 11}),
     (lambda rel: rel == 'mesa/src/panfrost/genxml/v9.xml', {9}),
     (lambda rel: (rel == 'mesa/src/panfrost/genxml/v7.xml' or
                   rel.endswith(('_v7.c', '_v7.h'))), {7}),

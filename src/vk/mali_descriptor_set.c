@@ -11,9 +11,17 @@
  * into each slot, because Mesa's compiler reads the slots; pool memory
  * and accounting follow the blob.
  *
- * Built per arch. The one hardware difference: v9's Buffer descriptor has
+ * Built per arch. The one v9/v11 difference: v9's Buffer descriptor has
  * no size-hi word (v11 word 5), so buffer sizes are 32 bits there; the
  * T820 blob writes the same v9 fields.
+ *
+ * v7 (Bifrost) keeps the slot layout with panvk_v7's contents
+ * (panvk_vX_descriptor_set.c at PAN_ARCH < 9): a Uniform Buffer
+ * descriptor at the start of a uniform buffer's slot, an address and size
+ * for a storage buffer, attribute descriptors for a storage image
+ * (mali_image_view.c) or a buffer view (below), zero for an unused slot.
+ * Draws and dispatches copy the slots a shader uses, storage buffers
+ * aside, into per-type tables (mali_jm_desc_v7.c).
  */
 
 #ifndef PAN_ARCH
@@ -47,10 +55,6 @@ static_assert(pan_size(NULL_DESCRIPTOR) == MALI_DESCRIPTOR_SIZE, "descriptor siz
 static_assert(pan_size(RESOURCE) == MALI_RESOURCE_SIZE, "descriptor size");
 #endif
 
-/* Where a dynamic buffer bound to nothing points: an address the GPU's
- * memory sink absorbs (panvk). */
-#define MALI_NULL_BUFFER_ADDR (0x8ull << 60)
-
 /* Set memory: CPU read/write, GPU read-only, CPU-uncached, SAME_VA, class
  * DESCRIPTOR_POOL (the blob's pool B). The CPU never reads a set back, so
  * the blob's cached variant for sets with dynamic bindings is not
@@ -61,8 +65,9 @@ static_assert(pan_size(RESOURCE) == MALI_RESOURCE_SIZE, "descriptor size");
 /* Buffer views                                                            */
 
 /* A Buffer descriptor of type Structure over whole texels
- * (pan_buffer_texture_emit). The conversion word is read by shader
- * code, not the hardware, so it comes from Mesa's format table like the
+ * (pan_buffer_texture_emit), or on v7 a 1D Attribute Buffer and an
+ * Attribute (below). The Buffer's conversion word is read by shader code,
+ * not the hardware, so it comes from Mesa's format table like the
  * compiler's expectations. */
 VKAPI_ATTR VkResult VKAPI_CALL
 MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
@@ -77,10 +82,45 @@ MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
 #if PAN_ARCH < 9
-   MALI_V7_UNSUPPORTED("a buffer view");
-   (void)buffer;
-   vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
-   return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+   /*
+    * Bifrost reads a texel buffer as an image: a 1D Attribute Buffer in
+    * bytes 0-15 of the slot and its Attribute in 16-23, as the descriptor
+    * copy takes them (mali_jm_desc_v7.c set_to_table_img_copy; Mesa
+    * pan_buffer.c pan_buffer_texture_emit at PAN_ARCH 6..7). The pointer
+    * is 64-byte aligned, so the address's low 6 bits go into the
+    * Attribute's offset.
+    */
+   const enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.format);
+   const unsigned stride = util_format_get_blocksize(pfmt);
+   const uint64_t addr = mali_buffer_gpu_va(buffer, pCreateInfo->offset);
+   const uint64_t base = addr & ~0x3full;
+   const uint32_t offset = addr & 0x3f;
+   /* The size field is 32 bits: a view that does not fit keeps the whole
+    * texels that do, as on v9. Only maxTexelBufferElements (2^28) texels
+    * of 16 bytes reach 4 GiB. */
+   const uint64_t texels = MIN2(view->vk.elements, (UINT32_MAX - offset) / stride);
+
+   struct {
+      struct mali_attribute_buffer_packed buf;
+      struct mali_attribute_packed attrib;
+      uint32_t pad[2];
+   } desc = {0};
+   static_assert(sizeof(desc) == MALI_DESCRIPTOR_SIZE, "one slot");
+   pan_pack(&desc.buf, ATTRIBUTE_BUFFER, cfg) {
+      cfg.type = MALI_ATTRIBUTE_TYPE_1D;
+      cfg.pointer = base;
+      cfg.stride = stride;
+      cfg.size = (uint32_t)(texels * stride + offset);
+   }
+   pan_pack(&desc.attrib, ATTRIBUTE, cfg) {
+      cfg.format = GENX(pan_format_from_pipe_format)(pfmt)->hw;
+      cfg.offset = offset;
+      cfg.offset_enable = offset != 0;
+   }
+   memcpy(&view->desc, &desc, sizeof(desc));
+
+   *pView = mali_buffer_view_to_handle(view);
+   return VK_SUCCESS;
 #else
    const enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.format);
    const unsigned stride = util_format_get_blocksize(pfmt);
@@ -210,8 +250,20 @@ static void
 pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
 {
 #if PAN_ARCH < 9
-   MALI_V7_UNSUPPORTED("a buffer descriptor");
-   memset(out, 0, MALI_DESCRIPTOR_SIZE);
+   /* panvk_v7 write_buffer_desc: a storage buffer is the address and size
+    * pair the shader reads from the set (struct mali_v7_ssbo_addr), a
+    * uniform buffer a Uniform Buffer descriptor at the start of a zeroed
+    * slot. */
+   if (ssbo) {
+      const struct mali_v7_ssbo_addr entry = mali_v7_ssbo_addr(addr, range);
+      memcpy(out, &entry, sizeof(entry));
+   } else {
+      memset(out, 0, MALI_DESCRIPTOR_SIZE);
+      pan_cast_and_pack(out, UNIFORM_BUFFER, cfg) {
+         cfg.pointer = addr;
+         cfg.entries = mali_v7_ubo_entries(range);
+      }
+   }
 #else
    const uint64_t size = align64(range, ssbo ? 4 : 16);
    pan_cast_and_pack(out, BUFFER, cfg) {
@@ -695,7 +747,8 @@ MALI_PER_ARCH(FreeDescriptorSets)(VkDevice _device, VkDescriptorPool _pool, uint
 /* ---------------------------------------------------------------------- */
 /* Binding (for the command buffer)                                        */
 
-/* The resource table entries, on v9 and v11; v7 has no resource tables. */
+/* The resource table entries, on v9 and v11; v7 has no resource tables
+ * (mali_jm_desc_v7.c packs its dynamic buffers). */
 #if PAN_ARCH >= 9
 void
 MALI_PER_ARCH(descriptor_set_pack_resource)(const struct mali_descriptor_set *set, void *out)

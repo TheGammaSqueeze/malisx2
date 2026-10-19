@@ -311,10 +311,9 @@ mali_diag_should_log(uint32_t *counter, uint32_t *n)
 
 /*
  * A path v7 does not support: logged once per call site, after which the
- * caller skips that work, or fails the object it is creating. A command
- * buffer records no error for it: an error recorded there is what
- * vkEndCommandBuffer returns, and that may not be
- * VK_ERROR_FEATURE_NOT_PRESENT.
+ * caller skips that work. The command buffer records no error for it: an
+ * error recorded there is what vkEndCommandBuffer returns, and that may not
+ * be VK_ERROR_FEATURE_NOT_PRESENT.
  */
 #define MALI_V7_UNSUPPORTED(what)                                              \
    do {                                                                        \

@@ -159,9 +159,17 @@ mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_sha
  * constants the compiler promoted (pan_fau_foreach_imm). Returns the FAU
  * word (address | count << 56), 0 when the shader has no FAU or on
  * failure.
+ *
+ * On v7 the system values also hold the shader's constant data and, from
+ * t, the stage's descriptor set addresses (mali_v7_desc_sysvals); t is
+ * NULL for an internal shader without descriptor sets. A v7 job takes the
+ * address alone.
  */
 static inline uint64_t
 mali_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+#if PAN_ARCH < 9
+                 const struct mali_v7_desc_tables *t,
+#endif
                  const void *push, uint32_t push_size, const uint32_t base[3],
                  const uint32_t groups[3])
 {
@@ -184,6 +192,11 @@ mali_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    sv.local_group_size.y = cs->cs.local_size[1];
    sv.local_group_size.z = cs->cs.local_size[2];
    sv.common.push_uniforms = p.gpu;
+#if PAN_ARCH < 9
+   sv.common.constant_data = cs->v7.data_mem.gpu_va;
+   if (t)
+      mali_v7_desc_sysvals(t, cs, sv.v7_desc.sets);
+#endif
 
    uint64_t pc[MALI_MAX_PUSH_CONST_FAUS];
    memset(pc, 0, sizeof(pc));
@@ -376,8 +389,8 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
    sv->vs.base_instance = d->base_instance;
    sv->vs.noperspective_varyings = p->bind.noperspective;
 #if PAN_ARCH >= 9
-   /* Not on v7: BLEND reads the Blend descriptors from the blend FAU
-    * slots (mali_shader.c lower_sysvals). */
+   /* On v7 these words are v7_desc.sets, which the v7 draw fills: BLEND
+    * reads the Blend descriptors from the blend FAU slots (mali_shader.h). */
    memcpy(sv->fs.blend_descs, d->blend_descs, sizeof(sv->fs.blend_descs));
 #endif
 
@@ -400,6 +413,14 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
       pan_pack(&conv, INTERNAL_CONVERSION, cfg) {
          cfg.memory_format =
             GENX(pan_dithered_format_from_pipe_format)(r->desc.rt[i].format, false);
+#if PAN_ARCH < 9
+         /* The v7 tile load converts into the register format the
+          * conversion names (panvk prepare_iam_sysvals). */
+         const enum pipe_format f = r->desc.rt[i].format;
+         cfg.register_format = util_format_is_pure_uint(f)   ? MALI_REGISTER_FILE_FORMAT_U32
+                               : util_format_is_pure_sint(f) ? MALI_REGISTER_FILE_FORMAT_I32
+                                                             : MALI_REGISTER_FILE_FORMAT_F32;
+#endif
       }
       sv->iam[idx].target = MALI_COLOR_ATTACHMENT(i);
       sv->iam[idx].conversion = conv.opaque[0];
@@ -409,13 +430,34 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
       if (idx < MALI_INPUT_ATTACHMENT_MAP_SIZE) {
          sv->iam[idx].target = MALI_ZS_ATTACHMENT;
          sv->iam[idx].conversion = 0;
+#if PAN_ARCH < 9
+         /* v7 needs the depth format in the conversion; a zero one
+          * faults with INVALID_INSTR_ENC (panvk prepare_iam_sysvals). */
+         if (r->desc.z.image) {
+            struct mali_internal_conversion_packed zconv;
+            pan_pack(&zconv, INTERNAL_CONVERSION, cfg) {
+               cfg.register_format = MALI_REGISTER_FILE_FORMAT_F32;
+               cfg.memory_format =
+                  GENX(pan_dithered_format_from_pipe_format)(r->desc.z.format, false);
+            }
+            sv->iam[idx].conversion = zconv.opaque[0];
+         }
+#endif
       }
    }
    if (ial->stencil_att != MESA_VK_ATTACHMENT_UNUSED) {
       uint32_t idx = ial->stencil_att == MESA_VK_ATTACHMENT_NO_INDEX ? 0 : ial->stencil_att + 1;
       if (idx < MALI_INPUT_ATTACHMENT_MAP_SIZE) {
+#if PAN_ARCH < 9
+         /* A v7 stencil read uses a constant conversion (mali_shader.c
+          * v7_stencil_tile_conv): leave depth's when both share the index. */
+         if (sv->iam[idx].target != MALI_ZS_ATTACHMENT)
+            sv->iam[idx].conversion = 0;
+         sv->iam[idx].target = MALI_ZS_ATTACHMENT;
+#else
          sv->iam[idx].target = MALI_ZS_ATTACHMENT;
          sv->iam[idx].conversion = 0;
+#endif
       }
    }
 }
@@ -621,9 +663,9 @@ mali_gfx_fs_srt(struct mali_cmd_buffer *cmd)
 #else /* PAN_ARCH < 9 */
 
 /* v7 has no resource tables: the v7 draw builds its attribute and varying
- * descriptors itself (mali_jm_cmd_draw_v7.c), and shaders that need
- * descriptor sets, textures, images or uniform buffers are not supported
- * (mali_shader.c). */
+ * descriptors itself (mali_jm_cmd_draw_v7.c), and each stage's
+ * descriptors go through per-type tables, built the same way for draws
+ * and dispatches (mali_jm_desc_v7.c). */
 
 #endif /* PAN_ARCH < 9 */
 
@@ -966,10 +1008,13 @@ mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
       d->dirty |= MALI_GFX_DIRTY_BLEND | MALI_GFX_DIRTY_FS_FAU;
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_RS_LINE_WIDTH))
       d->dirty |= MALI_GFX_DIRTY_PIPELINE;
+#if PAN_ARCH >= 9
+   /* v9+: the attributes live in the VS table (v7 packs them per draw). */
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES) ||
        BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDINGS_VALID))
       d->dirty |= MALI_GFX_DIRTY_VS_SRT;
+#endif
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP))
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
    if (d->pipeline && d->pipeline->bind.dynamic) {
@@ -1063,7 +1108,10 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
    if (d->first_vertex != di->vertex_offset && bd->vs_first_vertex)
       d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    if (d->base_instance != di->first_instance) {
+#if PAN_ARCH >= 9
+      /* The instanced attributes' offsets (in the VS table on v9+). */
       d->dirty |= MALI_GFX_DIRTY_VS_SRT;
+#endif
       if (bd->vs_base_instance)
          d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    }

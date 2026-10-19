@@ -236,18 +236,26 @@ MALI_PER_ARCH_DECL(VkResult, image_view_init_descs,
                    (struct mali_device *dev, struct mali_image_view *view));
 
 /* Bytes of plane descriptors behind a Texture descriptor with `layers`
- * layers of one level (one 32-byte plane descriptor each). */
+ * layers of one level of `image`: one 32-byte plane descriptor per layer,
+ * or on v7 one 16-byte Surface With Stride per layer and sample
+ * (mali_image_view.c). Per-arch code only. */
+#if defined(PAN_ARCH)
 static inline unsigned
-mali_image_plane_texture_desc_size(unsigned layers)
+mali_image_plane_texture_desc_size(const struct mali_image *image, unsigned layers)
 {
+#if PAN_ARCH < 9
+   return layers * MAX2(image->vk.samples, 1) * 16;
+#else
    return layers * 32;
+#endif
 }
+#endif
 
 /* Internal reads of an image plane (render-pass preloads, blits): a 2D
  * Texture descriptor for one level and `layers` layers from first_layer,
  * read as `format` with an identity swizzle. The plane descriptors
- * (mali_image_plane_texture_desc_size bytes, 32-byte aligned) are
- * written to planes_cpu / planes_gpu. */
+ * (mali_image_plane_texture_desc_size bytes, 32-byte aligned, 16-byte on
+ * v7) are written to planes_cpu / planes_gpu. */
 MALI_PER_ARCH_DECL(void, image_pack_plane_texture,
                    (const struct mali_image *image, unsigned plane, enum pipe_format format,
                     unsigned level, unsigned first_layer, unsigned layers, void *planes_cpu,

@@ -41,9 +41,10 @@
  * behind a barrier in its fragment chain.
  *
  * On v7 (Bifrost) the blit pass and the fragment-side copy pass are not
- * supported (their frame shaders draw with meta_fs_dcd): a blit is logged
- * once and skipped, and image copies take the compute copy, whose
- * dispatches are logged once and skipped as well (mali_jm_cmd_dispatch.c).
+ * supported (their frame shaders draw with meta_fs_dcd): image copies take
+ * the compute copy, and so does an unscaled, unflipped colour blit of one
+ * Z slice between identical uncompressed, non-AFBC formats of 1, 2, 4, 8
+ * or 16-byte texels. Any other colour blit is logged once and skipped.
  */
 
 #if PAN_ARCH >= 10
@@ -447,7 +448,8 @@ copy_on_fragment(struct mali_cmd_buffer *cmd, const struct mali_image *src,
 {
 #if PAN_ARCH < 9
    /* The fragment-side copy pass is not supported on v7 (its frame shader
-    * draws with meta_fs_dcd in mali_cmd_meta_gfx.c). */
+    * draws with meta_fs_dcd in mali_cmd_meta_gfx.c): the compute copy
+    * closes the batch instead. */
    return false;
 #elif PAN_ARCH < 10
    return aspect == VK_IMAGE_ASPECT_COLOR_BIT && src->vk.image_type == VK_IMAGE_TYPE_2D &&
@@ -738,10 +740,44 @@ MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInf
          continue;
 
 #if PAN_ARCH < 9
-      /* The blit pass is not supported on v7 (its frame shader draws with
-       * meta_fs_dcd in mali_cmd_meta_gfx.c). */
-      MALI_V7_UNSUPPORTED("a blit");
-      continue;
+      /*
+       * The blit pass is not supported on v7 (its frame shader draws with
+       * meta_fs_dcd in mali_cmd_meta_gfx.c). A colour blit that neither
+       * scales nor flips, between identical uncompressed formats of 1, 2,
+       * 4, 8 or 16-byte texels with no AFBC image and one Z slice, is a raw
+       * copy on the compute copy instead (dispatch_copy, which copies no
+       * other block size). Any other blit is logged once and skipped.
+       */
+      {
+         const int32_t sx0 = r->srcOffsets[0].x, sx1 = r->srcOffsets[1].x;
+         const int32_t sy0 = r->srcOffsets[0].y, sy1 = r->srcOffsets[1].y;
+         const unsigned sbytes = util_format_get_blocksize(sfmt);
+         const bool one_to_one =
+            src->vk.format == dst->vk.format && sx1 > sx0 && sy1 > sy0 &&
+            r->dstOffsets[1].x > r->dstOffsets[0].x && r->dstOffsets[1].y > r->dstOffsets[0].y &&
+            sx1 - sx0 == dx1 - dx0 && sy1 - sy0 == dy1 - dy0 &&
+            r->srcOffsets[1].z - r->srcOffsets[0].z == 1 &&
+            r->dstOffsets[1].z - r->dstOffsets[0].z == 1 &&
+            util_format_get_blockwidth(sfmt) == 1 && util_format_get_blockheight(sfmt) == 1 &&
+            util_is_power_of_two_nonzero(sbytes) && sbytes <= 16 &&
+            !mali_image_is_afbc(src) && !mali_image_is_afbc(dst) &&
+            (r->srcSubresource.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) &&
+            vk_image_subresource_layer_count(&src->vk, &r->srcSubresource) == layers;
+         if (!one_to_one) {
+            MALI_V7_UNSUPPORTED("a blit other than a raw copy");
+            continue;
+         }
+         const bool src3d = src->vk.image_type == VK_IMAGE_TYPE_3D;
+         const bool dst3d = dst->vk.image_type == VK_IMAGE_TYPE_3D;
+         struct copy_surface s, d;
+         image_surface(src, VK_IMAGE_ASPECT_COLOR_BIT, slevel,
+                       src3d ? r->srcOffsets[0].z : r->srcSubresource.baseArrayLayer, &s);
+         image_surface(dst, VK_IMAGE_ASPECT_COLOR_BIT, dlevel,
+                       dst3d ? r->dstOffsets[0].z : r->dstSubresource.baseArrayLayer, &d);
+         dispatch_copy(cmd, &s, sx0, sy0, &d, dx0, dy0, (uint32_t)(dx1 - dx0),
+                       (uint32_t)(dy1 - dy0), layers);
+         continue;
+      }
 #endif
 
       struct mali_meta_fs_key key = {

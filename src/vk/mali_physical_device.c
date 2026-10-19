@@ -739,15 +739,23 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * per set, those of the Renderer State's 16-bit sampler and texture
     * counts and 8-bit uniform buffer count, the Uniform Buffer's 12-bit
     * entry count and the Attribute's 9-bit buffer index
-    * (panvk_descriptor_set_layout.h); per stage, panvk_shader.h's. Warps are
-    * 8 lanes (pan_subgroup_size).
+    * (panvk_descriptor_set_layout.h); per stage, panvk_shader.h's. The
+    * exception is the per-stage sampled image limit: storage images,
+    * storage texel buffers and uniform texel buffers share a stage's image
+    * table of MALI_V7_MAX_STAGE_IMG_ENTRIES (mali_shader.h), and Vulkan
+    * counts uniform texel buffers as sampled images, so that limit is what
+    * the storage images leave of the table. Uniform buffers hold at most
+    * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
+    * (pan_subgroup_size).
     */
    if (p->arch_major == 7) {
+      props->maxUniformBufferRange = 1u << 16;
       props->maxPerStageDescriptorSamplers = 128;
       props->maxPerStageDescriptorUniformBuffers = UINT8_MAX - 32;
       props->maxPerStageDescriptorStorageBuffers = 64;
       props->maxPerStageDescriptorStorageImages = 32;
-      props->maxPerStageDescriptorSampledImages = 256;
+      props->maxPerStageDescriptorSampledImages =
+         MALI_V7_MAX_STAGE_IMG_ENTRIES - props->maxPerStageDescriptorStorageImages;
       props->maxPerStageResources =
          props->maxPerStageDescriptorSamplers + props->maxPerStageDescriptorUniformBuffers +
          props->maxPerStageDescriptorStorageBuffers + props->maxPerStageDescriptorSampledImages +
