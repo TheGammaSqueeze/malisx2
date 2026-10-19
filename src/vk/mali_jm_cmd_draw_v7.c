@@ -53,6 +53,10 @@
 
 #include "mali_cmd_state.h"
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "panfrost/compiler/pan_nir.h"
 #include "util/blend.h"
 #include "util/log.h"
@@ -973,6 +977,70 @@ buffer_written(const struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size)
 }
 
 /*
+ * Min and max of n 16- or 32-bit indices, restart indices (all ones) left
+ * out of the max when restart is on: the min needs no exclusion, a restart
+ * index being the largest value, so a draw of nothing but restart indices
+ * comes out with min > max. Index buffers are often in write-combined
+ * memory (azahar's stream buffer), where every load goes to DRAM: the
+ * loop issues eight 16-byte loads, which the compiler pairs into LDP,
+ * before it uses any, so they are in flight together.
+ */
+#if defined(__aarch64__)
+static void
+scan_u16(const uint16_t *idx, uint32_t n, bool restart, uint32_t *min_out, uint32_t *max_out)
+{
+   uint16x8_t vmin = vdupq_n_u16(UINT16_MAX), vmax = vdupq_n_u16(0);
+   const uint16x8_t all = vdupq_n_u16(UINT16_MAX);
+   uint32_t i = 0;
+   for (; i + 64 <= n; i += 64) {
+      uint16x8_t v[8];
+      for (unsigned k = 0; k < 8; k++)
+         v[k] = vld1q_u16(idx + i + 8 * k);
+      for (unsigned k = 0; k < 8; k++) {
+         vmin = vminq_u16(vmin, v[k]);
+         /* A restart index counts as 0 for the max. */
+         vmax = vmaxq_u16(vmax, restart ? vbicq_u16(v[k], vceqq_u16(v[k], all)) : v[k]);
+      }
+   }
+   uint32_t min = vminvq_u16(vmin), max = vmaxvq_u16(vmax);
+   for (; i < n; i++) {
+      const uint32_t v = idx[i];
+      min = MIN2(min, v);
+      if (!restart || v != UINT16_MAX)
+         max = MAX2(max, v);
+   }
+   *min_out = min;
+   *max_out = max;
+}
+
+static void
+scan_u32(const uint32_t *idx, uint32_t n, bool restart, uint32_t *min_out, uint32_t *max_out)
+{
+   uint32x4_t vmin = vdupq_n_u32(UINT32_MAX), vmax = vdupq_n_u32(0);
+   const uint32x4_t all = vdupq_n_u32(UINT32_MAX);
+   uint32_t i = 0;
+   for (; i + 32 <= n; i += 32) {
+      uint32x4_t v[8];
+      for (unsigned k = 0; k < 8; k++)
+         v[k] = vld1q_u32(idx + i + 4 * k);
+      for (unsigned k = 0; k < 8; k++) {
+         vmin = vminq_u32(vmin, v[k]);
+         vmax = vmaxq_u32(vmax, restart ? vbicq_u32(v[k], vceqq_u32(v[k], all)) : v[k]);
+      }
+   }
+   uint32_t min = vminvq_u32(vmin), max = vmaxvq_u32(vmax);
+   for (; i < n; i++) {
+      const uint32_t v = idx[i];
+      min = MIN2(min, v);
+      if (!restart || v != UINT32_MAX)
+         max = MAX2(max, v);
+   }
+   *min_out = min;
+   *max_out = max;
+}
+#endif
+
+/*
  * The smallest and largest index of the draw, read from the index
  * buffer's CPU view (restart indices skipped when primitive restart is
  * on); *empty when no index is in bounds or every index is a restart index
@@ -1032,8 +1100,14 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
    } while (0)
    switch (size) {
    case 1: SCAN(uint8_t, 0xff); break;
+#if defined(__aarch64__)
+   /* Index buffer offsets are a multiple of the index size. */
+   case 2: scan_u16((const uint16_t *)base, count, restart, &min, &max); break;
+   default: scan_u32((const uint32_t *)base, count, restart, &min, &max); break;
+#else
    case 2: SCAN(uint16_t, 0xffff); break;
    default: SCAN(uint32_t, 0xffffffffu); break;
+#endif
    }
 #undef SCAN
    if (min > max) {
