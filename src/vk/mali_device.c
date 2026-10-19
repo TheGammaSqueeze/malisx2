@@ -282,6 +282,9 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       char layout[192];
       mesa_logi("malisx2 job-manager atom layout: %s",
                 mali_kbase_jm_atom_layout_str(dev->kbase, layout, sizeof(layout)));
+      if (dev->kbase->jm_no_jit)
+         mesa_logi("malisx2 job-manager context without a JIT zone: the kernel refused "
+                   "MEM_JIT_INIT (GPU MMU VA %u bits)", dev->kbase->props.va_bits);
    }
 
    /* Shaders: kraid must be the compiler, code goes to the executable
