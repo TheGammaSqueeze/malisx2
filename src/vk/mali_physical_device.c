@@ -415,6 +415,13 @@ get_features(struct vk_features *f, uint32_t arch)
       .drawIndirectFirstInstance = false,
       .depthClamp = true,
       .depthBiasClamp = true,
+      /* v7 only: clip distances are varyings the fragment shader tests
+       * and discards on (mali_shader.c, "Clip distances"). The test is
+       * per pixel, at the pixel centre, so under multisampling the
+       * clipped edge is not antialiased; and with a fragment shader that
+       * forces early fragment tests, clipped fragments still write depth
+       * and stencil. */
+      .shaderClipDistance = arch == 7,
       .fillModeNonSolid = false,
       .depthBounds = false,
       .wideLines = false,
@@ -749,6 +756,8 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * (pan_subgroup_size).
     */
    if (p->arch_major == 7) {
+      props->maxClipDistances = MALI_V7_MAX_CLIP_DISTANCES;
+      props->maxCombinedClipAndCullDistances = MALI_V7_MAX_CLIP_DISTANCES;
       props->maxUniformBufferRange = 1u << 16;
       props->maxPerStageDescriptorSamplers = 128;
       props->maxPerStageDescriptorUniformBuffers = UINT8_MAX - 32;

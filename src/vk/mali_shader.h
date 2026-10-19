@@ -333,6 +333,11 @@ enum mali_v7_desc_table {
 #define MALI_V7_ATTRIB_BUF_RECORDS 512
 #define MALI_V7_MAX_STAGE_IMG_ENTRIES (MALI_V7_ATTRIB_BUF_RECORDS / 2 - 16)
 
+/* Clip distances on Bifrost: varyings the fragment shader tests, four in
+ * each of VARYING_SLOT_CLIP_DIST0 and 1 (mali_shader.c, "Clip
+ * distances"). */
+#define MALI_V7_MAX_CLIP_DISTANCES 8
+
 struct mali_v7_shader_desc {
    /* Entries of each table copied from sets (the dynamic uniform buffers
     * from desc.dyn_bufs follow count[UBO]). */

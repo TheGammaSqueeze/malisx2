@@ -197,7 +197,11 @@ emit_varying_attrs(struct mali_cmd_buffer *cmd, const struct pan_varying_layout 
          if (!slot)
             continue;
          const gl_varying_slot loc = slot->location;
-         const bool is_hw = loc < VARYING_SLOT_VAR0;
+         /* The hardware varyings (the position, point size and the like)
+          * are the ones outside the generic section: a built-in the layout
+          * keeps in it, such as the clip distances, links as a generic
+          * varying (panvk tests the location against VARYING_SLOT_VAR0). */
+         const bool is_hw = slot->section != PAN_VARYING_SECTION_GENERIC;
          const bool present = is_hw || bit_sizes[loc] != 0;
          enum pipe_format pfmt = PIPE_FORMAT_NONE;
          if (present && !is_hw) {
@@ -255,7 +259,7 @@ link_varyings(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *
    const uint32_t fs_count = fl ? fl->count : 0;
    for (uint32_t i = 0; i < fs_count; i++) {
       const struct pan_varying_slot *fslot = pan_varying_layout_slot_at(fl, i);
-      if (!fslot || fslot->location < VARYING_SLOT_VAR0)
+      if (!fslot || fslot->section != PAN_VARYING_SECTION_GENERIC)
          continue;
       assert(varying_buf(fslot->location) == MALI_V7_VARY_BUF_GENERAL);
       const struct pan_varying_slot *vslot = pan_varying_layout_find_slot(vl, fslot->location);

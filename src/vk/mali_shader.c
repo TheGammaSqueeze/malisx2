@@ -30,7 +30,9 @@
  *  - the BLEND instructions read the Blend descriptors from the hardware's
  *    blend FAU slots, not from system values;
  *  - jobs point at Renderer State Descriptors (RSDs) instead of SPDs
- *    (shader_upload).
+ *    (shader_upload);
+ *  - clip distances are a discard in the fragment shader
+ *    ("Clip distances").
  */
 
 #ifndef PAN_ARCH
@@ -1287,6 +1289,106 @@ v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
    nir_src_rewrite(&intr->src[2], nir_imm_int(b, conv.opaque[0]));
    return true;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Clip distances                                                          */
+
+/*
+ * Bifrost has no clip distance hardware. As Mesa's gallium driver does for
+ * user clip planes (nir_lower_clip_fs), the distances are varyings, and the
+ * fragment shader discards a fragment whose interpolated distance is
+ * negative.
+ *
+ * The vertex shader keeps gl_ClipDistance as vk_spirv_to_nir leaves it: a
+ * compact float array, whatever its name (a gl_PerVertex member is
+ * ".gl_ClipDistance", and stripped SPIR-V has none). nir_lower_io stores
+ * its element i in component i % 4 of VARYING_SLOT_CLIP_DIST0 + i / 4, so
+ * the vertex shader's varying layout has a slot for each of the two
+ * locations it writes, as wide as the components it writes there. The
+ * fragment shader is compiled against that layout (its key includes the
+ * vertex stage, mali_pipeline.c) and tests exactly those components.
+ *
+ * A pipeline without a fragment shader gets one that does nothing else
+ * (mali_pipeline.c clip_fs_compile).
+ *
+ * The result is that of clipping the primitive, except that:
+ *  - the distance is interpolated at the pixel centre, so under
+ *    multisampling the clipped edge is not antialiased;
+ *  - the discard makes the depth/stencil update late
+ *    (mali_pipeline_state.c earlyzs_get), but with a fragment shader that
+ *    forces early fragment tests, depth and stencil are written before the
+ *    shader runs, so clipped fragments still write them.
+ */
+
+/*
+ * The fragment shader's gl_ClipDistance input, a compact float array at
+ * VARYING_SLOT_CLIP_DIST0 with at least `count` elements: the shader's
+ * own, lengthened when it declares fewer, or a new one. Its elements lower
+ * to the components the vertex shader writes, as the vertex shader's do.
+ */
+static nir_variable *
+clip_distance_input(nir_shader *nir, unsigned count)
+{
+   const struct glsl_type *type = glsl_array_type(glsl_float_type(), count, 0);
+   nir_variable *var =
+      nir_find_variable_with_location(nir, nir_var_shader_in, VARYING_SLOT_CLIP_DIST0);
+
+   if (!var) {
+      var = nir_variable_create(nir, nir_var_shader_in, type, "gl_ClipDistance");
+      var->data.location = VARYING_SLOT_CLIP_DIST0;
+      var->data.compact = true;
+   } else if (glsl_get_length(var->type) < count) {
+      /* The variable's derefs carry its type too. */
+      var->type = type;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_deref)
+                  continue;
+               nir_deref_instr *deref = nir_instr_as_deref(instr);
+               if (deref->deref_type == nir_deref_type_var && deref->var == var)
+                  deref->type = type;
+            }
+         }
+      }
+   }
+   assert(var->data.compact);
+
+   nir->info.clip_distance_array_size =
+      MAX2(nir->info.clip_distance_array_size, glsl_get_length(var->type));
+   return var;
+}
+
+/* The discard for every clip distance the vertex shader writes
+ * (vs_layout), before the fragment shader's input locations are assigned. */
+static void
+lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layout)
+{
+   if (!vs_layout)
+      return;
+   const struct pan_varying_slot *slots[2] = {
+      pan_varying_layout_find_slot(vs_layout, VARYING_SLOT_CLIP_DIST0),
+      pan_varying_layout_find_slot(vs_layout, VARYING_SLOT_CLIP_DIST1),
+   };
+   if (!slots[0] && !slots[1])
+      return;
+
+   nir_variable *in = clip_distance_input(nir, slots[1] ? 4 + slots[1]->ncomps
+                                                        : slots[0]->ncomps);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *clip = nir_imm_false(&b);
+   for (unsigned i = 0; i < 2; i++) {
+      for (unsigned c = 0; slots[i] && c < slots[i]->ncomps; c++) {
+         nir_def *d = nir_load_array_var_imm(&b, in, 4 * i + c);
+         clip = nir_ior(&b, clip, nir_flt_imm(&b, d, 0.0));
+      }
+   }
+   nir_discard_if(&b, clip);
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_control_flow);
+}
 #endif
 
 /* ---------------------------------------------------------------------- */
@@ -1841,6 +1943,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
 #if PAN_ARCH < 9
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_stencil_tile_conv,
                nir_metadata_control_flow, NULL);
+      lower_clip_distance_fs(nir, info->vs_varying_layout);
 #endif
       /* Input slots first: their count sizes the front of the driver
        * table (mali_shader.h). */
