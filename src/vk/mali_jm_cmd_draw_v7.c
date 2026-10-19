@@ -46,11 +46,11 @@
  * rebuilt gets a descriptor copy job (a Compute job) in front of the
  * Vertex job, the vertex shader's before the fragment shader's. A stage
  * whose FAU block holds uniform buffer words gets a job that copies them
- * in, the vertex shader's also in front of the Vertex job. The Vertex
- * job's Dependency 1 is the vertex shader's last copy job, the Tiler
- * job's Dependency 1 the Vertex job and its Dependency 2 the previous
- * tiler-side job. A pending barrier goes to the draw's first job, and to
- * the Vertex job as well when that first job is the fragment copy.
+ * in, also in front of the Vertex job. The Vertex job's Dependency 1 is
+ * the vertex shader's last copy job, the Tiler job's Dependency 1 the
+ * Vertex job and its Dependency 2 the previous tiler-side job. A pending
+ * barrier goes to the draw's first job, and to the Vertex job as well
+ * when that first job is a fragment shader's copy.
  */
 
 #include "mali_cmd_state.h"
@@ -1198,32 +1198,56 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 
    struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
 
-   /* The descriptor copies of the stages whose tables were rebuilt and the
-    * vertex shader's uniform buffer word copy go in front of the Vertex job
-    * (panvk_cmd_draw). The Vertex job depends on the vertex shader's; the
-    * fragment shader's tables are read by the fragment job, which follows
-    * the whole vtc atom. A barrier pending on the chain goes to the first of
-    * these jobs, and to the Vertex job too when that is the fragment copy,
-    * which the Vertex job does not wait for. */
+   /* The descriptor copies of the stages whose tables were rebuilt and
+    * their uniform buffer word copies go in front of the Vertex job
+    * (panvk_cmd_draw), the vertex shader's before the fragment shader's.
+    * The Vertex job depends on the vertex shader's. The fragment shader's
+    * are for the fragment job, which follows the whole vtc atom, so no
+    * job here waits for them. A barrier pending on the chain goes to the
+    * first of these jobs, and to the Vertex job too when that is a
+    * fragment shader's copy, which the Vertex job does not wait for.
+    *
+    * An earlier draw's Tiler job goes in behind this draw's Vertex job
+    * (MALI_V7_TILER_DEFER, struct mali_jm_cmd::pend_tiler): the job manager
+    * starts a chain's jobs in order and a job waits for its dependencies,
+    * so a Tiler job right behind its own Vertex job would hold the next
+    * draw's jobs until that vertex shader is done. While tiler_defer is
+    * set, this draw's copy jobs and Vertex job go in ahead of the pending
+    * Tiler jobs (mali_jm_cmd_add_job). The Tiler jobs stay in draw order
+    * among themselves (Dependency 2). With a barrier pending they are
+    * linked first, so that it orders this draw's jobs after them. */
    const bool pending = c->pending != 0;
-   uint16_t vs_copy = 0, fs_copy = 0;
+   const bool defer = !pending;
+   if (!defer)
+      mali_v7_link_tilers(cmd, 0);
+   cmd->jm.tiler_defer = defer;
+   uint16_t vs_copy = 0, fs_copy = 0, fs_ubo = 0;
    if (dd.vs_copy &&
        !mali_v7_desc_copy(cmd, c, p->vs, &t->vs_tab, dd.vs_img_buf_offset, &vs_copy))
-      return;
+      goto fail;
    /* The vertex shader's uniform buffer words, which the Vertex job reads
     * from its FAU block: a copy job between the descriptor copy and it. */
    uint16_t vs_dep = vs_copy;
    if (dd.vs_ubo_copy &&
        !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
-      return;
+      goto fail;
    if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, &fs_copy))
-      return;
-
+      goto fail;
+   /* The fragment shader's uniform buffer words, which only the fragment
+    * job reads. */
+   if (tiling && dd.fs_ubo_copy &&
+       !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
+      goto fail;
    struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
-                                            pending && !vs_dep && fs_copy, vs_dep);
+                                            pending && !vs_dep && (fs_copy || fs_ubo), vs_dep);
+   cmd->jm.tiler_defer = false;
    if (!vj.cpu)
       return;
    const uint16_t vertex_index = c->index;
+   /* The Tiler job of the draw MALI_V7_TILER_DEFER draws back goes in
+    * behind this Vertex job. */
+   if (defer)
+      mali_v7_link_tilers(cmd, MALI_V7_TILER_DEFER - 1);
 
    /* The Vertex job (panvk_draw_prepare_vertex_job, panvk_emit_vertex_dcd). */
    memcpy(pan_section_ptr(vj.cpu, COMPUTE_JOB, INVOCATION), &invocation, sizeof(invocation));
@@ -1246,8 +1270,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
 
    if (tiling) {
-      struct mali_ptr tj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_TILER, pan_size(TILER_JOB),
-                                               false, vertex_index);
+      /* The Tiler job is written here, its header and link when it goes
+       * into the chain (mali_v7_link_tilers): behind a later draw's Vertex
+       * job, in front of any other job, or when the batch closes. */
+      struct mali_ptr tj = mali_cmd_alloc(cmd, pan_size(TILER_JOB), 128);
       if (!tj.cpu)
          return;
 
@@ -1309,10 +1335,12 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       dcd.opaque[0] |= t->dcd0;
       memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
 
-      /* The fragment shader's uniform buffer words: no job here depends
-       * on the copy, as the fragment job reads them after the vtc atom. */
-      if (dd.fs_ubo_copy && !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, NULL))
-         return;
+      assert(cmd->jm.pend_tilers < MALI_V7_TILER_DEFER);
+      cmd->jm.pend_tiler[cmd->jm.pend_tilers] = tj;
+      cmd->jm.pend_tiler_dep1[cmd->jm.pend_tilers] = vertex_index;
+      cmd->jm.pend_tilers++;
+      if (!defer)
+         mali_v7_link_tilers(cmd, 0);
    }
 
    /* Heap use: polygon-list entries only, the varyings being in command
@@ -1321,6 +1349,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    cmd->jm.cur.draws++;
    r->draws++;
    cmd->draws++;
+   return;
+
+fail:
+   cmd->jm.tiler_defer = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL

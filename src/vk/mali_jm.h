@@ -267,6 +267,15 @@ struct mali_jm_draw_tmpl {
 #endif
 
 #if PAN_ARCH < 9
+/* How many draws later a draw's Tiler job goes into the chain
+ * (mali_jm_cmd_draw_v7.c), and so how many can be pending. The job manager
+ * starts a chain's jobs in order and holds a Tiler job, and every job
+ * behind it, until the Tiler job's Vertex job is done. With 2 the Tiler
+ * job goes in behind the Vertex jobs of the next two draws, which keep the
+ * shader cores busy through that wait; with 1, behind only the next
+ * draw's, which can finish first and leave them idle. */
+#define MALI_V7_TILER_DEFER 2
+
 /* A range [start, end) of GPU addresses. */
 struct mali_v7_range {
    uint64_t start, end;
@@ -304,6 +313,17 @@ struct mali_jm_cmd {
     * MALISX2_MEASURE's "timing" mode is on. */
    struct mali_measure_cmd *measure;
 #if PAN_ARCH < 9
+   /* Tiler jobs written and waiting to be linked into the open batch's
+    * vtc chain (mali_v7_link_tilers). Each goes in behind the Vertex job
+    * of the draw MALI_V7_TILER_DEFER draws later, in front of any other
+    * job, or at batch close, whichever comes first. dep1 is each one's
+    * Vertex job. tiler_defer is set while a draw adds its copy jobs and
+    * its Vertex job, the only jobs that go in ahead of the pending ones
+    * (mali_jm_cmd_add_job). */
+   struct mali_ptr pend_tiler[MALI_V7_TILER_DEFER];
+   uint16_t pend_tiler_dep1[MALI_V7_TILER_DEFER];
+   uint8_t pend_tilers;          /* pending, oldest first */
+   bool tiler_defer;
    /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
     * copy_tsd), 0 until the first one. */
    uint64_t copy_tsd;
@@ -457,9 +477,12 @@ void mali_jm_cmd_mark_frag_transfer(struct mali_cmd_buffer *cmd);
  * (type, the next index, Barrier from the chain's pending barrier or
  * `barrier`, Dependency 1 = dep1, Dependency 2 = the previous tiler-side
  * job for a tiler-side job, Next = 0) and linked behind the chain's last
- * job. A pending Cache Flush job goes in first. The caller writes the
- * payload, every byte of it (slabs are recycled without clearing). {0} on
- * failure, with the command buffer's error set.
+ * job. A pending Cache Flush job goes in first. On v7 the pending Tiler
+ * jobs (struct mali_jm_cmd::pend_tiler) are linked into the open batch's
+ * vtc chain before anything else, whatever chain c is, unless a draw holds
+ * them back (tiler_defer). The caller writes the payload, every byte of it
+ * (slabs are recycled without clearing). {0} on failure, with the command
+ * buffer's error set.
  */
 struct mali_ptr mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                                     enum mali_job_type type, unsigned size, bool barrier,
@@ -486,6 +509,12 @@ mali_jm_chain_link(struct mali_jm_chain *c, struct mali_ptr job, uint16_t index,
    if (tiler_side)
       c->tiler_dep = index;
 }
+
+#if PAN_ARCH < 9
+/* Links the pending Tiler jobs (struct mali_jm_cmd::pend_tiler), oldest
+ * first, into the open batch's vtc chain until at most keep are left. */
+void mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep);
+#endif
 
 /* A Write Value job on chain c (timestamps, availability, tests). */
 bool mali_jm_cmd_write_value(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,

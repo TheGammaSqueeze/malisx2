@@ -8,7 +8,9 @@
  * job chains, job writing and linking, barriers, begin/end, and what a
  * command buffer that runs more than once needs restored.
  *
- * Every vkCmd* writes finished jobs when it is recorded. A command
+ * Every vkCmd* writes finished jobs when it is recorded, except a v7 draw's
+ * Tiler job, whose header and link are written when it goes into the chain
+ * (mali_v7_link_tilers), at the latest when the batch closes. A command
  * buffer is a list of batches (mali_jm.h); a batch is one vertex/tiler/
  * compute ("vtc") job chain, which runs as one atom on job slot 1, and
  * fragment segments, each a fragment chain that runs as one atom on slot 0
@@ -330,10 +332,40 @@ chain_has_room(struct mali_cmd_buffer *cmd, const struct mali_jm_chain *c)
    return false;
 }
 
+#if PAN_ARCH < 9
+void
+mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep)
+{
+   struct mali_jm_cmd *jm = &cmd->jm;
+   if (jm->pend_tilers <= keep)
+      return;
+   assert(jm->open);
+   struct mali_jm_chain *c = &jm->cur.vtc;
+   const unsigned n = jm->pend_tilers - keep;
+   for (unsigned i = 0; i < n; i++) {
+      if (!chain_has_room(cmd, c))
+         break;
+      link_job(cmd, c, jm->pend_tiler[i], MALI_JOB_TYPE_TILER, false, jm->pend_tiler_dep1[i]);
+   }
+   for (unsigned i = 0; i < keep; i++) {
+      jm->pend_tiler[i] = jm->pend_tiler[n + i];
+      jm->pend_tiler_dep1[i] = jm->pend_tiler_dep1[n + i];
+   }
+   jm->pend_tilers = keep;
+}
+#endif
+
 struct mali_ptr
 mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                     enum mali_job_type type, unsigned size, bool barrier, uint16_t dep1)
 {
+#if PAN_ARCH < 9
+   /* Every job but a draw's copy jobs and its Vertex job, which go in
+    * while tiler_defer is set (mali_jm_cmd_draw_v7.c), goes in behind the
+    * pending Tiler jobs. */
+   if (unlikely(cmd->jm.pend_tilers) && !cmd->jm.tiler_defer)
+      mali_v7_link_tilers(cmd, 0);
+#endif
    if (!chain_has_room(cmd, c))
       return (struct mali_ptr){0};
 
@@ -428,6 +460,9 @@ mali_jm_cmd_batch_close(struct mali_cmd_buffer *cmd)
 {
    if (!cmd->jm.open)
       return;
+#if PAN_ARCH < 9
+   mali_v7_link_tilers(cmd, 0);
+#endif
    cmd->jm.open = false;
    struct mali_jm_batch *b = &cmd->jm.cur;
    if (!b->vtc.jobs && !batch_has_frag_jobs(cmd)) {
@@ -878,6 +913,8 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->jm.reset_data);
    cmd->jm.open = false;
 #if PAN_ARCH < 9
+   cmd->jm.pend_tilers = 0;
+   cmd->jm.tiler_defer = false;
    cmd->jm.copy_tsd = 0;
    util_dynarray_clear(&cmd->jm.buf_writes);
 #endif
