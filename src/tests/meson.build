@@ -165,7 +165,11 @@ executable(
 # per stage) rebound before every draw with new offsets for one stage, the
 # same offsets or through a second set, two pipeline objects of one state,
 # overlapping draws whose order decides the result; submitted twice with
-# new uniform contents for the second run.
+# new uniform contents for the second run. Then the set switch cases: two
+# sets of a layout holding one dynamic uniform or storage buffer (no
+# descriptor slots), read by the fragment or the vertex shader, bound one
+# after the other at the same offset (0 or not) for two draws, each of which
+# must read its own set's buffer.
 executable(
   'dyn_g52',
   files('dyn_g52.c'),

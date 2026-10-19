@@ -39,6 +39,29 @@
  * twice (it is not one-time-submit): before the second run the host
  * rewrites the fragment colours, which the second readback must show.
  *
+ * Then the set switch cases, each its own pass into the same image (cleared
+ * to black): a pipeline layout whose set 0 holds one binding, a dynamic
+ * uniform or storage buffer, so the set has no descriptor slots of its own,
+ * only the dynamic buffer. Set A points at buffer X holding colour 1, set B
+ * at buffer Y holding colour 2 (both 16 bytes at the bound offset). Set A is
+ * bound and a quad drawn over the left half, then set B at the same dynamic
+ * offset and a quad over the right half, one pipeline throughout. Expected:
+ * the left half in colour 1, the right half in colour 2. A driver that
+ * matches the bound sets by their descriptor memory and slot count (address
+ * 0 and no slots for every such set, so A and B look alike) and keeps a
+ * stage's descriptor tables and FAU uniform words when those sets come
+ * with unchanged offsets draws the right half in colour 1. The cases are
+ * every combination of
+ *
+ *   - UNIFORM_BUFFER_DYNAMIC (read at a constant offset, which the driver
+ *     may push into FAU) or STORAGE_BUFFER_DYNAMIC;
+ *   - visible to and read by the fragment shader, or by the vertex shader,
+ *     which hands the colour on as a flat varying;
+ *   - both sets bound at offset 0, or both at the same non-zero offset (the
+ *     largest of 256 and the device's uniform and storage buffer offset
+ *     alignments; offset 0 of X and Y then holds a decoy colour of its own,
+ *     which a dropped offset would show).
+ *
  * Shaders (glslangValidator 16.6.0, -V --target-env vulkan1.1):
  *
  *   dyn.vert:  #version 450
@@ -50,6 +73,39 @@
  *              layout(location = 0) out vec4 color;
  *              layout(set = 0, binding = 1) uniform F { vec4 c; } f;
  *              void main() { color = f.c; }
+ *
+ *   The set switch cases:
+ *
+ *   sw.vert:       #version 450
+ *                  layout(location = 0) in vec2 pos;
+ *                  void main() { gl_Position = vec4(pos, 0.5, 1.0); }
+ *
+ *   sw_ubo.frag:   #version 450
+ *                  layout(location = 0) out vec4 color;
+ *                  layout(set = 0, binding = 0) uniform C { vec4 c; } u;
+ *                  void main() { color = u.c; }
+ *
+ *   sw_ssbo.frag:  #version 450
+ *                  layout(location = 0) out vec4 color;
+ *                  layout(set = 0, binding = 0, std430) readonly buffer C { vec4 c; } b;
+ *                  void main() { color = b.c; }
+ *
+ *   sw_ubo.vert:   #version 450
+ *                  layout(location = 0) in vec2 pos;
+ *                  layout(location = 0) flat out vec4 v_color;
+ *                  layout(set = 0, binding = 0) uniform C { vec4 c; } u;
+ *                  void main() { gl_Position = vec4(pos, 0.5, 1.0); v_color = u.c; }
+ *
+ *   sw_ssbo.vert:  #version 450
+ *                  layout(location = 0) in vec2 pos;
+ *                  layout(location = 0) flat out vec4 v_color;
+ *                  layout(set = 0, binding = 0, std430) readonly buffer C { vec4 c; } b;
+ *                  void main() { gl_Position = vec4(pos, 0.5, 1.0); v_color = b.c; }
+ *
+ *   sw_flat.frag:  #version 450
+ *                  layout(location = 0) flat in vec4 v_color;
+ *                  layout(location = 0) out vec4 color;
+ *                  void main() { color = v_color; }
  *
  * Usage: dyn_g52 [path/to/libvulkan_malisx2.so]
  *   The path defaults to $MALISX2_ICD, then to DYN_G52_DEFAULT_ICD.
@@ -72,6 +128,8 @@
 #define SENTINEL 0xa5
 #define VS_SLOTS (CELLS + 3 + 1)   /* the cells, the three row-7 rects, full screen */
 #define FS_SLOTS (CELLS / 4 + 3 + 3)
+#define SW_HALF (IMG_W / 2)        /* set switch cases: the left quad's width */
+#define SW_CASES 8u
 
 /* ---------------------------------------------------------------------- */
 /* Shaders (see the file comment)                                          */
@@ -150,6 +208,214 @@ static const uint32_t dyn_frag_spv[] = {
    0x000200f8, 0x00000005, 0x00050041, 0x0000000f, 0x00000010, 0x0000000c,
    0x0000000e, 0x0004003d, 0x00000007, 0x00000011, 0x00000010, 0x0003003e,
    0x00000009, 0x00000011, 0x000100fd, 0x00010038,
+};
+
+/* The set switch cases. */
+
+static const uint32_t sw_vert_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x0000001b, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000000,
+   0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000012, 0x00030003,
+   0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
+   0x00060005, 0x0000000b, 0x505f6c67, 0x65567265, 0x78657472, 0x00000000,
+   0x00060006, 0x0000000b, 0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69,
+   0x00070006, 0x0000000b, 0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953,
+   0x00000000, 0x00070006, 0x0000000b, 0x00000002, 0x435f6c67, 0x4470696c,
+   0x61747369, 0x0065636e, 0x00070006, 0x0000000b, 0x00000003, 0x435f6c67,
+   0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d, 0x00000000,
+   0x00030005, 0x00000012, 0x00736f70, 0x00030047, 0x0000000b, 0x00000002,
+   0x00050048, 0x0000000b, 0x00000000, 0x0000000b, 0x00000000, 0x00050048,
+   0x0000000b, 0x00000001, 0x0000000b, 0x00000001, 0x00050048, 0x0000000b,
+   0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000000b, 0x00000003,
+   0x0000000b, 0x00000004, 0x00040047, 0x00000012, 0x0000001e, 0x00000000,
+   0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+   0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
+   0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0004002b, 0x00000008,
+   0x00000009, 0x00000001, 0x0004001c, 0x0000000a, 0x00000006, 0x00000009,
+   0x0006001e, 0x0000000b, 0x00000007, 0x00000006, 0x0000000a, 0x0000000a,
+   0x00040020, 0x0000000c, 0x00000003, 0x0000000b, 0x0004003b, 0x0000000c,
+   0x0000000d, 0x00000003, 0x00040015, 0x0000000e, 0x00000020, 0x00000001,
+   0x0004002b, 0x0000000e, 0x0000000f, 0x00000000, 0x00040017, 0x00000010,
+   0x00000006, 0x00000002, 0x00040020, 0x00000011, 0x00000001, 0x00000010,
+   0x0004003b, 0x00000011, 0x00000012, 0x00000001, 0x0004002b, 0x00000006,
+   0x00000014, 0x3f000000, 0x0004002b, 0x00000006, 0x00000015, 0x3f800000,
+   0x00040020, 0x00000019, 0x00000003, 0x00000007, 0x00050036, 0x00000002,
+   0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d,
+   0x00000010, 0x00000013, 0x00000012, 0x00050051, 0x00000006, 0x00000016,
+   0x00000013, 0x00000000, 0x00050051, 0x00000006, 0x00000017, 0x00000013,
+   0x00000001, 0x00070050, 0x00000007, 0x00000018, 0x00000016, 0x00000017,
+   0x00000014, 0x00000015, 0x00050041, 0x00000019, 0x0000001a, 0x0000000d,
+   0x0000000f, 0x0003003e, 0x0000001a, 0x00000018, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t sw_ubo_frag_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x00000012, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000004,
+   0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
+   0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+   0x6e69616d, 0x00000000, 0x00040005, 0x00000009, 0x6f6c6f63, 0x00000072,
+   0x00030005, 0x0000000a, 0x00000043, 0x00040006, 0x0000000a, 0x00000000,
+   0x00000063, 0x00030005, 0x0000000c, 0x00000075, 0x00040047, 0x00000009,
+   0x0000001e, 0x00000000, 0x00030047, 0x0000000a, 0x00000002, 0x00050048,
+   0x0000000a, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000000c,
+   0x00000021, 0x00000000, 0x00040047, 0x0000000c, 0x00000022, 0x00000000,
+   0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+   0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
+   0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008,
+   0x00000009, 0x00000003, 0x0003001e, 0x0000000a, 0x00000007, 0x00040020,
+   0x0000000b, 0x00000002, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c,
+   0x00000002, 0x00040015, 0x0000000d, 0x00000020, 0x00000001, 0x0004002b,
+   0x0000000d, 0x0000000e, 0x00000000, 0x00040020, 0x0000000f, 0x00000002,
+   0x00000007, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+   0x000200f8, 0x00000005, 0x00050041, 0x0000000f, 0x00000010, 0x0000000c,
+   0x0000000e, 0x0004003d, 0x00000007, 0x00000011, 0x00000010, 0x0003003e,
+   0x00000009, 0x00000011, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t sw_ssbo_frag_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x00000012, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000004,
+   0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
+   0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+   0x6e69616d, 0x00000000, 0x00040005, 0x00000009, 0x6f6c6f63, 0x00000072,
+   0x00030005, 0x0000000a, 0x00000043, 0x00040006, 0x0000000a, 0x00000000,
+   0x00000063, 0x00030005, 0x0000000c, 0x00000062, 0x00040047, 0x00000009,
+   0x0000001e, 0x00000000, 0x00030047, 0x0000000a, 0x00000002, 0x00040048,
+   0x0000000a, 0x00000000, 0x00000018, 0x00050048, 0x0000000a, 0x00000000,
+   0x00000023, 0x00000000, 0x00030047, 0x0000000c, 0x00000018, 0x00040047,
+   0x0000000c, 0x00000021, 0x00000000, 0x00040047, 0x0000000c, 0x00000022,
+   0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+   0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+   0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b,
+   0x00000008, 0x00000009, 0x00000003, 0x0003001e, 0x0000000a, 0x00000007,
+   0x00040020, 0x0000000b, 0x0000000c, 0x0000000a, 0x0004003b, 0x0000000b,
+   0x0000000c, 0x0000000c, 0x00040015, 0x0000000d, 0x00000020, 0x00000001,
+   0x0004002b, 0x0000000d, 0x0000000e, 0x00000000, 0x00040020, 0x0000000f,
+   0x0000000c, 0x00000007, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+   0x00000003, 0x000200f8, 0x00000005, 0x00050041, 0x0000000f, 0x00000010,
+   0x0000000c, 0x0000000e, 0x0004003d, 0x00000007, 0x00000011, 0x00000010,
+   0x0003003e, 0x00000009, 0x00000011, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t sw_ubo_vert_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x00000022, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000000,
+   0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000012, 0x0000001b,
+   0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
+   0x00000000, 0x00060005, 0x0000000b, 0x505f6c67, 0x65567265, 0x78657472,
+   0x00000000, 0x00060006, 0x0000000b, 0x00000000, 0x505f6c67, 0x7469736f,
+   0x006e6f69, 0x00070006, 0x0000000b, 0x00000001, 0x505f6c67, 0x746e696f,
+   0x657a6953, 0x00000000, 0x00070006, 0x0000000b, 0x00000002, 0x435f6c67,
+   0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000000b, 0x00000003,
+   0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d,
+   0x00000000, 0x00030005, 0x00000012, 0x00736f70, 0x00040005, 0x0000001b,
+   0x6f635f76, 0x00726f6c, 0x00030005, 0x0000001c, 0x00000043, 0x00040006,
+   0x0000001c, 0x00000000, 0x00000063, 0x00030005, 0x0000001e, 0x00000075,
+   0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000,
+   0x0000000b, 0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x0000000b,
+   0x00000001, 0x00050048, 0x0000000b, 0x00000002, 0x0000000b, 0x00000003,
+   0x00050048, 0x0000000b, 0x00000003, 0x0000000b, 0x00000004, 0x00040047,
+   0x00000012, 0x0000001e, 0x00000000, 0x00030047, 0x0000001b, 0x0000000e,
+   0x00040047, 0x0000001b, 0x0000001e, 0x00000000, 0x00030047, 0x0000001c,
+   0x00000002, 0x00050048, 0x0000001c, 0x00000000, 0x00000023, 0x00000000,
+   0x00040047, 0x0000001e, 0x00000021, 0x00000000, 0x00040047, 0x0000001e,
+   0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+   0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
+   0x00000006, 0x00000004, 0x00040015, 0x00000008, 0x00000020, 0x00000000,
+   0x0004002b, 0x00000008, 0x00000009, 0x00000001, 0x0004001c, 0x0000000a,
+   0x00000006, 0x00000009, 0x0006001e, 0x0000000b, 0x00000007, 0x00000006,
+   0x0000000a, 0x0000000a, 0x00040020, 0x0000000c, 0x00000003, 0x0000000b,
+   0x0004003b, 0x0000000c, 0x0000000d, 0x00000003, 0x00040015, 0x0000000e,
+   0x00000020, 0x00000001, 0x0004002b, 0x0000000e, 0x0000000f, 0x00000000,
+   0x00040017, 0x00000010, 0x00000006, 0x00000002, 0x00040020, 0x00000011,
+   0x00000001, 0x00000010, 0x0004003b, 0x00000011, 0x00000012, 0x00000001,
+   0x0004002b, 0x00000006, 0x00000014, 0x3f000000, 0x0004002b, 0x00000006,
+   0x00000015, 0x3f800000, 0x00040020, 0x00000019, 0x00000003, 0x00000007,
+   0x0004003b, 0x00000019, 0x0000001b, 0x00000003, 0x0003001e, 0x0000001c,
+   0x00000007, 0x00040020, 0x0000001d, 0x00000002, 0x0000001c, 0x0004003b,
+   0x0000001d, 0x0000001e, 0x00000002, 0x00040020, 0x0000001f, 0x00000002,
+   0x00000007, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+   0x000200f8, 0x00000005, 0x0004003d, 0x00000010, 0x00000013, 0x00000012,
+   0x00050051, 0x00000006, 0x00000016, 0x00000013, 0x00000000, 0x00050051,
+   0x00000006, 0x00000017, 0x00000013, 0x00000001, 0x00070050, 0x00000007,
+   0x00000018, 0x00000016, 0x00000017, 0x00000014, 0x00000015, 0x00050041,
+   0x00000019, 0x0000001a, 0x0000000d, 0x0000000f, 0x0003003e, 0x0000001a,
+   0x00000018, 0x00050041, 0x0000001f, 0x00000020, 0x0000001e, 0x0000000f,
+   0x0004003d, 0x00000007, 0x00000021, 0x00000020, 0x0003003e, 0x0000001b,
+   0x00000021, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t sw_ssbo_vert_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x00000022, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0008000f, 0x00000000,
+   0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000012, 0x0000001b,
+   0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
+   0x00000000, 0x00060005, 0x0000000b, 0x505f6c67, 0x65567265, 0x78657472,
+   0x00000000, 0x00060006, 0x0000000b, 0x00000000, 0x505f6c67, 0x7469736f,
+   0x006e6f69, 0x00070006, 0x0000000b, 0x00000001, 0x505f6c67, 0x746e696f,
+   0x657a6953, 0x00000000, 0x00070006, 0x0000000b, 0x00000002, 0x435f6c67,
+   0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000000b, 0x00000003,
+   0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000000d,
+   0x00000000, 0x00030005, 0x00000012, 0x00736f70, 0x00040005, 0x0000001b,
+   0x6f635f76, 0x00726f6c, 0x00030005, 0x0000001c, 0x00000043, 0x00040006,
+   0x0000001c, 0x00000000, 0x00000063, 0x00030005, 0x0000001e, 0x00000062,
+   0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000,
+   0x0000000b, 0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x0000000b,
+   0x00000001, 0x00050048, 0x0000000b, 0x00000002, 0x0000000b, 0x00000003,
+   0x00050048, 0x0000000b, 0x00000003, 0x0000000b, 0x00000004, 0x00040047,
+   0x00000012, 0x0000001e, 0x00000000, 0x00030047, 0x0000001b, 0x0000000e,
+   0x00040047, 0x0000001b, 0x0000001e, 0x00000000, 0x00030047, 0x0000001c,
+   0x00000002, 0x00040048, 0x0000001c, 0x00000000, 0x00000018, 0x00050048,
+   0x0000001c, 0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x0000001e,
+   0x00000018, 0x00040047, 0x0000001e, 0x00000021, 0x00000000, 0x00040047,
+   0x0000001e, 0x00000022, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
+   0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017,
+   0x00000007, 0x00000006, 0x00000004, 0x00040015, 0x00000008, 0x00000020,
+   0x00000000, 0x0004002b, 0x00000008, 0x00000009, 0x00000001, 0x0004001c,
+   0x0000000a, 0x00000006, 0x00000009, 0x0006001e, 0x0000000b, 0x00000007,
+   0x00000006, 0x0000000a, 0x0000000a, 0x00040020, 0x0000000c, 0x00000003,
+   0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000003, 0x00040015,
+   0x0000000e, 0x00000020, 0x00000001, 0x0004002b, 0x0000000e, 0x0000000f,
+   0x00000000, 0x00040017, 0x00000010, 0x00000006, 0x00000002, 0x00040020,
+   0x00000011, 0x00000001, 0x00000010, 0x0004003b, 0x00000011, 0x00000012,
+   0x00000001, 0x0004002b, 0x00000006, 0x00000014, 0x3f000000, 0x0004002b,
+   0x00000006, 0x00000015, 0x3f800000, 0x00040020, 0x00000019, 0x00000003,
+   0x00000007, 0x0004003b, 0x00000019, 0x0000001b, 0x00000003, 0x0003001e,
+   0x0000001c, 0x00000007, 0x00040020, 0x0000001d, 0x0000000c, 0x0000001c,
+   0x0004003b, 0x0000001d, 0x0000001e, 0x0000000c, 0x00040020, 0x0000001f,
+   0x0000000c, 0x00000007, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+   0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000010, 0x00000013,
+   0x00000012, 0x00050051, 0x00000006, 0x00000016, 0x00000013, 0x00000000,
+   0x00050051, 0x00000006, 0x00000017, 0x00000013, 0x00000001, 0x00070050,
+   0x00000007, 0x00000018, 0x00000016, 0x00000017, 0x00000014, 0x00000015,
+   0x00050041, 0x00000019, 0x0000001a, 0x0000000d, 0x0000000f, 0x0003003e,
+   0x0000001a, 0x00000018, 0x00050041, 0x0000001f, 0x00000020, 0x0000001e,
+   0x0000000f, 0x0004003d, 0x00000007, 0x00000021, 0x00000020, 0x0003003e,
+   0x0000001b, 0x00000021, 0x000100fd, 0x00010038,
+};
+
+static const uint32_t sw_flat_frag_spv[] = {
+   0x07230203, 0x00010300, 0x0008000b, 0x0000000d, 0x00000000, 0x00020011,
+   0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+   0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
+   0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000b, 0x00030010,
+   0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
+   0x00000004, 0x6e69616d, 0x00000000, 0x00040005, 0x00000009, 0x6f6c6f63,
+   0x00000072, 0x00040005, 0x0000000b, 0x6f635f76, 0x00726f6c, 0x00040047,
+   0x00000009, 0x0000001e, 0x00000000, 0x00030047, 0x0000000b, 0x0000000e,
+   0x00040047, 0x0000000b, 0x0000001e, 0x00000000, 0x00020013, 0x00000002,
+   0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
+   0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
+   0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003,
+   0x00040020, 0x0000000a, 0x00000001, 0x00000007, 0x0004003b, 0x0000000a,
+   0x0000000b, 0x00000001, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+   0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x00000007, 0x0000000c,
+   0x0000000b, 0x0003003e, 0x00000009, 0x0000000c, 0x000100fd, 0x00010038,
 };
 
 /* ---------------------------------------------------------------------- */
@@ -482,6 +748,354 @@ check(struct g52 *g, struct g52_image *color, unsigned run)
 }
 
 /* ---------------------------------------------------------------------- */
+/* The set switch cases                                                    */
+
+/* Colour 1 (buffer X, set A) and colour 2 (buffer Y, set B), at the bound
+ * offset of their buffer. */
+static const uint8_t sw_rgba[2][4] = {
+   {220, 40, 20, 255},
+   {20, 160, 240, 255},
+};
+
+/* What X and Y hold at offset 0 when the sets are bound at a non-zero one. */
+static const uint8_t sw_decoy_rgba[2][4] = {
+   {90, 220, 60, 255},
+   {240, 200, 30, 255},
+};
+
+/* The left half (vertices 0 to 5) and the right half (6 to 11), two
+ * triangles each. */
+static const float sw_halves[24] = {
+   -1.0f, -1.0f, 0.0f, -1.0f, -1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 1.0f, -1.0f, 1.0f,
+   0.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 0.0f, 1.0f,
+};
+
+struct sw_case {
+   VkDescriptorType type;     /* UNIFORM_BUFFER_DYNAMIC or STORAGE_BUFFER_DYNAMIC */
+   VkShaderStageFlags stage;  /* the one stage the binding is visible to, which reads it */
+   uint32_t offset;           /* the dynamic offset both sets are bound at */
+};
+
+/* What every case uses: the image, the command buffer, the quads. */
+struct sw_ctx {
+   struct g52 *g;
+   const struct dyn_fns *d;
+   struct g52_image *color;
+   VkCommandPool pool;
+   VkCommandBuffer cmd;
+   VkBuffer halves;
+};
+
+/* What one case creates. */
+struct sw_objs {
+   struct g52_buffer x, y;
+   VkDescriptorSetLayout dsl;
+   VkDescriptorPool dpool;
+   VkDescriptorSet sets[2];   /* A over X, B over Y */
+   VkPipelineLayout layout;
+   VkPipeline pipeline;
+};
+
+/* Every channel within one LSB. */
+static bool
+rgba_near(const uint8_t *a, const uint8_t *b)
+{
+   for (unsigned c = 0; c < 4; c++) {
+      const int d = (int)a[c] - (int)b[c];
+      if (d < -1 || d > 1)
+         return false;
+   }
+   return true;
+}
+
+static void
+rgba_to_float(const uint8_t rgba[4], float out[4])
+{
+   for (unsigned c = 0; c < 4; c++)
+      out[c] = rgba[c] / 255.0f;
+}
+
+/* Buffer X (which 0) or Y (which 1): its colour at byte `offset` (a
+ * multiple of 256), its decoy at offset 0 when `offset` is not 0. */
+static bool
+sw_buffer_create(struct g52 *g, struct g52_buffer *b, VkBufferUsageFlags usage, uint32_t offset,
+                 unsigned which)
+{
+   const size_t size = (size_t)offset + 4 * sizeof(float);
+   float *data = calloc(1, size);
+   if (!data) {
+      fprintf(stderr, "%s: out of host memory for a %zu-byte buffer\n", g->prog, size);
+      return false;
+   }
+   rgba_to_float(sw_rgba[which], data + offset / sizeof(float));
+   if (offset)
+      rgba_to_float(sw_decoy_rgba[which], data);
+   const bool ok = g52_buffer_create(g, b, data, size, usage);
+   free(data);
+   return ok;
+}
+
+static void
+sw_objs_destroy(const struct sw_ctx *c, struct sw_objs *o)
+{
+   struct g52 *g = c->g;
+   if (o->pipeline)
+      g->f.DestroyPipeline(g->device, o->pipeline, NULL);
+   if (o->layout)
+      g->f.DestroyPipelineLayout(g->device, o->layout, NULL);
+   if (o->dpool)
+      c->d->DestroyDescriptorPool(g->device, o->dpool, NULL);
+   if (o->dsl)
+      c->d->DestroyDescriptorSetLayout(g->device, o->dsl, NULL);
+   g52_buffer_destroy(g, &o->y);
+   g52_buffer_destroy(g, &o->x);
+   memset(o, 0, sizeof(*o));
+}
+
+/* Buffers X and Y, the set layout, sets A and B, the pipeline layout and
+ * the pipeline of a case. False (after saying why) at the first failure,
+ * with what was created so far in *o for sw_objs_destroy. */
+static bool
+sw_objs_create(const struct sw_ctx *c, const struct sw_case *sc, const char *name,
+               struct sw_objs *o)
+{
+   struct g52 *g = c->g;
+   const struct g52_fns *f = &g->f;
+   const struct dyn_fns *d = c->d;
+   const bool ubo = sc->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+   const bool vs = sc->stage == VK_SHADER_STAGE_VERTEX_BIT;
+   memset(o, 0, sizeof(*o));
+
+   const VkBufferUsageFlags usage =
+      ubo ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+   if (!sw_buffer_create(g, &o->x, usage, sc->offset, 0) ||
+       !sw_buffer_create(g, &o->y, usage, sc->offset, 1))
+      return false;
+
+   /* Set 0: the one dynamic buffer binding, so no descriptor slots. */
+   const VkDescriptorSetLayoutBinding binding = {0, sc->type, 1, sc->stage, NULL};
+   const VkDescriptorSetLayoutCreateInfo dslci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 1,
+      .pBindings = &binding,
+   };
+   VkResult r = d->CreateDescriptorSetLayout(g->device, &dslci, NULL, &o->dsl);
+   const VkDescriptorPoolSize pool_size = {sc->type, 2};
+   const VkDescriptorPoolCreateInfo dpci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets = 2,
+      .poolSizeCount = 1,
+      .pPoolSizes = &pool_size,
+   };
+   if (r == VK_SUCCESS)
+      r = d->CreateDescriptorPool(g->device, &dpci, NULL, &o->dpool);
+   const VkDescriptorSetLayout dsls[2] = {o->dsl, o->dsl};
+   const VkDescriptorSetAllocateInfo dsai = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = o->dpool,
+      .descriptorSetCount = 2,
+      .pSetLayouts = dsls,
+   };
+   if (r == VK_SUCCESS)
+      r = d->AllocateDescriptorSets(g->device, &dsai, o->sets);
+   if (r != VK_SUCCESS) {
+      fprintf(stderr, "%s: %s: descriptor sets: %s\n", g->prog, name, g52_result_str(r));
+      return false;
+   }
+   const VkDescriptorBufferInfo dbi[2] = {{o->x.buffer, 0, 16}, {o->y.buffer, 0, 16}};
+   VkWriteDescriptorSet writes[2];
+   for (unsigned s = 0; s < 2; s++) {
+      writes[s] = (VkWriteDescriptorSet){
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = o->sets[s],
+         .dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = sc->type,
+         .pBufferInfo = &dbi[s],
+      };
+   }
+   d->UpdateDescriptorSets(g->device, 2, writes, 0, NULL);
+
+   const VkPipelineLayoutCreateInfo plci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1,
+      .pSetLayouts = &o->dsl,
+   };
+   r = f->CreatePipelineLayout(g->device, &plci, NULL, &o->layout);
+   if (r != VK_SUCCESS) {
+      fprintf(stderr, "%s: %s: vkCreatePipelineLayout failed: %s\n", g->prog, name,
+              g52_result_str(r));
+      return false;
+   }
+
+   /* The reading stage gets the buffer's shader, the other one the plain
+    * one (sw.vert, or sw_flat.frag taking the vertex shader's colour). */
+   const struct g52_pipeline_desc pd = {
+      .vs_spv = !vs ? sw_vert_spv : ubo ? sw_ubo_vert_spv : sw_ssbo_vert_spv,
+      .vs_size = !vs ? sizeof(sw_vert_spv) : ubo ? sizeof(sw_ubo_vert_spv)
+                                                  : sizeof(sw_ssbo_vert_spv),
+      .fs_spv = vs ? sw_flat_frag_spv : ubo ? sw_ubo_frag_spv : sw_ssbo_frag_spv,
+      .fs_size = vs ? sizeof(sw_flat_frag_spv) : ubo ? sizeof(sw_ubo_frag_spv)
+                                                    : sizeof(sw_ssbo_frag_spv),
+      .attrib_format = VK_FORMAT_R32G32_SFLOAT,
+      .vertex_stride = 2 * sizeof(float),
+      .width = IMG_W,
+      .height = IMG_H,
+      .color_format = c->color->format,
+      .depth_format = VK_FORMAT_UNDEFINED,
+      .stencil_format = VK_FORMAT_UNDEFINED,
+      .blend = {.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT},
+   };
+   o->pipeline = g52_pipeline_create(g, &pd, o->layout, name);
+   return o->pipeline != VK_NULL_HANDLE;
+}
+
+/* The left half in colour 1, the right half in colour 2. */
+static bool
+sw_check(const struct sw_ctx *c, const struct sw_case *sc, const char *name)
+{
+   static const uint8_t black[4] = {0, 0, 0, 255};
+   struct g52_image *color = c->color;
+   g52_image_sync_for_read(c->g, color);
+   uint32_t bad = 0, sent = 0, cleared = 0, stale = 0, unoffset = 0;
+   int fx = -1, fy = -1;
+   uint8_t fgot[4] = {0};
+   for (uint32_t y = 0; y < IMG_H; y++) {
+      for (uint32_t x = 0; x < IMG_W; x++) {
+         const unsigned half = x >= SW_HALF;
+         const uint8_t *px = g52_image_pixel(color, x, y);
+         if (rgba_near(px, sw_rgba[half]))
+            continue;
+         if (px[0] == SENTINEL && px[1] == SENTINEL && px[2] == SENTINEL && px[3] == SENTINEL)
+            sent++;
+         else if (rgba_near(px, black))
+            cleared++;
+         else if (half && rgba_near(px, sw_rgba[0]))
+            stale++;
+         else if (sc->offset &&
+                  (rgba_near(px, sw_decoy_rgba[0]) || rgba_near(px, sw_decoy_rgba[1])))
+            unoffset++;
+         if (!bad) {
+            fx = (int)x;
+            fy = (int)y;
+            memcpy(fgot, px, 4);
+         }
+         bad++;
+      }
+   }
+   if (!bad) {
+      printf("  PASS %s: left half colour 1 (set A), right half colour 2 (set B)\n", name);
+      return true;
+   }
+   const uint8_t *fwant = sw_rgba[fx >= SW_HALF];
+   printf("  FAIL %s: %u pixels wrong (%u sentinel, %u black, %u of the right half in set A's "
+          "colour 1, %u in a buffer's offset 0 decoy); first at (%d,%d) = %u %u %u %u, "
+          "expected %u %u %u %u\n", name, bad, sent, cleared, stale, unoffset, fx, fy, fgot[0],
+          fgot[1], fgot[2], fgot[3], fwant[0], fwant[1], fwant[2], fwant[3]);
+   if (stale == (uint32_t)(IMG_W - SW_HALF) * IMG_H)
+      printf("    (the whole right half shows colour 1: the draw after binding set B kept set "
+             "A's descriptor tables or FAU uniform words, as when sets with no descriptor slots "
+             "are matched by their address)\n");
+   if (unoffset)
+      printf("    (a buffer's offset 0 decoy: the dynamic offset was not applied)\n");
+   return false;
+}
+
+/*
+ * One case: bind set A, draw the left half, bind set B at the same offset,
+ * draw the right half; submit and check. *stop is set when the submit did
+ * not complete (a timeout or a lost device): no further case runs, and this
+ * one's objects are left to the process exit since the GPU may still hold
+ * them.
+ */
+static bool
+sw_run(const struct sw_ctx *c, const struct sw_case *sc, bool *stop)
+{
+   struct g52 *g = c->g;
+   const struct g52_fns *f = &g->f;
+   const bool ubo = sc->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+   const bool vs = sc->stage == VK_SHADER_STAGE_VERTEX_BIT;
+   char name[112];
+   snprintf(name, sizeof(name), "set switch, %s buffer read by the %s shader, both sets at "
+            "offset %u", ubo ? "uniform" : "storage", vs ? "vertex" : "fragment", sc->offset);
+
+   struct sw_objs o;
+   if (!sw_objs_create(c, sc, name, &o)) {
+      printf("  FAIL %s: setup failed (see stderr)\n", name);
+      sw_objs_destroy(c, &o);
+      return false;
+   }
+
+   VkResult r = f->ResetCommandPool(g->device, c->pool, 0);
+   const VkCommandBufferBeginInfo bi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   if (r == VK_SUCCESS)
+      r = f->BeginCommandBuffer(c->cmd, &bi);
+   if (r != VK_SUCCESS) {
+      printf("  FAIL %s: command buffer: %s\n", name, g52_result_str(r));
+      sw_objs_destroy(c, &o);
+      return false;
+   }
+   g52_image_refill(g, c->color, SENTINEL);
+   g52_cmd_transition(g, c->cmd, c->color->image, VK_IMAGE_ASPECT_COLOR_BIT,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+   const VkRenderingAttachmentInfo color_att = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = c->color->view,
+      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue.color.float32 = {0.0f, 0.0f, 0.0f, 1.0f},
+   };
+   const VkRenderingInfo ri = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = {{0, 0}, {IMG_W, IMG_H}},
+      .layerCount = 1,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &color_att,
+   };
+   f->CmdBeginRendering(c->cmd, &ri);
+   f->CmdBindPipeline(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, o.pipeline);
+   const VkDeviceSize vb_offset = 0;
+   f->CmdBindVertexBuffers(c->cmd, 0, 1, &c->halves, &vb_offset);
+   const uint32_t offset = sc->offset;
+   c->d->CmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, o.layout, 0, 1,
+                               &o.sets[0], 1, &offset);
+   f->CmdDraw(c->cmd, 6, 1, 0, 0);
+   c->d->CmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, o.layout, 0, 1,
+                               &o.sets[1], 1, &offset);
+   f->CmdDraw(c->cmd, 6, 1, 6, 0);
+   f->CmdEndRendering(c->cmd);
+   g52_cmd_transition(g, c->cmd, c->color->image, VK_IMAGE_ASPECT_COLOR_BIT,
+                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                      VK_ACCESS_HOST_READ_BIT);
+   r = f->EndCommandBuffer(c->cmd);
+   if (r != VK_SUCCESS) {
+      printf("  FAIL %s: vkEndCommandBuffer: %s (see the log)\n", name, g52_result_str(r));
+      sw_objs_destroy(c, &o);
+      return false;
+   }
+   r = g52_submit_wait(g, c->cmd, name);
+   if (r != VK_SUCCESS) {
+      printf("  FAIL %s: the submit did not complete (%s); no further case runs\n", name,
+             g52_result_str(r));
+      *stop = true;
+      return false;
+   }
+   const bool pass = sw_check(c, sc, name);
+   sw_objs_destroy(c, &o);
+   return pass;
+}
+
+/* ---------------------------------------------------------------------- */
 
 int
 main(int argc, char **argv)
@@ -511,6 +1125,10 @@ main(int argc, char **argv)
    VkDeviceSize align = props2.properties.limits.minUniformBufferOffsetAlignment;
    if (align < 256)
       align = 256;
+   /* The set switch cases' non-zero offset, valid for both buffer types. */
+   VkDeviceSize sw_offset = align;
+   if (props2.properties.limits.minStorageBufferOffsetAlignment > sw_offset)
+      sw_offset = props2.properties.limits.minStorageBufferOffsetAlignment;
 
    static const VkFormat zs_candidates[] = {VK_FORMAT_D24_UNORM_S8_UINT,
                                             VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_S8_UINT};
@@ -787,9 +1405,43 @@ main(int argc, char **argv)
       }
       pass = check(&g, &color, run);
    }
-   printf(pass ? "PASS: dynamic stencil reference, rebound uniform offsets and draw order "
-                 "over %u draws, two runs\n"
-               : "FAIL: see above (%u draws)\n", CELLS + 6);
+
+   /* 4. The set switch cases, each its own pass into the same image, as
+    * long as the device completes the work. */
+   unsigned sw_passed = 0, sw_ran = 0;
+   struct g52_buffer halves = {0};
+   if (r != VK_SUCCESS) {
+      printf("  set switch cases not run: the draws above did not complete\n");
+   } else if (!g52_buffer_create(&g, &halves, sw_halves, sizeof(sw_halves),
+                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) {
+      printf("  set switch cases not run: no vertex buffer\n");
+   } else {
+      printf("  set switch cases: set 0 holds one dynamic buffer binding and no descriptor "
+             "slots; set A (colour 1) then set B (colour 2) at one offset\n");
+      const struct sw_ctx swc = {&g, &d, &color, pool, cmd, halves.buffer};
+      bool stop = false;
+      for (unsigned i = 0; i < SW_CASES && !stop; i++) {
+         const struct sw_case sc = {
+            .type = (i & 4) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                            : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            .stage = (i & 2) ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = (i & 1) ? (uint32_t)sw_offset : 0,
+         };
+         sw_ran++;
+         if (sw_run(&swc, &sc, &stop))
+            sw_passed++;
+      }
+   }
+
+   const bool all = pass && sw_passed == SW_CASES;
+   if (all)
+      printf("PASS: dynamic stencil reference, rebound uniform offsets and draw order over %u "
+             "draws, two runs; %u of %u set switch cases\n", (unsigned)(CELLS + 6), sw_passed,
+             SW_CASES);
+   else
+      printf("FAIL: see above (%u draws: %s; set switch cases: %u of %u passed, %u not run)\n",
+             (unsigned)(CELLS + 6), pass ? "PASS" : "FAIL", sw_passed, SW_CASES,
+             SW_CASES - sw_ran);
 
    f->DeviceWaitIdle(g.device);
    f->DestroyCommandPool(g.device, pool, NULL);
@@ -803,9 +1455,10 @@ main(int argc, char **argv)
    f->UnmapMemory(g.device, u.memory);
    f->DestroyBuffer(g.device, u.buffer, NULL);
    f->FreeMemory(g.device, u.memory, NULL);
+   g52_buffer_destroy(&g, &halves);
    g52_buffer_destroy(&g, &vbuf);
    g52_image_destroy(&g, &zs);
    g52_image_destroy(&g, &color);
    g52_close(&g);
-   return pass ? 0 : 1;
+   return all ? 0 : 1;
 }
