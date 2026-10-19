@@ -223,7 +223,8 @@ astc_tag(const struct util_format_description *desc)
 }
 
 /* One Surface With Stride: level `level`, layer or Z slice `layer`,
- * sample `sample` (get_linear_or_u_tiled_surface_props). */
+ * sample `sample` (get_linear_or_u_tiled_surface_props, or
+ * get_afbc_surface_props for an AFBC image). */
 static void
 emit_surface(const struct view_src *src, unsigned level, unsigned layer, unsigned sample,
              void *out)
@@ -233,7 +234,32 @@ emit_surface(const struct view_src *src, unsigned level, unsigned layer, unsigne
    const struct mali_image_slice *s = &pl->slices[level];
    const struct util_format_description *desc = util_format_description(src->format);
 
-   assert(!mali_image_is_afbc(image));
+   if (mali_image_is_afbc(image)) {
+      /* get_afbc_surface_props at PAN_ARCH 7: the layer's first header
+       * (4 KiB aligned) with the AFBC surface flags in the pointer's low
+       * bits, the header row stride, and the surface stride (headers and
+       * body), by which the payload range check bounds the headers' body
+       * offsets. Read in the plane's own format, sRGB aside. */
+      const uint64_t mod = image->vk.drm_format_mod;
+      assert(image->vk.image_type == VK_IMAGE_TYPE_2D && sample == 0);
+      assert(util_format_linear(src->format) ==
+             util_format_linear(image->planes[src->plane].format));
+      unsigned flags = MALI_AFBC_SURFACE_FLAG_PREFETCH | MALI_AFBC_SURFACE_FLAG_CHECK_PAYLOAD_RANGE;
+      if (mod & AFBC_FORMAT_MOD_YTR)
+         flags |= MALI_AFBC_SURFACE_FLAG_YTR;
+      if (mod & AFBC_FORMAT_MOD_TILED)
+         flags |= MALI_AFBC_SURFACE_FLAG_TILED_HEADER;
+      const uint64_t header = image->base + s->offset + (uint64_t)layer * pl->array_stride;
+      assert(!(header & (MALI_AFBC_ALIGN - 1)));
+      assert(s->surface_stride <= UINT32_MAX);
+      pan_cast_and_pack(out, SURFACE_WITH_STRIDE, cfg) {
+         cfg.pointer = header | flags;
+         cfg.row_stride = s->row_stride;
+         cfg.surface_stride = (uint32_t)s->surface_stride;
+      }
+      return;
+   }
+
    uint64_t addr = image->base + s->offset;
    if (image->vk.image_type == VK_IMAGE_TYPE_3D)
       addr += (uint64_t)layer * s->surface_stride;
@@ -442,7 +468,8 @@ pack_texture(const struct view_src *src, const unsigned char swizzle[4],
                              util_format_is_compressed(src->format);
 #else
       /* pan_modifier_to_layout. */
-      cfg.texel_ordering = image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ?
+      cfg.texel_ordering = mali_image_is_afbc(image) ? MALI_TEXTURE_LAYOUT_AFBC :
+                           image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ?
                               MALI_TEXTURE_LAYOUT_LINEAR : MALI_TEXTURE_LAYOUT_TILED;
 #endif
       cfg.levels = src->levels;

@@ -333,6 +333,20 @@ MALI_PER_ARCH(fb_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_de
     * grows to them and a tile smaller than a superblock counts as one. */
    uint32_t tw, th;
    tile_dims(r->tile_size, &tw, &th);
+#if PAN_ARCH < 9
+   /* pan_force_clean_write_on: tiles smaller than an AFBC superblock share
+    * superblocks, which only compress right when every tile of the target
+    * is written back, clean or not; the frame shaders then run on every
+    * tile (fix_frame_mode). Only several or wide targets make the v7 tile
+    * that small. */
+   if (tw < AFBC_BLOCK || th < AFBC_BLOCK) {
+      for (unsigned i = 0; i < desc->rt_count; i++) {
+         struct mali_fb_target *t = &r->desc.rt[i];
+         if (target_is_afbc(t) && t->store)
+            t->always_write = true;
+      }
+   }
+#endif
    bool afbc_store = false;
    for (unsigned i = 0; i < n; i++)
       afbc_store |= target_is_afbc(targets[i]) && targets[i]->store;
@@ -462,7 +476,6 @@ target_mem(const struct mali_fb_target *t, unsigned layer, uint64_t *base,
    *surf_stride = s->surface_stride;
 }
 
-#if PAN_ARCH >= 9
 /* get_afbc_att_mem_props: the layer's first header, the body offset from
  * it and the header row stride. */
 static void
@@ -487,7 +500,6 @@ afbc_reverse_issue_order(const struct mali_render_state *r)
    tile_dims(r->tile_size, &tw, &th);
    return tw < AFBC_BLOCK || th < AFBC_BLOCK;
 }
-#endif /* PAN_ARCH >= 9 */
 
 static enum mali_block_format
 target_block_format(const struct mali_fb_target *t)
@@ -700,7 +712,7 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
    }
 
 #if PAN_ARCH < 9
-   /* v7 images are never AFBC (afbc_mode_on_arch in mali_image.c). */
+   /* v7 depth/stencil images are never AFBC (mali_image.c v7_can_use_afbc). */
    assert(!target_is_afbc(zt) && !target_is_afbc(st));
    if (zt->image && zt->store) {
 #else
@@ -774,24 +786,12 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
    memcpy(out, &desc, sizeof(desc));
 }
 
-#if PAN_ARCH < 9
-/* AFBC render targets are not supported on v7, whose images are never AFBC
- * (afbc_mode_on_arch in mali_image.c). Should one reach this, it is packed
- * as a target that writes nothing. */
-static void
-pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, unsigned i,
-             unsigned layer, const uint32_t clear[4], void *out)
-{
-   MALI_V7_UNSUPPORTED("an AFBC render target");
-   pan_cast_and_pack(out, RGB_RENDER_TARGET, cfg) {
-      cfg.internal_buffer_offset = r->rt_offset[i];
-      cfg.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
-      cfg.write_enable = false;
-      cfg.writeback_block_format = MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED;
-   }
-}
-#else
-/* pan_emit_afbc_color_attachment for v9+. */
+/*
+ * pan_emit_afbc_color_attachment. v7 has an absolute body pointer, the
+ * header row stride in superblocks (pan_afbc_stride_blocks), no
+ * compression mode word (the writeback format is the compression format)
+ * and no RAW32 stand-in for RAW24.
+ */
 static void
 pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, unsigned i,
              unsigned layer, const uint32_t clear[4], void *out)
@@ -799,6 +799,11 @@ pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, 
    uint64_t header;
    uint32_t body, row;
    target_afbc_mem(t, layer, &header, &body, &row);
+#if PAN_ARCH < 9
+   const enum pipe_format pf = t->image->planes[t->plane].format;
+   const uint32_t row_blocks = row / (MALI_AFBC_HEADER_BYTES * mali_afbc_header_tile_sbs(pf));
+   assert(util_format_linear(t->format) == util_format_linear(pf));
+#endif
 
    pan_cast_and_pack(out, AFBC_RGB_RENDER_TARGET, cfg) {
       cfg.internal_buffer_offset = r->rt_offset[i];
@@ -810,9 +815,11 @@ pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, 
       cfg.clear.color_3 = clear[3];
       cfg.write_enable = t->store;
       rt_formats(t->format, &cfg.writeback_format, &cfg.internal_format, &cfg.swizzle);
+#if PAN_ARCH >= 9
       /* No AFBC with RAW24 on v9+: RAW32, the compression mode says 24. */
       if (cfg.writeback_format == MALI_COLOR_FORMAT_RAW24)
          cfg.writeback_format = MALI_COLOR_FORMAT_RAW32;
+#endif
       cfg.srgb = util_format_is_srgb(t->format);
       cfg.writeback_block_format = MALI_BLOCK_FORMAT_AFBC_TILED;
       cfg.writeback_msaa = MALI_MSAA_SINGLE;
@@ -821,12 +828,16 @@ pack_rt_afbc(const struct mali_render_state *r, const struct mali_fb_target *t, 
       cfg.split_block = false;
       cfg.reverse_issue_order = afbc_reverse_issue_order(r);
       cfg.header = header;
+#if PAN_ARCH >= 9
       cfg.body_offset = body;
       cfg.row_stride = row;
       cfg.compression_mode = MALI_PER_ARCH(image_afbc_hw_mode)(t->image, t->plane);
+#else
+      cfg.body = header + body;
+      cfg.row_stride = row_blocks;
+#endif
    }
 }
-#endif
 
 static void
 pack_rt(const struct mali_render_state *r, unsigned i, unsigned layer, void *out)

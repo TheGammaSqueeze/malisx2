@@ -33,6 +33,9 @@
 #include "mali_cmd_state.h"
 
 #include "mali_measure.h"
+#if PAN_ARCH < 9
+#include "mali_rsd_v7.h"
+#endif
 
 static void
 dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
@@ -56,17 +59,42 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
     * keeps no dirty state.
     *
     * Internal dispatches that read textures (the AFBC plane copy,
-    * mali_cmd_image.c) are not supported: v7 images are never AFBC.
+    * mali_cmd_image.c) use no descriptor sets and name texture i of
+    * `textures` and sampler 0 by literal index. The shader's RSD counts no
+    * textures, so such a dispatch packs an RSD of its own with the counts
+    * of its Texture table and its one nearest sampler.
     */
-   if (texture_count) {
-      MALI_V7_UNSUPPORTED("an internal dispatch that reads textures");
-      return;
-   }
-
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
    struct mali_v7_desc_tables tables;
    if (!mali_v7_desc_prepare(cmd, cs, desc, true, &tables))
       return;
+   uint64_t rsd = cs->spd[MALI_SPD_MAIN];
+   if (texture_count) {
+      assert(!desc && !cs->desc.used_set_mask && !cs->v7.map_count);
+      struct mali_ptr tex = mali_cmd_alloc(cmd, (uint64_t)texture_count * pan_size(TEXTURE), 64);
+      struct mali_ptr samp = mali_cmd_alloc(cmd, pan_size(SAMPLER), 64);
+      struct mali_ptr state =
+         mali_cmd_alloc(cmd, pan_size(RENDERER_STATE), pan_alignment(RENDERER_STATE));
+      if (!tex.cpu || !samp.cpu || !state.cpu)
+         return;
+      for (unsigned i = 0; i < texture_count; i++)
+         memcpy((uint8_t *)tex.cpu + i * pan_size(TEXTURE), textures[i], pan_size(TEXTURE));
+      pan_cast_and_pack(samp.cpu, SAMPLER, cfg) {
+         cfg.seamless_cube_map = false;
+         cfg.normalized_coordinates = false;
+         cfg.clamp_integer_array_indices = false;
+         cfg.minify_nearest = true;
+         cfg.magnify_nearest = true;
+      }
+      pan_cast_and_pack(state.cpu, RENDERER_STATE, cfg) {
+         mali_v7_rsd_shader(&cs->info, mali_shader_code_va(cs), &cfg);
+         cfg.shader.texture_count = texture_count;
+         cfg.shader.sampler_count = 1;
+      }
+      tables.tables[MALI_V7_DESC_TABLE_TEXTURE] = tex.gpu;
+      tables.tables[MALI_V7_DESC_TABLE_SAMPLER] = samp.gpu;
+      rsd = state.gpu;
+   }
    const uint64_t fau =
       mali_compute_fau(cmd, cs, &tables, push, push_size, base, groups) & BITFIELD64_MASK(56);
    const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
@@ -110,7 +138,7 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       cfg.job_task_split = mali_v7_compute_task_split(cs->cs.local_size);
    }
    pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
-      cfg.state = cs->spd[MALI_SPD_MAIN];
+      cfg.state = rsd;
       cfg.attributes = tables.img_attribs;
       cfg.attribute_buffers = tables.tables[MALI_V7_DESC_TABLE_IMG];
       cfg.thread_storage = tsd;

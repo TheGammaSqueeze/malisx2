@@ -43,8 +43,14 @@
  * On v7 (Bifrost) the blit pass also blits depth and stencil and the
  * slices of 3D images (blit_region_v7), and an unscaled, unflipped blit
  * between identical uncompressed, non-AFBC formats of 1, 2, 4, 8 or
- * 16-byte texels is the compute copy instead. Image copies never take the
- * fragment-side copy pass.
+ * 16-byte texels is the compute copy instead. v7 compresses and
+ * decompresses AFBC by the render target's and the texture's format, so
+ * the two AFBC paths read and write an AFBC plane (colour only) in its own
+ * format and convert to and from the block's bits in the shader
+ * (mali_meta_copy_fmt). Blits and clears work in the image's own format.
+ * The copy pass writes its target through a copy format (v7_copy_fmt),
+ * which only the AFBC formats have, so image copies into other planes
+ * never take the fragment-side copy pass.
  */
 
 #if PAN_ARCH >= 10
@@ -235,10 +241,33 @@ static enum pipe_format
 copy_read_format(const struct mali_image *img, unsigned plane)
 {
    const enum pipe_format f = img->planes[plane].format;
+#if PAN_ARCH < 9
+   /* v7 decompresses by the texture's format: an AFBC plane is read in its
+    * own (linear) format and converted to bits in the shader. */
+   if (mali_image_is_afbc(img))
+      return util_format_linear(f);
+#endif
    if (f == PIPE_FORMAT_S8_UINT)
       return f;
    return uint_format(util_format_get_blocksize(f));
 }
+
+#if PAN_ARCH < 9
+/* The copy format of a v7 AFBC plane (mali_cmd_gfx.h): its own format,
+ * sRGB read and written as UNORM so the bits pass unchanged. */
+static enum mali_meta_copy_fmt
+v7_copy_fmt(const struct mali_image *img, unsigned plane)
+{
+   switch (util_format_linear(img->planes[plane].format)) {
+   case PIPE_FORMAT_R8_UNORM: return MALI_META_COPY_FMT_R8;
+   case PIPE_FORMAT_R8G8_UNORM: return MALI_META_COPY_FMT_R8G8;
+   case PIPE_FORMAT_R8G8B8A8_UNORM: return MALI_META_COPY_FMT_R8G8B8A8;
+   default:
+      /* v7_afbc_format (mali_image.c) admits no other format. */
+      UNREACHABLE("no v7 AFBC copy format");
+   }
+}
+#endif
 
 /* The source of a copy into an AFBC plane: an AFBC image plane (read as a
  * texture) or a raw surface. Block coordinates. */
@@ -326,6 +355,15 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
    };
    key.rt_op[0] = MALI_META_FS_COPY;
    key.rt_type[0] = MALI_META_FS_UINT;
+#if PAN_ARCH < 9
+   /* v7: an AFBC target and source in their own formats, the bits
+    * converted in the shader (mali_meta_copy_fmt). */
+   const enum pipe_format target_format = util_format_linear(img->planes[plane].format);
+   key.rt_type[0] = MALI_META_FS_FLOAT;
+   key.copy_dst_fmt = v7_copy_fmt(img, plane);
+   if (src->img)
+      key.copy_src_fmt = v7_copy_fmt(src->img, src->plane);
+#endif
 
    struct mali_meta_fs_push push = {
       .area = {dx, dy, dx + (int32_t)w - 1, dy + (int32_t)h - 1},
@@ -366,7 +404,11 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
       .plane = plane,
       .level = level,
       .layer = layer,
+#if PAN_ARCH < 9
+      .format = target_format,
+#else
       .format = uint_format(elem),
+#endif
       .load = MALI_ATT_LOAD_DONT_CARE,
       .store = true,
       .always_write = true,
@@ -387,8 +429,14 @@ copy_from_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsign
 {
    if (!w || !h || !layers)
       return;
+#if PAN_ARCH < 9
+   /* v7: read in the plane's own format, packed into bits in the shader. */
+   const struct mali_shader *s =
+      MALI_PER_ARCH(meta_copy_tex_fmt_get)(cmd, v7_copy_fmt(img, plane));
+#else
    const unsigned elem = util_format_get_blocksize(img->planes[plane].format);
    const struct mali_shader *s = MALI_PER_ARCH(meta_copy_tex_get)(cmd, util_logbase2(elem));
+#endif
    if (!s)
       return;
 
@@ -447,7 +495,9 @@ copy_on_fragment(struct mali_cmd_buffer *cmd, const struct mali_image *src,
                  const struct copy_surface *s)
 {
 #if PAN_ARCH < 9
-   /* Image copies on v7 take the compute copy (file comment). */
+   /* v7's copy pass writes its target through v7_copy_fmt, which only the
+    * AFBC formats have (file comment): other planes take the compute
+    * copy. */
    return false;
 #elif PAN_ARCH < 10
    return aspect == VK_IMAGE_ASPECT_COLOR_BIT && src->vk.image_type == VK_IMAGE_TYPE_2D &&

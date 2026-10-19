@@ -78,6 +78,14 @@ enum mali_afbc_mode mali_afbc_mode(enum pipe_format format);
 /* Whether the YUV-like transform applies to a format (pan_afbc_can_ytr). */
 bool mali_afbc_can_ytr(enum pipe_format format);
 
+/* Bytes of header per 16x16 superblock (AFBC_HEADER_BYTES_PER_TILE in
+ * pan_afbc.h). */
+#define MALI_AFBC_HEADER_BYTES 16
+
+/* Superblocks per side of a header tile (pan_afbc_tile_size with tiled
+ * headers): 8, or 4 above 32 bits per pixel. */
+unsigned mali_afbc_header_tile_sbs(enum pipe_format format);
+
 /* Width and height below which a plane is not worth AFBC with tiled
  * headers (pan_mod_afbc_test_props: half a header tile of 8x8 superblocks,
  * 4x4 above 32 bits per pixel). */

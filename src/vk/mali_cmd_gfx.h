@@ -16,7 +16,8 @@
  * functions declared here (mali_cmd_render.c and mali_cmd_draw.c on v11,
  * the mali_jm_* files on v7 and v9): every function below has a mali_v7_,
  * a mali_v9_ and a mali_v11_ variant (MALI_PER_ARCH), except where an #if
- * limits one to some arches (cmd_run_fullscreen: v7 has no Fullscreen job).
+ * limits one to some arches (cmd_run_fullscreen: v7 has no Fullscreen
+ * job; meta_copy_tex_get, which v7 replaces with meta_copy_tex_fmt_get).
  */
 
 #ifndef MALI_CMD_GFX_H
@@ -157,7 +158,9 @@ struct mali_fb_target {
    /* The frame shader writes this target: a load, or a clear that a
     * partly covered tile cannot do through the tile buffer. */
    bool preload;
-   /* Every tile of the bounding box is written back (a blit's target). */
+   /* Every tile of the bounding box is written back: a blit's target, or
+    * on v7 an AFBC target of a pass whose tiles are smaller than a
+    * superblock (mali_fb.c fb_begin). */
    bool always_write;
 };
 
@@ -308,7 +311,9 @@ MALI_PER_ARCH_DECL(void, cmd_dispatch_shader,
                     const uint32_t base[3], const uint32_t groups[3]));
 
 /* A dispatch of an internal shader whose resource table 0 holds a sampler
- * at index 0 and `textures` (packed Texture descriptors) from index 1. */
+ * at index 0 and `textures` (packed Texture descriptors) from index 1; on
+ * v7, `textures` are the dispatch's Texture table, next to a Sampler table
+ * of one nearest sampler. */
 MALI_PER_ARCH_DECL(void, cmd_dispatch_meta,
                    (struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                     const void *push, uint32_t push_size, const uint32_t groups[3],
@@ -482,7 +487,8 @@ enum mali_meta_fs_op {
                                 * a z_op / s_op, with two textures each
                                 * after the colour ones */
    MALI_META_FS_COPY,          /* raw copy into an AFBC target read as a
-                                * uint format of its block size: inside the
+                                * uint format of its block size (on v7 in
+                                * its copy format, copy_dst_fmt): inside the
                                 * area, the source block at the fragment's
                                 * position + copy_delta (texture 0 when
                                 * copy_src_tex, else a raw surface in memory);
@@ -503,8 +509,39 @@ struct mali_meta_fs_key {
    uint8_t layered;            /* sources are arrays indexed by the layer */
    uint8_t copy_src_tex;       /* COPY: the source is texture 0 */
    uint8_t copy_elem_log2;     /* COPY: log2 of the block size in bytes */
-   uint8_t pad[3];
+   /* COPY on v7 (enum mali_meta_copy_fmt, RAW on v9 and v11): the format
+    * an AFBC target is written in (dst) or an AFBC source read in (src). */
+   uint8_t copy_dst_fmt, copy_src_fmt;
+   uint8_t pad[1];
 };
+
+/*
+ * v7 compresses and decompresses AFBC by the render target or texture
+ * format, so the uint format of the block size cannot stand in for the
+ * plane's own as on v9 and v11: a copy into or out of an AFBC plane reads
+ * or writes it in its own format (sRGB as UNORM) and the shader converts
+ * to and from the block's bits. RAW: no conversion. One per format v7
+ * makes AFBC (mali_image.c v7_afbc_format).
+ */
+enum mali_meta_copy_fmt {
+   MALI_META_COPY_FMT_RAW = 0,
+   MALI_META_COPY_FMT_R8,
+   MALI_META_COPY_FMT_R8G8,
+   MALI_META_COPY_FMT_R8G8B8A8,
+   MALI_META_COPY_FMT_COUNT,
+};
+
+/* The pipe format of a copy format (RAW: PIPE_FORMAT_NONE). */
+static inline enum pipe_format
+mali_meta_copy_fmt_pipe(enum mali_meta_copy_fmt f)
+{
+   switch (f) {
+   case MALI_META_COPY_FMT_R8: return PIPE_FORMAT_R8_UNORM;
+   case MALI_META_COPY_FMT_R8G8: return PIPE_FORMAT_R8G8_UNORM;
+   case MALI_META_COPY_FMT_R8G8B8A8: return PIPE_FORMAT_R8G8B8A8_UNORM;
+   default: return PIPE_FORMAT_NONE;
+   }
+}
 
 struct mali_meta_fs_push {
    /* Render area for CLEAR_IN_AREA, inclusive: min x, min y, max x, max y. */
@@ -567,11 +604,19 @@ MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_get,
 MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_quad_get,
                    (struct mali_cmd_buffer *cmd, unsigned elem_log2));
 
+#if !defined(PAN_ARCH) || PAN_ARCH >= 9
 /* The same copy with the source read through texture 0 (a 2D array of the
  * copied layers, in the uint format of the block size) at (src_x + x,
  * src_y + y, z): for AFBC sources, which have no raw addressing. */
 MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_tex_get,
                    (struct mali_cmd_buffer *cmd, unsigned elem_log2));
+#else
+/* v7: the same copy with the source, an AFBC plane, read through texture 0
+ * in the copy format `fmt` (not RAW) and packed into the block's bits.
+ * v7 cannot read an AFBC plane in the uint format of its block size. */
+MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_tex_fmt_get,
+                   (struct mali_cmd_buffer *cmd, enum mali_meta_copy_fmt fmt));
+#endif
 
 /* Frame shader Draw descriptors of a framebuffer descriptor: colour preload,
  * depth/stencil preload, post-frame (panvk's slots 0, 1, 2). On v7 every
