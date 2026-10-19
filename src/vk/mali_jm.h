@@ -235,6 +235,11 @@ struct mali_v7_desc_tables {
    uint32_t set_desc_counts[MALI_MAX_SETS];   /* their slot counts */
    /* The shader the tables were built for (their layout is its own). */
    const struct mali_shader *shader;
+   /* The dynamic buffers they were built with, one per entry of the
+    * shader's dynamic buffer map: the address with the bound offset
+    * applied, and the range (mali_v7_desc_refresh). */
+   uint64_t dyn_addrs[MALI_MAX_DYNAMIC_BUFFERS];
+   uint64_t dyn_ranges[MALI_MAX_DYNAMIC_BUFFERS];
 };
 
 /*
@@ -634,15 +639,17 @@ bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader 
  * storage buffer table are packed anew and the copied entries kept, so the
  * draw needs no copy job. A bound set cannot change while the command
  * buffer records (no update-after-bind is exposed), and a push set gets
- * new memory with every push. False, with *t unchanged, when the tables
- * must be rebuilt (another shader or set, regular uniform buffers, which
- * share the table with the dynamic ones and come from the copy, or a
- * vertex shader with images), or on an allocation failure, with the
- * command buffer's error set.
+ * new memory with every push. *unchanged when the shader's dynamic buffers
+ * (addresses with the offsets applied, and ranges) are the same too. False,
+ * with *t unchanged, when the tables must be rebuilt
+ * (another shader or set, regular uniform buffers, which share the table
+ * with the dynamic ones and come from the copy, or a vertex shader with
+ * images), or on an allocation failure, with the command buffer's error
+ * set.
  */
 bool mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                           const struct mali_desc_state *desc, bool img,
-                          struct mali_v7_desc_tables *t);
+                          struct mali_v7_desc_tables *t, bool *unchanged);
 
 /*
  * Writes the table entries that come from the sets (the shader's copy map)

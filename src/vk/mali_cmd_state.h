@@ -993,6 +993,27 @@ struct mali_draw_info {
    bool indexed;
 };
 
+#if PAN_ARCH < 9
+/* Whether a dirty dynamic state may feed the pipeline bake (gfx_pack_state):
+ * any but the viewports, scissors, blend constants and vertex input, which
+ * the draw reads through groups of their own. */
+static inline bool
+mali_v7_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
+{
+   BITSET_DECLARE(d, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
+   memcpy(d, dyn->dirty, sizeof(d));
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_VIEWPORT_COUNT);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_VIEWPORTS);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_SCISSOR_COUNT);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VP_SCISSORS);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI_BINDINGS_VALID);
+   BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
+   return !BITSET_IS_EMPTY(d);
+}
+#endif
+
 /* Dynamic states this driver reads at draw time, per dirty group. */
 static inline void
 mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
@@ -1018,9 +1039,15 @@ mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP))
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
    if (d->pipeline && d->pipeline->bind.dynamic) {
-      /* Words baked from state the pipeline left dynamic: repack. */
-      d->dirty |= MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_ZSD | MALI_GFX_DIRTY_BLEND |
-                  MALI_GFX_DIRTY_FS_FAU;
+      /* Words baked from state the pipeline left dynamic: repack. On v7
+       * only when a state the bake reads changed: the runtime marks a
+       * state dirty only when its value changes, and a new pipeline, a
+       * pass and meta operations mark these groups themselves. */
+#if PAN_ARCH < 9
+      if (mali_v7_dyn_bake_dirty(dyn))
+#endif
+         d->dirty |= MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_ZSD | MALI_GFX_DIRTY_BLEND |
+                     MALI_GFX_DIRTY_FS_FAU;
    }
    vk_dynamic_graphics_state_clear_dirty(dyn);
 }

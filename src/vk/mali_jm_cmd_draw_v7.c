@@ -848,8 +848,11 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    if (t->fs_tab.shader != p->fs)
       d->dirty |= MALI_GFX_DIRTY_FS_SRT;
    if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
-      /* The same sets with other dynamic offsets keep the copied tables. */
-      if (!mali_v7_desc_refresh(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab)) {
+      /* The same sets with other dynamic offsets keep the copied tables;
+       * with the same dynamic buffers too, the tables and the FAU block
+       * stay. */
+      bool same = false;
+      if (!mali_v7_desc_refresh(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab, &same)) {
          if (vk_command_buffer_has_error(&cmd->vk) ||
              !mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
             return false;
@@ -859,18 +862,19 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       d->vs_sets_dirty = 0;
       /* The set addresses and the uniform buffer words in FAU follow the
        * tables (mali_gfx_update_dirty leaves the second to this). */
-      if (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count)
+      if (!same && (p->vs->v7.needs_set_addrs || p->vs->fau.ubo_push_count))
          d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
       if (p->fs) {
-         if (!mali_v7_desc_refresh(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab)) {
+         bool same = false;
+         if (!mali_v7_desc_refresh(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab, &same)) {
             if (vk_command_buffer_has_error(&cmd->vk) ||
                 !mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
                return false;
             dd->fs_copy = true;
          }
-         if (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count)
+         if (!same && (p->fs->v7.needs_set_addrs || p->fs->fau.ubo_push_count))
             d->dirty |= MALI_GFX_DIRTY_FS_FAU;
       } else {
          memset(&t->fs_tab, 0, sizeof(t->fs_tab));

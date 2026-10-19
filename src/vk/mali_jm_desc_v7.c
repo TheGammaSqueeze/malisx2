@@ -80,6 +80,15 @@ dyn_buf(const struct mali_desc_state *desc, uint32_t handle, uint64_t *addr, uin
    return true;
 }
 
+/* dyn_buf, with 0 and 0 when there is no buffer. */
+static inline void
+dyn_buf_or_none(const struct mali_desc_state *desc, uint32_t handle, uint64_t *addr,
+                uint64_t *range)
+{
+   if (!dyn_buf(desc, handle, addr, range))
+      *addr = *range = 0;
+}
+
 /* ---------------------------------------------------------------------- */
 /* The tables                                                              */
 
@@ -140,12 +149,21 @@ build_dyn_ssbos(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    return p.gpu;
 }
 
+static inline void
+save_dyn_bufs(const struct mali_shader *s, const struct mali_desc_state *desc,
+              struct mali_v7_desc_tables *t)
+{
+   for (uint32_t i = 0; i < s->desc.dyn_bufs.count; i++)
+      dyn_buf_or_none(desc, s->desc.dyn_bufs.map[i], &t->dyn_addrs[i], &t->dyn_ranges[i]);
+}
+
 bool
 mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                      const struct mali_desc_state *desc, bool img,
-                     struct mali_v7_desc_tables *t)
+                     struct mali_v7_desc_tables *t, bool *unchanged)
 {
    const struct mali_v7_shader_desc *v7 = &s->v7;
+   *unchanged = false;
    if (t->shader != s || v7->count[MALI_V7_DESC_TABLE_UBO] ||
        (!img && v7->count[MALI_V7_DESC_TABLE_IMG]))
       return false;
@@ -154,6 +172,20 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       if (t->sets[i] != (set ? set->gpu : 0) ||
           t->set_desc_counts[i] != (set ? set->layout->desc_count : 0))
          return false;
+   }
+
+   /* The same sets and the same dynamic buffers: the tables stand as they
+    * are. The buffers are compared, not the offsets: two sets without
+    * descriptor slots both have the address 0. */
+   bool same = true;
+   for (uint32_t i = 0; i < s->desc.dyn_bufs.count && same; i++) {
+      uint64_t addr, range;
+      dyn_buf_or_none(desc, s->desc.dyn_bufs.map[i], &addr, &range);
+      same = t->dyn_addrs[i] == addr && t->dyn_ranges[i] == range;
+   }
+   if (same) {
+      *unchanged = true;
+      return true;
    }
 
    const uint32_t dyn_ubo_count = v7->dyn_ubo_count;
@@ -175,6 +207,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    }
    t->tables[MALI_V7_DESC_TABLE_UBO] = ubo;
    t->dyn_ssbos = dyn_ssbos;
+   save_dyn_bufs(s, desc, t);
    return true;
 }
 
@@ -248,6 +281,7 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       if (!out->dyn_ssbos)
          return false;
    }
+   save_dyn_bufs(s, desc, out);
    return true;
 }
 
