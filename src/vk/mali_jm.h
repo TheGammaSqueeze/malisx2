@@ -591,6 +591,22 @@ bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader 
                           struct mali_v7_desc_tables *out);
 
 /*
+ * Updates *t for new dynamic offsets when it was built for this shader and
+ * the same bound sets: the dynamic uniform buffer entries and the dynamic
+ * storage buffer table are packed anew and the copied entries kept, so the
+ * draw needs no copy job. A bound set cannot change while the command
+ * buffer records (no update-after-bind is exposed), and a push set gets
+ * new memory with every push. False, with *t unchanged, when the tables
+ * must be rebuilt (another shader or set, regular uniform buffers, which
+ * share the table with the dynamic ones and come from the copy, or a
+ * vertex shader with images), or on an allocation failure, with the
+ * command buffer's error set.
+ */
+bool mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                          const struct mali_desc_state *desc, bool img,
+                          struct mali_v7_desc_tables *t);
+
+/*
  * Writes the table entries that come from the sets (the shader's copy map)
  * with a Compute job on chain c, one invocation per entry (panvk_v7
  * meta_get_copy_desc_job). *index: that job's index, the Dependency 1 of

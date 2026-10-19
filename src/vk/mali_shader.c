@@ -2098,9 +2098,9 @@ shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
 /*
  * Whether a deserialized shader's v7 counts are ones a compile produces.
  * The dynamic buffer counts size host arrays (mali_jm_desc_v7.c
- * mali_v7_desc_prepare), the table map has one entry per copied table
- * entry (the descriptor copy job reads that many), and the image table is
- * within MALI_V7_MAX_STAGE_IMG_ENTRIES (v7_fixup_info).
+ * pack_dyn_ubos, build_dyn_ssbos), the table map has one entry per copied
+ * table entry (the descriptor copy job reads that many), and the image
+ * table is within MALI_V7_MAX_STAGE_IMG_ENTRIES (v7_fixup_info).
  */
 static bool
 v7_desc_counts_valid(const struct mali_shader *s)

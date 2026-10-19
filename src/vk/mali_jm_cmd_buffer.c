@@ -791,7 +791,9 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
    cmd->dispatches = cmd->draws = cmd->passes = 0;
 #if PAN_ARCH < 9
-   /* The v7 draw state goes with gfx: its index buffer view belongs to the
+   /* The v7 draw state goes with gfx: its descriptor tables were in the
+    * command memory released above (a draw after the reset must not keep
+    * them, mali_v7_desc_refresh), its index buffer view belongs to the
     * binding in gfx.draw.ib, and everything else is rebuilt by
     * MALI_GFX_DIRTY_ALL. */
    mali_jm_draw_tmpl_init(&cmd->jm.draw);

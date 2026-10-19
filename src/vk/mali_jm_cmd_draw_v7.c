@@ -843,9 +843,13 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    if (t->fs_tab.shader != p->fs)
       d->dirty |= MALI_GFX_DIRTY_FS_SRT;
    if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
-      if (!mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
-         return false;
-      dd->vs_copy = true;
+      /* The same sets with other dynamic offsets keep the copied tables. */
+      if (!mali_v7_desc_refresh(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab)) {
+         if (vk_command_buffer_has_error(&cmd->vk) ||
+             !mali_v7_desc_prepare(cmd, p->vs, &cmd->gfx.desc, false, &t->vs_tab))
+            return false;
+         dd->vs_copy = true;
+      }
       d->vs_srt_key = bd->vs_srt_key;
       d->vs_sets_dirty = 0;
       if (p->vs->v7.needs_set_addrs)
@@ -853,9 +857,12 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
       if (p->fs) {
-         if (!mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
-            return false;
-         dd->fs_copy = true;
+         if (!mali_v7_desc_refresh(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab)) {
+            if (vk_command_buffer_has_error(&cmd->vk) ||
+                !mali_v7_desc_prepare(cmd, p->fs, &cmd->gfx.desc, true, &t->fs_tab))
+               return false;
+            dd->fs_copy = true;
+         }
          if (p->fs->v7.needs_set_addrs)
             d->dirty |= MALI_GFX_DIRTY_FS_FAU;
       } else {
