@@ -624,6 +624,15 @@ MALI_PER_ARCH(CmdCopyImageToBuffer2)(VkCommandBuffer commandBuffer, const VkCopy
       const uint32_t w = DIV_ROUND_UP(r->imageExtent.width, s.block_w);
       const uint32_t h = DIV_ROUND_UP(r->imageExtent.height, s.block_h);
       const uint32_t layers = subresource_layers(&img->vk, &r->imageSubresource, &r->imageExtent);
+#if PAN_ARCH < 9
+      /* The buffer memory written, up to the end of the last row, for the
+       * v7 indexed draws (mali_v7_note_buffer_write). */
+      if (w && h && layers)
+         mali_v7_note_buffer_write(cmd, d.base,
+                                   (uint64_t)(layers - 1) * d.layer_stride +
+                                      (uint64_t)(h - 1) * d.row_stride +
+                                      (uint64_t)w * d.block_bytes);
+#endif
       if (mali_image_is_afbc(img))
          copy_from_afbc(cmd, img, aspect_plane(img, r->imageSubresource.aspectMask),
                         r->imageSubresource.mipLevel, r->imageSubresource.baseArrayLayer,

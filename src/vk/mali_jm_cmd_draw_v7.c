@@ -30,8 +30,10 @@
  *    draw_helper.cl); here the CPU reads the indices from the index
  *    buffer's mapping (mali_cmd_state.c) when the draw is recorded, so they
  *    must be in place by then and stay unchanged until the draw has run
- *    (index_range lists the writes it cannot see). An index buffer without
- *    a CPU mapping is not supported, logged once with the draw skipped;
+ *    (index_range lists the writes it cannot see). Not supported, each
+ *    logged once with the draw skipped: an index buffer without a CPU
+ *    mapping, and indices that a buffer copy, fill or update or an image
+ *    to buffer copy recorded earlier in the same command buffer writes;
  *  - descriptor sets: each stage's tables come from the builder the
  *    dispatches use too (mali_jm_desc_v7.c). The vertex shader's images
  *    go behind its vertex attributes, the fragment shader's in the Tiler
@@ -909,6 +911,67 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
 /* ---------------------------------------------------------------------- */
 /* Indexed draws: the vertex range                                         */
 
+/* The first of the n sorted, disjoint ranges r that ends at or after
+ * addr; n if there is none. */
+static unsigned
+range_first_ending_at(const struct mali_v7_range *r, unsigned n, uint64_t addr)
+{
+   unsigned lo = 0, hi = n;
+   while (lo < hi) {
+      const unsigned mid = lo + (hi - lo) / 2;
+      if (r[mid].end < addr)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   return lo;
+}
+
+void
+mali_v7_note_buffer_write(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size)
+{
+   if (!size)
+      return;
+   struct util_dynarray *a = &cmd->jm.buf_writes;
+   struct mali_v7_range *r = util_dynarray_begin(a);
+   const unsigned n = util_dynarray_num_elements(a, struct mali_v7_range);
+   struct mali_v7_range w = {addr, addr + size};
+
+   /* The ranges w overlaps or touches, [first, last), become one. */
+   const unsigned first = range_first_ending_at(r, n, w.start);
+   unsigned last = first;
+   for (; last < n && r[last].start <= w.end; last++) {
+      w.start = MIN2(w.start, r[last].start);
+      w.end = MAX2(w.end, r[last].end);
+   }
+   if (last == first) {
+      if (!util_dynarray_grow(a, struct mali_v7_range, 1)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+      r = util_dynarray_begin(a);
+      memmove(&r[first + 1], &r[first], (n - first) * sizeof(*r));
+   } else {
+      memmove(&r[first + 1], &r[last], (n - last) * sizeof(*r));
+      a->size -= (last - first - 1) * sizeof(*r);
+   }
+   r[first] = w;
+}
+
+/* Does a transfer recorded earlier in this command buffer write any of the
+ * size bytes at addr (mali_v7_note_buffer_write)? */
+static inline bool
+buffer_written(const struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size)
+{
+   const unsigned n = util_dynarray_num_elements(&cmd->jm.buf_writes, struct mali_v7_range);
+   if (likely(!n) || !size)
+      return false;
+   /* Only the first range that ends past addr can overlap. */
+   const struct mali_v7_range *r = util_dynarray_begin(&cmd->jm.buf_writes);
+   const unsigned i = range_first_ending_at(r, n, addr + 1);
+   return i < n && r[i].start < addr + size;
+}
+
 /*
  * The smallest and largest index of the draw, read from the index
  * buffer's CPU view (restart indices skipped when primitive restart is
@@ -918,14 +981,15 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
  * The indices are read when the draw is recorded, not when it runs, so
  * they must be in the buffer by then and stay unchanged until the draw has
  * run: an index outside the range found here makes the Tiler job read
- * positions and varyings the Vertex job did not write. An index buffer
- * without a CPU view is caught, logged once and returned as false, and the
- * draw is skipped. Writes that land after this read are not detected,
- * whether by a transfer or a shader (even one recorded earlier in this
- * command buffer), by another command buffer that has not finished by
- * this call, or by the host. In host-cached memory that is not
- * host-coherent, indices the GPU wrote can also be read from stale CPU
- * cache lines.
+ * positions and varyings the Vertex job did not write. Two cases are
+ * caught, logged once and returned as false, and the draw is skipped: an
+ * index buffer without a CPU view, and indices that a transfer recorded
+ * earlier in this command buffer writes (mali_v7_note_buffer_write), which
+ * runs after this read. Other writes are not detected: by a shader, by
+ * another command buffer that has not finished by this call, by the host
+ * after it, or by a transfer recorded later in this command buffer when it
+ * runs again. In host-cached memory that is not host-coherent, indices
+ * the GPU wrote can also be read from stale CPU cache lines.
  */
 static bool
 index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool restart,
@@ -947,6 +1011,11 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
    }
    /* Indices past the end of the bound range are left out of the scan. */
    const uint32_t count = (uint32_t)MIN2(di->count, (d->ib.size - first) / size);
+   if (buffer_written(cmd, d->ib.addr + first, (uint64_t)count * size)) {
+      MALI_V7_UNSUPPORTED("an indexed draw whose indices a transfer earlier in the same "
+                          "command buffer writes");
+      return false;
+   }
    const uint8_t *base = t->ib_cpu + first;
    uint32_t min = UINT32_MAX, max = 0;
 

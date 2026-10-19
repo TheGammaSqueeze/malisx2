@@ -266,6 +266,13 @@ struct mali_jm_draw_tmpl {
 };
 #endif
 
+#if PAN_ARCH < 9
+/* A range [start, end) of GPU addresses. */
+struct mali_v7_range {
+   uint64_t start, end;
+};
+#endif
+
 /* Inside the job-manager command buffer: what submit reads, and the open
  * batch. */
 struct mali_jm_cmd {
@@ -300,6 +307,11 @@ struct mali_jm_cmd {
    /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
     * copy_tsd), 0 until the first one. */
    uint64_t copy_tsd;
+   /* The buffer memory that the transfers recorded so far write
+    * (mali_v7_note_buffer_write): struct mali_v7_range, sorted, disjoint
+    * and not touching. Empty unless the command buffer has such a
+    * transfer. */
+   struct util_dynarray buf_writes;
 #endif
 };
 
@@ -675,6 +687,20 @@ uint64_t mali_v7_meta_rect_positions(struct mali_cmd_buffer *cmd, float x0, floa
  * to 1, in command memory (mali_cmd_meta_gfx.c). 0 on failure. */
 uint64_t mali_v7_meta_viewport(struct mali_cmd_buffer *cmd, uint32_t minx, uint32_t miny,
                                uint32_t maxx, uint32_t maxy);
+
+/* ---------------------------------------------------------------------- */
+/* Indexed draws (mali_jm_cmd_draw_v7.c)                                   */
+
+/*
+ * Notes that a transfer recorded in cmd writes the size bytes of buffer
+ * memory at GPU address addr (struct mali_jm_cmd::buf_writes); the buffer
+ * copies, fills and updates and the image to buffer copies call it. The
+ * v7 draw reads an indexed draw's indices on the CPU when the draw is
+ * recorded, before such a write runs, and skips a draw whose indices one
+ * of them writes (index_range). On failure the command buffer's error is
+ * set.
+ */
+void mali_v7_note_buffer_write(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size);
 #endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
